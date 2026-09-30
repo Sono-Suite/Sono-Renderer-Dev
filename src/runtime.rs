@@ -1,0 +1,2345 @@
+//! Portable Watch node execution primitives.
+//!
+//! This is the scalar VM/display-list boundary. Platform rendering and host
+//! services are deliberately kept out of this module.
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, RwLock};
+
+const MAX_EVALUATIONS: usize = 5_000_000;
+const MAX_CALL_DEPTH: usize = 2048;
+const ENGINE_ROM_BLOCK: i64 = 3000;
+const RUNTIME_UPDATE_BLOCK: i64 = 1001;
+const ENTITY_DATA_ARRAY_BLOCK: i64 = 4101;
+const ENTITY_SHARED_MEMORY_ARRAY_BLOCK: i64 = 4102;
+const ENTITY_INFO_ARRAY_BLOCK: i64 = 4103;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpriteDraw {
+    pub sprite_id: u32,
+    /// Sonolus order: bottom-left, top-left, top-right, bottom-right.
+    pub corners: [[f64; 2]; 4],
+    pub z: [f64; 4],
+    pub alpha: f64,
+    #[serde(default)]
+    pub provenance: Option<DrawProvenance>,
+    #[serde(default)]
+    pub trace: Option<DrawTrace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DrawTrace {
+    /// WatchData node IDs corresponding positionally to the Draw arguments.
+    pub argument_nodes: Vec<usize>,
+    /// Values observed while evaluating the executed argument graph.
+    pub node_values: BTreeMap<usize, f64>,
+    /// Text form preserves NaN and infinities, which JSON numbers cannot encode.
+    #[serde(default)]
+    pub node_value_texts: BTreeMap<usize, String>,
+    /// Memory reads performed while evaluating the Draw arguments, including
+    /// the most recent in-callback write to the same block/index when known.
+    pub memory_reads: Vec<MemoryReadTrace>,
+    /// Latest writes to memory locations at the point this Draw executes.
+    pub memory_writes: Vec<MemoryWriteTrace>,
+    /// Compound memory operations with their old value, operand, and result.
+    #[serde(default)]
+    pub memory_operations: Vec<MemoryOperationTrace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryOperationTrace {
+    pub node: usize,
+    pub function: String,
+    pub block: i64,
+    pub index: usize,
+    pub old_value: String,
+    pub operand: String,
+    pub result: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryReadTrace {
+    pub node: usize,
+    pub block: i64,
+    pub index: usize,
+    pub value: f64,
+    pub last_write: Option<(usize, f64)>,
+    #[serde(default)]
+    pub value_text: String,
+    #[serde(default)]
+    pub last_write_value_text: Option<String>,
+    #[serde(default)]
+    pub last_write_origin: Option<MemoryWriteOrigin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryWriteOrigin {
+    pub node: usize,
+    pub entity_id: Option<usize>,
+    pub archetype: Option<String>,
+    pub callback: Option<String>,
+    pub callback_node: Option<usize>,
+    pub value: String,
+    #[serde(default)]
+    pub operation: Option<MemoryOperationTrace>,
+    #[serde(default)]
+    pub expression_values: BTreeMap<usize, String>,
+    #[serde(default)]
+    pub expression_reads: Vec<MemoryReadTrace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryWriteTrace {
+    pub node: usize,
+    pub block: i64,
+    pub index: usize,
+    pub value: f64,
+    #[serde(default)]
+    pub value_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DrawProvenance {
+    pub entity_id: Option<usize>,
+    pub archetype: Option<String>,
+    pub callback: Option<String>,
+    pub callback_node: Option<usize>,
+    pub draw_node: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DisplayList {
+    pub sprites: Vec<SpriteDraw>,
+}
+
+/// Per-command observations for auditing the skin-backed rendering pipeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkinDrawDiagnostic {
+    pub display_list_index: usize,
+    pub render_order: usize,
+    pub provenance: Option<DrawProvenance>,
+    pub sprite_id: u32,
+    pub sprite_name: String,
+    pub atlas_size: [u32; 2],
+    pub atlas_interpolation: bool,
+    /// 8x8 linear transform supplied by this skin sprite's SkinData entry.
+    pub sprite_transform: [[f64; 8]; 8],
+    pub atlas_nontransparent_pixels: u32,
+    pub atlas_alpha_range: [u8; 2],
+    pub input_corners: [[f64; 2]; 4],
+    pub transformed_corners: [[f64; 2]; 4],
+    pub screen_pixel_corners: [[f64; 2]; 4],
+    pub atlas_rect: [u32; 4],
+    /// Atlas positions corresponding to input BL, TL, TR, BR after UV mapping.
+    pub atlas_corner_samples: [[f64; 2]; 4],
+    pub z: [f64; 4],
+    /// Full tuple used by the renderer's painter ordering. The observed
+    /// Sonolus behavior establishes lexicographic ordering for ordinary
+    /// finite unequal tuples; exceptional float values and exact ties remain
+    /// implementation-defined here.
+    pub z_order_key: [f64; 4],
+    pub alpha: f64,
+    pub unclipped_pixel_bounds: [i64; 4],
+    pub clipped_pixel_bounds: [i64; 4],
+    /// Pixel centers inside the bilinear destination quad and with sampled
+    /// nonzero sprite alpha, independent of the sprite's RGB color.
+    pub nontransparent_quad_pixels: u64,
+    pub sampled_alpha_range: Option<[u8; 2]>,
+    pub sampled_rgb_range: Option<[[u8; 2]; 3]>,
+}
+
+/// A deferred entity creation requested by WatchData's `Spawn` function.
+/// Sonolus queues these until the next spawning system pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpawnRequest {
+    pub archetype_id: i64,
+    pub data: Vec<f64>,
+}
+
+/// Deferred audio intent emitted by Watch. Times remain in the BGM/gameplay
+/// timeline; an audio backend applies its device/audio offset when dispatching.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduledEffect {
+    pub clip_id: i64,
+    pub time: f64,
+    pub minimum_distance: f64,
+    pub requested_at: f64,
+    pub has_required_lead_time: bool,
+}
+
+/// Request to destroy a previously spawned particle-effect instance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DestroyedParticleEffect {
+    pub particle_id: i64,
+}
+
+/// Backend-neutral description of a live particle-effect instance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParticleEffectInstance {
+    pub instance_id: i64,
+    pub effect_id: i64,
+    /// Sonolus corner order: bottom-left, top-left, top-right, bottom-right.
+    pub corners: [[f64; 2]; 4],
+    pub duration: f64,
+    pub is_looped: bool,
+    pub spawned_at: f64,
+}
+
+/// Particle host events emitted by Watch operations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ParticleEffectEvent {
+    Spawn(ParticleEffectInstance),
+    Destroy { instance_id: i64 },
+}
+
+/// Shared particle instance allocator and live-instance table for a Watch run.
+#[derive(Debug, Default)]
+pub struct ParticleEffectState {
+    next_instance_id: i64,
+    instances: BTreeMap<i64, ParticleEffectInstance>,
+}
+
+impl ParticleEffectState {
+    pub fn instances(&self) -> &BTreeMap<i64, ParticleEffectInstance> {
+        &self.instances
+    }
+}
+
+impl DisplayList {
+    /// Explain the same geometry, resource, UV, screen, and painter-order
+    /// conversions used by `render_skin_ppm`, without altering any command.
+    pub fn skin_render_diagnostics(
+        &self,
+        width: u32,
+        height: u32,
+        aspect_ratio: f64,
+        skin: &crate::formats::SkinAssets,
+        bindings: &BTreeMap<u32, String>,
+    ) -> Result<Vec<SkinDrawDiagnostic>> {
+        if width == 0 || height == 0 || width > 8192 || height > 8192 {
+            bail!("frame dimensions must be in 1..=8192");
+        }
+        if !aspect_ratio.is_finite() || aspect_ratio <= 0.0 {
+            bail!("screen aspect ratio must be finite and positive");
+        }
+        let expected_texture_bytes = (skin.width as usize)
+            .checked_mul(skin.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .context("skin texture dimensions overflow address space")?;
+        if skin.width == 0 || skin.height == 0 || skin.rgba.len() != expected_texture_bytes {
+            bail!("skin atlas dimensions do not match its RGBA pixel buffer");
+        }
+        let mut order: Vec<_> = self.sprites.iter().enumerate().collect();
+        order.sort_by(|(_, a), (_, b)| compare_z_tuples(&a.z, &b.z));
+        let mut diagnostics = Vec::with_capacity(order.len());
+        for (render_order, (display_list_index, draw)) in order.into_iter().enumerate() {
+            let sprite_name = bindings.get(&draw.sprite_id).with_context(|| {
+                format!("Draw references unbound skin sprite ID {}", draw.sprite_id)
+            })?;
+            let sprite = skin
+                .sprites
+                .get(sprite_name)
+                .with_context(|| format!("skin does not contain bound sprite {sprite_name:?}"))?;
+            let right = sprite
+                .x
+                .checked_add(sprite.width)
+                .context("sprite x range overflow")?;
+            let bottom = sprite
+                .y
+                .checked_add(sprite.height)
+                .context("sprite y range overflow")?;
+            if sprite.width == 0 || sprite.height == 0 || right > skin.width || bottom > skin.height
+            {
+                bail!("skin sprite {sprite_name:?} has an invalid atlas rectangle");
+            }
+            let transformed_corners = transform_skin_corners(draw.corners, sprite);
+            let screen_pixel_corners = transformed_corners.map(|[x, y]| {
+                [
+                    ((x / aspect_ratio + 1.0) * 0.5) * f64::from(width),
+                    ((1.0 - y) * 0.5) * f64::from(height),
+                ]
+            });
+            let min_x = screen_pixel_corners
+                .iter()
+                .map(|p| p[0])
+                .fold(f64::INFINITY, f64::min);
+            let max_x = screen_pixel_corners
+                .iter()
+                .map(|p| p[0])
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_y = screen_pixel_corners
+                .iter()
+                .map(|p| p[1])
+                .fold(f64::INFINITY, f64::min);
+            let max_y = screen_pixel_corners
+                .iter()
+                .map(|p| p[1])
+                .fold(f64::NEG_INFINITY, f64::max);
+            let unclipped_pixel_bounds = [
+                min_x.floor() as i64,
+                min_y.floor() as i64,
+                max_x.ceil() as i64,
+                max_y.ceil() as i64,
+            ];
+            let clipped_pixel_bounds = [
+                unclipped_pixel_bounds[0].clamp(0, i64::from(width)),
+                unclipped_pixel_bounds[1].clamp(0, i64::from(height)),
+                unclipped_pixel_bounds[2].clamp(0, i64::from(width)),
+                unclipped_pixel_bounds[3].clamp(0, i64::from(height)),
+            ];
+            let mut atlas_nontransparent_pixels = 0u32;
+            let mut min_alpha = u8::MAX;
+            let mut max_alpha = u8::MIN;
+            for y in sprite.y..bottom {
+                for x in sprite.x..right {
+                    let offset = (y as usize * skin.width as usize + x as usize) * 4;
+                    let alpha = skin.rgba.get(offset + 3).copied().unwrap_or(0);
+                    min_alpha = min_alpha.min(alpha);
+                    max_alpha = max_alpha.max(alpha);
+                    atlas_nontransparent_pixels += u32::from(alpha > 0);
+                }
+            }
+            let mut nontransparent_quad_pixels = 0u64;
+            let mut sampled_alpha_min = u8::MAX;
+            let mut sampled_alpha_max = u8::MIN;
+            let mut sampled_rgb_min = [u8::MAX; 3];
+            let mut sampled_rgb_max = [u8::MIN; 3];
+            let mut covered_quad_pixels = 0u64;
+            for py in clipped_pixel_bounds[1]..clipped_pixel_bounds[3] {
+                for px in clipped_pixel_bounds[0]..clipped_pixel_bounds[2] {
+                    let target = [
+                        (((px as f64 + 0.5) / f64::from(width)) * 2.0 - 1.0) * aspect_ratio,
+                        1.0 - ((py as f64 + 0.5) / f64::from(height)) * 2.0,
+                    ];
+                    let Some((u, v)) = inverse_bilinear(&transformed_corners, target) else {
+                        continue;
+                    };
+                    if !(-1e-7..=1.0000001).contains(&u) || !(-1e-7..=1.0000001).contains(&v) {
+                        continue;
+                    }
+                    let tex_x =
+                        f64::from(sprite.x) + u.clamp(0.0, 1.0) * f64::from(sprite.width) - 0.5;
+                    let tex_y = f64::from(sprite.y)
+                        + (1.0 - v.clamp(0.0, 1.0)) * f64::from(sprite.height)
+                        - 0.5;
+                    let sample = sample_skin(skin, sprite, tex_x, tex_y);
+                    let sample_alpha = sample[3];
+                    sampled_alpha_min = sampled_alpha_min.min(sample_alpha);
+                    sampled_alpha_max = sampled_alpha_max.max(sample_alpha);
+                    for channel in 0..3 {
+                        sampled_rgb_min[channel] = sampled_rgb_min[channel].min(sample[channel]);
+                        sampled_rgb_max[channel] = sampled_rgb_max[channel].max(sample[channel]);
+                    }
+                    covered_quad_pixels += 1;
+                    nontransparent_quad_pixels += u64::from(sample_alpha > 0);
+                }
+            }
+            diagnostics.push(SkinDrawDiagnostic {
+                display_list_index,
+                render_order,
+                provenance: draw.provenance.clone(),
+                sprite_id: draw.sprite_id,
+                sprite_name: sprite_name.clone(),
+                atlas_size: [skin.width, skin.height],
+                atlas_interpolation: skin.interpolation,
+                sprite_transform: sprite.transform,
+                atlas_nontransparent_pixels,
+                atlas_alpha_range: [min_alpha, max_alpha],
+                input_corners: draw.corners,
+                transformed_corners,
+                screen_pixel_corners,
+                atlas_rect: [sprite.x, sprite.y, sprite.width, sprite.height],
+                atlas_corner_samples: [
+                    [f64::from(sprite.x) - 0.5, f64::from(bottom) - 0.5],
+                    [f64::from(sprite.x) - 0.5, f64::from(sprite.y) - 0.5],
+                    [f64::from(right) - 0.5, f64::from(sprite.y) - 0.5],
+                    [f64::from(right) - 0.5, f64::from(bottom) - 0.5],
+                ],
+                z: draw.z,
+                z_order_key: draw.z,
+                alpha: draw.alpha,
+                unclipped_pixel_bounds,
+                clipped_pixel_bounds,
+                nontransparent_quad_pixels,
+                sampled_alpha_range: (covered_quad_pixels > 0)
+                    .then_some([sampled_alpha_min, sampled_alpha_max]),
+                sampled_rgb_range: (covered_quad_pixels > 0).then(|| {
+                    std::array::from_fn(|channel| {
+                        [sampled_rgb_min[channel], sampled_rgb_max[channel]]
+                    })
+                }),
+            });
+        }
+        Ok(diagnostics)
+    }
+
+    /// Rasterize the current abstract sprites to a portable RGB PPM frame.
+    /// This simple color-ID rasterizer is a diagnostic boundary; it is not yet
+    /// a Sonolus skin atlas renderer.
+    pub fn render_ppm(&self, width: u32, height: u32) -> Result<Vec<u8>> {
+        if width == 0 || height == 0 || width > 8192 || height > 8192 {
+            bail!("frame dimensions must be in 1..=8192");
+        }
+        let pixels = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(3))
+            .context("frame dimensions overflow address space")?;
+        let mut rgb = vec![0u8; pixels];
+        let mut order: Vec<_> = self.sprites.iter().collect();
+        order.sort_by(|a, b| compare_z_tuples(&a.z, &b.z));
+        for sprite in order {
+            let left = sprite
+                .corners
+                .iter()
+                .map(|p| p[0])
+                .fold(f64::INFINITY, f64::min);
+            let right = sprite
+                .corners
+                .iter()
+                .map(|p| p[0])
+                .fold(f64::NEG_INFINITY, f64::max);
+            let bottom = sprite
+                .corners
+                .iter()
+                .map(|p| p[1])
+                .fold(f64::INFINITY, f64::min);
+            let top = sprite
+                .corners
+                .iter()
+                .map(|p| p[1])
+                .fold(f64::NEG_INFINITY, f64::max);
+            if ![left, right, bottom, top, sprite.alpha]
+                .iter()
+                .all(|x| x.is_finite())
+            {
+                continue;
+            }
+            let x0 = (((left + 1.0) * 0.5 * width as f64).floor() as i64).clamp(0, width as i64);
+            let x1 = (((right + 1.0) * 0.5 * width as f64).ceil() as i64).clamp(0, width as i64);
+            let y0 = (((1.0 - top) * 0.5 * height as f64).floor() as i64).clamp(0, height as i64);
+            let y1 = (((1.0 - bottom) * 0.5 * height as f64).ceil() as i64).clamp(0, height as i64);
+            let alpha = sprite.alpha.clamp(0.0, 1.0);
+            let color = sprite_color(sprite.sprite_id);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let offset = (y as usize * width as usize + x as usize) * 3;
+                    for channel in 0..3 {
+                        rgb[offset + channel] = (rgb[offset + channel] as f64 * (1.0 - alpha)
+                            + color[channel] as f64 * alpha)
+                            .round() as u8;
+                    }
+                }
+            }
+        }
+        let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+        ppm.extend_from_slice(&rgb);
+        Ok(ppm)
+    }
+
+    /// Rasterize sprites by sampling their actual skin atlas rectangles.
+    /// Geometry follows Sonolus' BL, TL, TR, BR quad corner order.
+    pub fn render_skin_ppm(
+        &self,
+        width: u32,
+        height: u32,
+        aspect_ratio: f64,
+        skin: &crate::formats::SkinAssets,
+        bindings: &BTreeMap<u32, String>,
+    ) -> Result<Vec<u8>> {
+        self.render_skin_ppm_with_background(width, height, aspect_ratio, skin, bindings, None)
+    }
+
+    /// Render the Sonolus background first, then the unchanged skin display
+    /// list using the existing geometry, sampling, alpha, and painter rules.
+    pub fn render_skin_ppm_with_background(
+        &self,
+        width: u32,
+        height: u32,
+        aspect_ratio: f64,
+        skin: &crate::formats::SkinAssets,
+        bindings: &BTreeMap<u32, String>,
+        background: Option<(&crate::formats::BackgroundAssets, [[f64; 2]; 4])>,
+    ) -> Result<Vec<u8>> {
+        if width == 0 || height == 0 || width > 8192 || height > 8192 {
+            bail!("frame dimensions must be in 1..=8192");
+        }
+        if !aspect_ratio.is_finite() || aspect_ratio <= 0.0 {
+            bail!("screen aspect ratio must be finite and positive");
+        }
+        let expected_texture_bytes = (skin.width as usize)
+            .checked_mul(skin.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .context("skin texture dimensions overflow address space")?;
+        if skin.width == 0 || skin.height == 0 || skin.rgba.len() != expected_texture_bytes {
+            bail!("skin atlas dimensions do not match its RGBA pixel buffer");
+        }
+        let pixel_count = (width as usize)
+            .checked_mul(height as usize)
+            .context("frame dimensions overflow address space")?;
+        let byte_count = pixel_count
+            .checked_mul(3)
+            .context("frame dimensions overflow address space")?;
+        let mut rgb = vec![0u8; byte_count];
+        if let Some((background, quad)) = background {
+            render_background(&mut rgb, width, height, aspect_ratio, background, quad)?;
+        }
+        let mut order: Vec<_> = self.sprites.iter().collect();
+        order.sort_by(|a, b| compare_z_tuples(&a.z, &b.z));
+        for draw in order {
+            let sprite_name = bindings.get(&draw.sprite_id).with_context(|| {
+                format!("Draw references unbound skin sprite ID {}", draw.sprite_id)
+            })?;
+            let sprite = skin
+                .sprites
+                .get(sprite_name)
+                .with_context(|| format!("skin does not contain bound sprite {sprite_name:?}"))?;
+            let sprite_right = sprite.x.checked_add(sprite.width);
+            let sprite_bottom = sprite.y.checked_add(sprite.height);
+            if sprite.width == 0
+                || sprite.height == 0
+                || sprite_right.is_none_or(|right| right > skin.width)
+                || sprite_bottom.is_none_or(|bottom| bottom > skin.height)
+            {
+                bail!("skin sprite {sprite_name:?} has an invalid atlas rectangle");
+            }
+            if !draw.alpha.is_finite()
+                || !draw.corners.iter().flatten().all(|value| value.is_finite())
+                || !draw.z.iter().all(|value| value.is_finite())
+            {
+                continue;
+            }
+            let corners = transform_skin_corners(draw.corners, sprite);
+            if !corners.iter().flatten().all(|value| value.is_finite()) {
+                continue;
+            }
+            let left = corners.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+            let right = corners
+                .iter()
+                .map(|p| p[0])
+                .fold(f64::NEG_INFINITY, f64::max);
+            let bottom = corners.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
+            let top = corners
+                .iter()
+                .map(|p| p[1])
+                .fold(f64::NEG_INFINITY, f64::max);
+            let x0 = (((left / aspect_ratio + 1.0) * 0.5 * width as f64).floor() as i64)
+                .clamp(0, width as i64);
+            let x1 = (((right / aspect_ratio + 1.0) * 0.5 * width as f64).ceil() as i64)
+                .clamp(0, width as i64);
+            let y0 = (((1.0 - top) * 0.5 * height as f64).floor() as i64).clamp(0, height as i64);
+            let y1 = (((1.0 - bottom) * 0.5 * height as f64).ceil() as i64).clamp(0, height as i64);
+            let alpha = draw.alpha.clamp(0.0, 1.0);
+            if alpha == 0.0 {
+                continue;
+            }
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    let target = [
+                        (((px as f64 + 0.5) / width as f64) * 2.0 - 1.0) * aspect_ratio,
+                        1.0 - ((py as f64 + 0.5) / height as f64) * 2.0,
+                    ];
+                    let Some((u, v)) = inverse_bilinear(&corners, target) else {
+                        continue;
+                    };
+                    if !(-1e-7..=1.0000001).contains(&u) || !(-1e-7..=1.0000001).contains(&v) {
+                        continue;
+                    }
+                    let tex_x = sprite.x as f64 + u.clamp(0.0, 1.0) * sprite.width as f64 - 0.5;
+                    let tex_y =
+                        sprite.y as f64 + (1.0 - v.clamp(0.0, 1.0)) * sprite.height as f64 - 0.5;
+                    let sample = sample_skin(skin, sprite, tex_x, tex_y);
+                    let source_alpha = alpha * f64::from(sample[3]) / 255.0;
+                    let offset = (py as usize * width as usize + px as usize) * 3;
+                    for channel in 0..3 {
+                        rgb[offset + channel] = (f64::from(rgb[offset + channel])
+                            * (1.0 - source_alpha)
+                            + f64::from(sample[channel]) * source_alpha)
+                            .round() as u8;
+                    }
+                }
+            }
+        }
+        let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+        ppm.extend_from_slice(&rgb);
+        Ok(ppm)
+    }
+}
+
+fn render_background(
+    rgb: &mut [u8],
+    width: u32,
+    height: u32,
+    aspect_ratio: f64,
+    background: &crate::formats::BackgroundAssets,
+    quad: [[f64; 2]; 4],
+) -> Result<()> {
+    if background.width == 0 || background.height == 0 {
+        bail!("background image dimensions must be positive");
+    }
+    let expected = (background.width as usize)
+        .checked_mul(background.height as usize)
+        .and_then(|count| count.checked_mul(4))
+        .context("background image dimensions overflow address space")?;
+    if background.rgba.len() != expected {
+        bail!("background image dimensions do not match its RGBA pixel buffer");
+    }
+    if background.configuration.blur != 0.0 {
+        bail!("nonzero Sonolus background blur is not yet supported");
+    }
+    if !quad
+        .iter()
+        .flatten()
+        .all(|coordinate| coordinate.is_finite())
+    {
+        bail!("Runtime Background quad contains a non-finite coordinate");
+    }
+    let base = crate::formats::parse_background_color(&background.data.color, false)?;
+    let mask = crate::formats::parse_background_color(&background.configuration.mask, true)?;
+    for pixel in rgb.chunks_exact_mut(3) {
+        pixel.copy_from_slice(&base[..3]);
+    }
+    for py in 0..height {
+        for px in 0..width {
+            let target = [
+                (((f64::from(px) + 0.5) / f64::from(width)) * 2.0 - 1.0) * aspect_ratio,
+                1.0 - ((f64::from(py) + 0.5) / f64::from(height)) * 2.0,
+            ];
+            let Some((u, v)) = inverse_bilinear(&quad, target) else {
+                continue;
+            };
+            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                continue;
+            }
+            let sample = sample_rgba_bilinear(
+                &background.rgba,
+                background.width,
+                background.height,
+                u * f64::from(background.width - 1),
+                (1.0 - v) * f64::from(background.height - 1),
+            );
+            let pixel = &mut rgb[(py as usize * width as usize + px as usize) * 3..][..3];
+            blend_rgb(pixel, sample, f64::from(sample[3]) / 255.0);
+        }
+    }
+    for pixel in rgb.chunks_exact_mut(3) {
+        blend_rgb(pixel, mask, f64::from(mask[3]) / 255.0);
+    }
+    Ok(())
+}
+
+/// Rasterize only the Sonolus background layer, using the same quad sampling
+/// path as gameplay frame composition. Useful for deterministic diagnostics.
+pub fn render_background_ppm(
+    width: u32,
+    height: u32,
+    aspect_ratio: f64,
+    background: &crate::formats::BackgroundAssets,
+    quad: [[f64; 2]; 4],
+) -> Result<Vec<u8>> {
+    if width == 0 || height == 0 || width > 8192 || height > 8192 {
+        bail!("frame dimensions must be in 1..=8192");
+    }
+    if !aspect_ratio.is_finite() || aspect_ratio <= 0.0 {
+        bail!("screen aspect ratio must be finite and positive");
+    }
+    let byte_count = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .context("frame dimensions overflow address space")?;
+    let mut rgb = vec![0u8; byte_count];
+    render_background(&mut rgb, width, height, aspect_ratio, background, quad)?;
+    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+    ppm.extend_from_slice(&rgb);
+    Ok(ppm)
+}
+
+fn sample_rgba_bilinear(rgba: &[u8], width: u32, height: u32, x: f64, y: f64) -> [u8; 4] {
+    let x0 = x.floor().clamp(0.0, f64::from(width - 1)) as u32;
+    let y0 = y.floor().clamp(0.0, f64::from(height - 1)) as u32;
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let tx = x - f64::from(x0);
+    let ty = y - f64::from(y0);
+    std::array::from_fn(|channel| {
+        let at =
+            |px: u32, py: u32| rgba[(py as usize * width as usize + px as usize) * 4 + channel];
+        let top = f64::from(at(x0, y0)) * (1.0 - tx) + f64::from(at(x1, y0)) * tx;
+        let bottom = f64::from(at(x0, y1)) * (1.0 - tx) + f64::from(at(x1, y1)) * tx;
+        (top * (1.0 - ty) + bottom * ty).round() as u8
+    })
+}
+
+fn blend_rgb(target: &mut [u8], source: [u8; 4], alpha: f64) {
+    for channel in 0..3 {
+        target[channel] = (f64::from(target[channel]) * (1.0 - alpha)
+            + f64::from(source[channel]) * alpha)
+            .round() as u8;
+    }
+}
+
+/// Compare Draw z tuples in component order. `total_cmp` gives the Rust
+/// renderer a deterministic ordering for all f64 bit patterns; the real-client
+/// conformance observations establish the larger-first-difference behavior
+/// only for ordinary finite, unequal tuples. Exact ties remain equal so the
+/// stable `sort_by` calls preserve Draw submission order.
+pub fn compare_z_tuples(left: &[f64; 4], right: &[f64; 4]) -> std::cmp::Ordering {
+    for (left, right) in left.iter().zip(right.iter()) {
+        let ordering = left.total_cmp(right);
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn transform_skin_corners(
+    input_corners: [[f64; 2]; 4],
+    sprite: &crate::formats::SkinSpriteAsset,
+) -> [[f64; 2]; 4] {
+    let input = [
+        input_corners[0][0],
+        input_corners[0][1],
+        input_corners[1][0],
+        input_corners[1][1],
+        input_corners[2][0],
+        input_corners[2][1],
+        input_corners[3][0],
+        input_corners[3][1],
+    ];
+    std::array::from_fn(|vertex| {
+        [
+            dot8(&sprite.transform[vertex * 2], &input),
+            dot8(&sprite.transform[vertex * 2 + 1], &input),
+        ]
+    })
+}
+
+fn dot8(coefficients: &[f64; 8], values: &[f64; 8]) -> f64 {
+    coefficients.iter().zip(values).map(|(a, b)| a * b).sum()
+}
+
+fn inverse_bilinear(corners: &[[f64; 2]; 4], target: [f64; 2]) -> Option<(f64, f64)> {
+    // Sonolus corner order is bottom-left, top-left, top-right, bottom-right.
+    let p00 = corners[0];
+    let p10 = corners[3];
+    let p01 = corners[1];
+    let p11 = corners[2];
+    let cross = [
+        p11[0] - p10[0] - p01[0] + p00[0],
+        p11[1] - p10[1] - p01[1] + p00[1],
+    ];
+    let mut u = 0.5;
+    let mut v = 0.5;
+    for _ in 0..12 {
+        let point = [
+            p00[0] + u * (p10[0] - p00[0]) + v * (p01[0] - p00[0]) + u * v * cross[0],
+            p00[1] + u * (p10[1] - p00[1]) + v * (p01[1] - p00[1]) + u * v * cross[1],
+        ];
+        let error = [point[0] - target[0], point[1] - target[1]];
+        if error[0].abs().max(error[1].abs()) < 1e-7 {
+            return Some((u, v));
+        }
+        let du = [
+            p10[0] - p00[0] + v * cross[0],
+            p10[1] - p00[1] + v * cross[1],
+        ];
+        let dv = [
+            p01[0] - p00[0] + u * cross[0],
+            p01[1] - p00[1] + u * cross[1],
+        ];
+        let determinant = du[0] * dv[1] - dv[0] * du[1];
+        if determinant.abs() < 1e-12 {
+            return None;
+        }
+        u -= (error[0] * dv[1] - dv[0] * error[1]) / determinant;
+        v -= (du[0] * error[1] - error[0] * du[1]) / determinant;
+    }
+    let point = [
+        p00[0] + u * (p10[0] - p00[0]) + v * (p01[0] - p00[0]) + u * v * cross[0],
+        p00[1] + u * (p10[1] - p00[1]) + v * (p01[1] - p00[1]) + u * v * cross[1],
+    ];
+    ((point[0] - target[0])
+        .abs()
+        .max((point[1] - target[1]).abs())
+        < 1e-5)
+        .then_some((u, v))
+}
+
+fn sample_skin(
+    skin: &crate::formats::SkinAssets,
+    sprite: &crate::formats::SkinSpriteAsset,
+    x: f64,
+    y: f64,
+) -> [u8; 4] {
+    let get = |x: i64, y: i64| -> [u8; 4] {
+        let x = x.clamp(sprite.x as i64, (sprite.x + sprite.width - 1) as i64) as usize;
+        let y = y.clamp(sprite.y as i64, (sprite.y + sprite.height - 1) as i64) as usize;
+        let offset = (y * skin.width as usize + x) * 4;
+        skin.rgba[offset..offset + 4]
+            .try_into()
+            .unwrap_or([0, 0, 0, 0])
+    };
+    if !skin.interpolation {
+        return get((x + 0.5).floor() as i64, (y + 0.5).floor() as i64);
+    }
+    let x0 = x.floor();
+    let y0 = y.floor();
+    let fx = x - x0;
+    let fy = y - y0;
+    let samples = [
+        get(x0 as i64, y0 as i64),
+        get(x0 as i64 + 1, y0 as i64),
+        get(x0 as i64, y0 as i64 + 1),
+        get(x0 as i64 + 1, y0 as i64 + 1),
+    ];
+    let weights = [
+        (1.0 - fx) * (1.0 - fy),
+        fx * (1.0 - fy),
+        (1.0 - fx) * fy,
+        fx * fy,
+    ];
+    let mut result = [0u8; 4];
+    for channel in 0..4 {
+        result[channel] = samples
+            .iter()
+            .zip(weights)
+            .map(|(pixel, weight)| f64::from(pixel[channel]) * weight)
+            .sum::<f64>()
+            .round() as u8;
+    }
+    result
+}
+
+fn sprite_color(id: u32) -> [u8; 3] {
+    let value = id.wrapping_mul(0x9e3779b9);
+    [
+        64 + ((value >> 16) as u8 & 0xbf),
+        64 + ((value >> 8) as u8 & 0xbf),
+        64 + (value as u8 & 0xbf),
+    ]
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Memory {
+    values: BTreeMap<(i64, usize), f64>,
+}
+
+impl Memory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn get(&self, block: i64, index: usize) -> f64 {
+        self.values.get(&(block, index)).copied().unwrap_or(0.0)
+    }
+
+    pub fn set(&mut self, block: i64, index: usize, value: f64) {
+        self.values.insert((block, index), value);
+    }
+
+    pub fn entries_for_block(&self, block: i64) -> Vec<(usize, f64)> {
+        self.values
+            .iter()
+            .filter_map(|(&(key, index), &value)| (key == block).then_some((index, value)))
+            .collect()
+    }
+
+    pub fn retain_other_than(&mut self, block: i64) {
+        self.values.retain(|(key, _), _| *key != block);
+    }
+
+    pub fn retain_only(&mut self, block: i64) {
+        self.values.retain(|(key, _), _| *key == block);
+    }
+
+    pub fn overlay(&mut self, source: &Memory) {
+        self.values
+            .extend(source.values.iter().map(|(k, v)| (*k, *v)));
+    }
+}
+
+pub struct WatchVm<'a> {
+    nodes: &'a [crate::watch::EngineNode],
+    pub memory: Memory,
+    pub display_list: DisplayList,
+    /// Entities requested by `Spawn`; a Watch host drains this at its next
+    /// spawning-system boundary.
+    pub spawn_queue: Vec<SpawnRequest>,
+    pub scheduled_effects: Vec<ScheduledEffect>,
+    pub destroyed_particle_effects: Vec<DestroyedParticleEffect>,
+    pub particle_events: Vec<ParticleEffectEvent>,
+    evaluations: usize,
+    depth: usize,
+    block_depth: usize,
+    break_signal: Option<(usize, f64)>,
+    pub context: VmContext,
+    pub function_counts: BTreeMap<String, u64>,
+    pub skin_checks: Vec<(i64, bool)>,
+    diagnostics: Option<VmDiagnostics>,
+    loop_trace: Vec<LoopTraceFrame>,
+    trace_draws: bool,
+    capture_draw_argument_values: bool,
+    draw_argument_values: BTreeMap<usize, f64>,
+    draw_argument_value_texts: BTreeMap<usize, String>,
+    draw_memory_reads: Vec<MemoryReadTrace>,
+    draw_memory_operations: Vec<MemoryOperationTrace>,
+    last_memory_writes: BTreeMap<(i64, usize), (usize, f64)>,
+}
+
+struct VmDiagnostics {
+    capacity: usize,
+    capture_after_evaluation: usize,
+    events: VecDeque<String>,
+}
+
+#[derive(Clone, Copy)]
+struct LoopTraceFrame {
+    node: usize,
+    iteration: usize,
+    branch: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VmContext {
+    pub time: f64,
+    pub beat: f64,
+    pub timescale: f64,
+    pub starting_time: f64,
+    pub starting_beat: f64,
+    pub skin_sprites: BTreeMap<String, u32>,
+    pub effect_clips: BTreeMap<String, u32>,
+    pub particle_effects: BTreeMap<String, u32>,
+    /// Runtime Background quad in Sonolus BL, TL, TR, BR order, flattened x/y.
+    pub runtime_background: Arc<RwLock<[f64; 8]>>,
+    /// Live particle instances are shared across callback VMs in a Watch run.
+    pub particle_instances: Arc<RwLock<ParticleEffectState>>,
+    pub streams: BTreeMap<(i64, i64), Vec<(f64, f64)>>,
+    pub time_map: Vec<(f64, f64)>,
+    pub timescale_map: Vec<(f64, f64)>,
+    pub bpm_map: Vec<(f64, f64)>,
+    /// Shared diagnostic provenance for memory values that survive between
+    /// callbacks. This map is only read or written with Draw tracing enabled.
+    pub memory_write_origins: Arc<RwLock<BTreeMap<(Option<usize>, i64, usize), MemoryWriteOrigin>>>,
+    /// Immutable Engine Rom values shared cheaply by each callback VM.
+    pub engine_rom: Arc<Vec<f64>>,
+    /// Live, 32-slot rows of entity data indexed by entity ID.
+    pub entity_data_array: Arc<RwLock<Vec<f64>>>,
+    /// Host-shared 32-slot rows for non-spawned level entities.
+    pub entity_shared_memory_array: Arc<RwLock<Vec<f64>>>,
+    /// Three-value rows: entity index, archetype index, and active flag.
+    pub entity_info_array: Arc<RwLock<Vec<f64>>>,
+    pub entity_archetype: Option<String>,
+    pub callback_name: Option<String>,
+    pub callback_node: Option<usize>,
+    /// Current entity's Entity Info block, unavailable to spawned entities.
+    pub entity_info: Option<[f64; 3]>,
+    /// Lifecycle permissions for mutable host blocks.
+    pub lifecycle_stage: Option<u8>,
+    /// Current non-spawned entity ID for entity-local block views.
+    pub entity_id: Option<usize>,
+    pub has_entity_data: bool,
+    pub has_entity_shared_memory: bool,
+    /// Entity Data Array writes are permitted only during preprocessing.
+    pub entity_data_array_writable: bool,
+}
+
+impl<'a> WatchVm<'a> {
+    pub fn new(nodes: &'a [crate::watch::EngineNode]) -> Self {
+        Self {
+            nodes,
+            memory: Memory::default(),
+            display_list: DisplayList::default(),
+            spawn_queue: Vec::new(),
+            scheduled_effects: Vec::new(),
+            destroyed_particle_effects: Vec::new(),
+            particle_events: Vec::new(),
+            evaluations: 0,
+            depth: 0,
+            block_depth: 0,
+            break_signal: None,
+            context: VmContext {
+                timescale: 1.0,
+                ..VmContext::default()
+            },
+            function_counts: BTreeMap::new(),
+            skin_checks: Vec::new(),
+            diagnostics: None,
+            loop_trace: Vec::new(),
+            trace_draws: false,
+            capture_draw_argument_values: false,
+            draw_argument_values: BTreeMap::new(),
+            draw_argument_value_texts: BTreeMap::new(),
+            draw_memory_reads: Vec::new(),
+            draw_memory_operations: Vec::new(),
+            last_memory_writes: BTreeMap::new(),
+        }
+    }
+
+    pub fn set_draw_tracing(&mut self, enabled: bool) {
+        self.trace_draws = enabled;
+        self.capture_draw_argument_values = enabled;
+    }
+
+    /// Capture a bounded VM trace from the start of the next execution.
+    /// Intended for small, targeted diagnostic calls and tests.
+    pub fn enable_diagnostics(&mut self, capacity: usize) -> Result<()> {
+        self.enable_diagnostics_after(capacity, 0)
+    }
+
+    /// Capture only the tail of a potentially expensive execution. The
+    /// evaluation cap and VM operation semantics remain unchanged.
+    pub fn enable_limit_diagnostics(&mut self, capacity: usize) -> Result<()> {
+        self.enable_diagnostics_after(capacity, MAX_EVALUATIONS.saturating_sub(16_384))
+    }
+
+    fn enable_diagnostics_after(
+        &mut self,
+        capacity: usize,
+        capture_after_evaluation: usize,
+    ) -> Result<()> {
+        if !(1..=4096).contains(&capacity) {
+            bail!("diagnostic event capacity must be in 1..=4096");
+        }
+        self.diagnostics = Some(VmDiagnostics {
+            capacity,
+            capture_after_evaluation,
+            events: VecDeque::with_capacity(capacity),
+        });
+        Ok(())
+    }
+
+    /// Return bounded diagnostics for an enabled VM, including runtime time
+    /// values and the most recent node, loop, and memory events.
+    pub fn diagnostic_report(&self) -> Option<String> {
+        let diagnostics = self.diagnostics.as_ref()?;
+        let current_time = self.memory_get(RUNTIME_UPDATE_BLOCK, 0);
+        let delta_time = self.memory_get(RUNTIME_UPDATE_BLOCK, 1);
+        let mut report = format!(
+            "Watch VM diagnostic: evaluations={}, time={}, deltaTime={}, timescale={}",
+            self.evaluations, current_time, delta_time, self.context.timescale
+        );
+        if !self.loop_trace.is_empty() {
+            let active = self
+                .loop_trace
+                .iter()
+                .filter_map(|frame| {
+                    let body = self
+                        .nodes
+                        .get(frame.node)
+                        .and_then(|node| node.args.get(frame.branch))
+                        .and_then(serde_json::Value::as_u64);
+                    body.map(|body| {
+                        format!(
+                            "node={} iteration={} branch={} body_node={body}",
+                            frame.node, frame.iteration, frame.branch
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !active.is_empty() {
+                report.push_str(&format!("\nActive loop fingerprint: {}", active.join("; ")));
+            }
+        }
+        if diagnostics.events.is_empty() {
+            report.push_str("\n(no events captured before execution stopped)");
+        } else {
+            let mut loop_branches = BTreeMap::<usize, BTreeSet<(usize, usize)>>::new();
+            let mut memory_slots = BTreeMap::<i64, BTreeSet<usize>>::new();
+            for event in &diagnostics.events {
+                if let Some(rest) = event.split("JumpLoop node=").nth(1) {
+                    let mut fields = rest.split_whitespace();
+                    let node = fields.next().and_then(|v| v.parse::<usize>().ok());
+                    let branch = rest
+                        .split("selected_branch=")
+                        .nth(1)
+                        .and_then(|v| v.split_whitespace().next())
+                        .and_then(|v| v.parse::<usize>().ok());
+                    let body = rest
+                        .split("branch_node=")
+                        .nth(1)
+                        .and_then(|v| v.split_whitespace().next())
+                        .and_then(|v| v.parse::<usize>().ok());
+                    if let (Some(node), Some(branch), Some(body)) = (node, branch, body) {
+                        loop_branches
+                            .entry(node)
+                            .or_default()
+                            .insert((branch, body));
+                    }
+                }
+                if let (Some(block), Some(slot)) = (
+                    event
+                        .split(" block=")
+                        .nth(1)
+                        .and_then(|v| v.split_whitespace().next())
+                        .and_then(|v| v.parse::<i64>().ok()),
+                    event
+                        .split(" index=")
+                        .nth(1)
+                        .and_then(|v| v.split_whitespace().next())
+                        .and_then(|v| v.parse::<usize>().ok()),
+                ) {
+                    memory_slots.entry(block).or_default().insert(slot);
+                }
+            }
+            if !loop_branches.is_empty() {
+                let summaries = loop_branches
+                    .iter()
+                    .map(|(node, branches)| {
+                        let branches = branches
+                            .iter()
+                            .map(|(branch, body)| format!("{branch}->{body}"))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("JumpLoop {node} branches [{branches}]")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                report.push_str(&format!("\nLoop fingerprint in trace window: {summaries}"));
+            }
+            if !memory_slots.is_empty() {
+                let accesses = memory_slots
+                    .iter()
+                    .map(|(block, slots)| {
+                        format!(
+                            "{block}=[{}]",
+                            slots
+                                .iter()
+                                .map(usize::to_string)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                report.push_str(&format!(
+                    "\nMemory block/index pairs in trace window: {accesses}"
+                ));
+            }
+            report.push_str(&format!(
+                "\nlast {} VM events (bounded capacity {}) :",
+                diagnostics.events.len(),
+                diagnostics.capacity
+            ));
+            for event in &diagnostics.events {
+                report.push_str("\n  ");
+                report.push_str(event);
+            }
+        }
+        Some(report)
+    }
+
+    fn record_diagnostic(&mut self, message: impl FnOnce() -> String) {
+        let Some(diagnostics) = self.diagnostics.as_mut() else {
+            return;
+        };
+        if self.evaluations < diagnostics.capture_after_evaluation {
+            return;
+        }
+        if diagnostics.events.len() == diagnostics.capacity {
+            diagnostics.events.pop_front();
+        }
+        let loops = self
+            .loop_trace
+            .iter()
+            .map(|frame| format!("{}#{}:branch{}", frame.node, frame.iteration, frame.branch))
+            .collect::<Vec<_>>()
+            .join("/");
+        let loop_context = if loops.is_empty() {
+            String::new()
+        } else {
+            format!(" loop={loops}")
+        };
+        diagnostics.events.push_back(format!(
+            "eval={}{} {}",
+            self.evaluations,
+            loop_context,
+            message()
+        ));
+    }
+
+    pub fn execute(&mut self, entry: usize) -> Result<f64> {
+        self.evaluations = 0;
+        self.depth = 0;
+        self.break_signal = None;
+        self.eval(entry)
+    }
+
+    pub fn evaluation_count(&self) -> usize {
+        self.evaluations
+    }
+
+    fn eval(&mut self, index: usize) -> Result<f64> {
+        self.evaluations += 1;
+        if self.evaluations > MAX_EVALUATIONS {
+            bail!("Watch execution exceeded the evaluation limit");
+        }
+        if self.depth >= MAX_CALL_DEPTH {
+            bail!("Watch execution exceeded the recursion limit at node {index}");
+        }
+        let node = self
+            .nodes
+            .get(index)
+            .with_context(|| format!("Watch node index {index} is out of bounds"))?;
+        if let Some(value) = node.value.as_ref().and_then(serde_json::Value::as_f64) {
+            if self.capture_draw_argument_values {
+                self.draw_argument_values.insert(index, value);
+                self.draw_argument_value_texts
+                    .insert(index, trace_value(value));
+            }
+            return Ok(value);
+        }
+        let function = node.func.as_deref().with_context(|| {
+            format!("Watch node {index} has neither a numeric value nor a function")
+        })?;
+        self.record_diagnostic(|| format!("node={index} function={function}"));
+        self.depth += 1;
+        let result = self.eval_function(index, function);
+        self.depth -= 1;
+        let result =
+            result.with_context(|| format!("executing Watch function {function} at node {index}"));
+        if self.capture_draw_argument_values {
+            if let Ok(value) = result.as_ref() {
+                self.draw_argument_values.insert(index, *value);
+                self.draw_argument_value_texts
+                    .insert(index, trace_value(*value));
+            }
+        }
+        result
+    }
+
+    fn arg(&mut self, node_index: usize, arg_index: usize) -> Result<f64> {
+        let index = self
+            .nodes
+            .get(node_index)
+            .and_then(|n| n.args.get(arg_index))
+            .with_context(|| format!("missing argument {arg_index} at node {node_index}"))?;
+        let index = index.as_u64().with_context(|| {
+            format!("argument {arg_index} of node {node_index} is not a node index")
+        })? as usize;
+        self.eval(index)
+    }
+
+    fn memory_get(&self, block: i64, slot: usize) -> f64 {
+        if block == 1004 {
+            self.context
+                .runtime_background
+                .read()
+                .ok()
+                .and_then(|values| values.get(slot).copied())
+                .unwrap_or(0.0)
+        } else if block == ENGINE_ROM_BLOCK {
+            self.context.engine_rom.get(slot).copied().unwrap_or(0.0)
+        } else if block == ENTITY_DATA_ARRAY_BLOCK {
+            self.context
+                .entity_data_array
+                .read()
+                .ok()
+                .and_then(|values| values.get(slot).copied())
+                .unwrap_or(0.0)
+        } else if block == 4001 {
+            if slot >= 32 {
+                return 0.0;
+            }
+            self.context
+                .entity_id
+                .filter(|_| self.context.has_entity_data)
+                .and_then(|id| {
+                    self.context
+                        .entity_data_array
+                        .read()
+                        .ok()
+                        .and_then(|values| values.get(id.saturating_mul(32) + slot).copied())
+                })
+                .unwrap_or(0.0)
+        } else if block == 4002 {
+            if slot >= 32 {
+                return 0.0;
+            }
+            self.context
+                .entity_id
+                .filter(|_| self.context.has_entity_shared_memory)
+                .and_then(|id| {
+                    self.context
+                        .entity_shared_memory_array
+                        .read()
+                        .ok()
+                        .and_then(|values| values.get(id.saturating_mul(32) + slot).copied())
+                })
+                .unwrap_or(0.0)
+        } else if block == ENTITY_SHARED_MEMORY_ARRAY_BLOCK {
+            self.context
+                .entity_shared_memory_array
+                .read()
+                .ok()
+                .and_then(|values| values.get(slot).copied())
+                .unwrap_or(0.0)
+        } else if block == ENTITY_INFO_ARRAY_BLOCK {
+            self.context
+                .entity_info_array
+                .read()
+                .ok()
+                .and_then(|values| values.get(slot).copied())
+                .unwrap_or(0.0)
+        } else if block == 4003 {
+            self.context
+                .entity_info
+                .and_then(|values| values.get(slot).copied())
+                .unwrap_or(0.0)
+        } else {
+            self.memory.get(block, slot)
+        }
+    }
+
+    fn memory_set(&mut self, block: i64, slot: usize, value: f64, node: usize) -> Result<()> {
+        if block == 1004 {
+            if !matches!(self.context.lifecycle_stage, Some(0 | 5)) {
+                bail!("Runtime Background is read-only in this lifecycle stage");
+            }
+            let mut values = self
+                .context
+                .runtime_background
+                .write()
+                .map_err(|_| anyhow::anyhow!("Runtime Background lock was poisoned"))?;
+            let target = values
+                .get_mut(slot)
+                .with_context(|| format!("Runtime Background index {slot} exceeds 7"))?;
+            *target = value;
+            self.last_memory_writes.insert((block, slot), (node, value));
+            return Ok(());
+        }
+        if block == ENGINE_ROM_BLOCK {
+            bail!("Engine Rom block is read-only");
+        }
+        if block == ENTITY_DATA_ARRAY_BLOCK {
+            if !self.context.entity_data_array_writable {
+                bail!("Entity Data Array block is read-only outside preprocessing");
+            }
+            let mut values = self
+                .context
+                .entity_data_array
+                .write()
+                .map_err(|_| anyhow::anyhow!("Entity Data Array lock was poisoned"))?;
+            if slot >= values.len() {
+                bail!(
+                    "Entity Data Array index {slot} is outside {} values",
+                    values.len()
+                );
+            }
+            values[slot] = value;
+            self.last_memory_writes.insert((block, slot), (node, value));
+            return Ok(());
+        }
+        if block == ENTITY_SHARED_MEMORY_ARRAY_BLOCK {
+            if !matches!(self.context.lifecycle_stage, Some(0 | 5)) {
+                bail!("Entity Shared Memory Array is read-only in this lifecycle stage");
+            }
+            let mut values = self
+                .context
+                .entity_shared_memory_array
+                .write()
+                .map_err(|_| anyhow::anyhow!("Entity Shared Memory Array lock was poisoned"))?;
+            if slot >= values.len() {
+                bail!(
+                    "Entity Shared Memory Array index {slot} is outside {} values",
+                    values.len()
+                );
+            }
+            values[slot] = value;
+            self.last_memory_writes.insert((block, slot), (node, value));
+            return Ok(());
+        }
+        if block == 4001 {
+            if self.context.lifecycle_stage != Some(0) {
+                bail!("Entity Data is read-only outside preprocessing");
+            }
+            if !self.context.has_entity_data {
+                bail!("Entity Data is unavailable for this entity");
+            }
+            if slot >= 32 {
+                bail!("Entity Data slot {slot} exceeds its 32-value row");
+            }
+            let id = self
+                .context
+                .entity_id
+                .context("missing current entity ID")?;
+            let mut values = self
+                .context
+                .entity_data_array
+                .write()
+                .map_err(|_| anyhow::anyhow!("Entity Data Array lock was poisoned"))?;
+            let index = id.saturating_mul(32).saturating_add(slot);
+            if index >= values.len() {
+                bail!("Entity Data row for entity {id} is outside the array");
+            }
+            values[index] = value;
+            self.last_memory_writes.insert((block, slot), (node, value));
+            return Ok(());
+        }
+        if block == 4002 {
+            if !matches!(self.context.lifecycle_stage, Some(0 | 5)) {
+                bail!("Entity Shared Memory is read-only in this lifecycle stage");
+            }
+            if !self.context.has_entity_shared_memory {
+                bail!("Entity Shared Memory is unavailable for this entity");
+            }
+            if slot >= 32 {
+                bail!("Entity Shared Memory slot {slot} exceeds its 32-value row");
+            }
+            let id = self
+                .context
+                .entity_id
+                .context("missing current entity ID")?;
+            let mut values = self
+                .context
+                .entity_shared_memory_array
+                .write()
+                .map_err(|_| anyhow::anyhow!("Entity Shared Memory Array lock was poisoned"))?;
+            let index = id.saturating_mul(32).saturating_add(slot);
+            if index >= values.len() {
+                bail!("Entity Shared Memory row for entity {id} is outside the array");
+            }
+            values[index] = value;
+            self.last_memory_writes.insert((block, slot), (node, value));
+            return Ok(());
+        }
+        if block == ENTITY_INFO_ARRAY_BLOCK || block == 4003 {
+            bail!("Entity Info memory blocks are read-only");
+        }
+        if block == 4001 && self.context.lifecycle_stage != Some(0) {
+            bail!("Entity Data is read-only outside preprocessing");
+        }
+        if block == 4002 && !matches!(self.context.lifecycle_stage, Some(0 | 5)) {
+            bail!("Entity Shared Memory is read-only in this lifecycle stage");
+        }
+        self.memory.set(block, slot, value);
+        if self.capture_draw_argument_values && block != 10000 {
+            let operation = self
+                .draw_memory_operations
+                .iter()
+                .rev()
+                .find(|operation| operation.node == node)
+                .cloned();
+            let (expression_values, expression_reads) = if block == 2000 {
+                self.trace_memory_write_expression(node)
+            } else {
+                (BTreeMap::new(), Vec::new())
+            };
+            if let Ok(mut origins) = self.context.memory_write_origins.write() {
+                origins.insert(
+                    memory_origin_key(self.context.entity_id, block, slot),
+                    MemoryWriteOrigin {
+                        node,
+                        entity_id: self.context.entity_id,
+                        archetype: self.context.entity_archetype.clone(),
+                        callback: self.context.callback_name.clone(),
+                        callback_node: self.context.callback_node,
+                        value: trace_value(value),
+                        operation,
+                        expression_values,
+                        expression_reads,
+                    },
+                );
+            }
+        }
+        self.last_memory_writes.insert((block, slot), (node, value));
+        Ok(())
+    }
+
+    fn trace_memory_write_expression(
+        &self,
+        writer_node: usize,
+    ) -> (BTreeMap<usize, String>, Vec<MemoryReadTrace>) {
+        let Some(root) = self
+            .nodes
+            .get(writer_node)
+            .and_then(|node| node.args.last())
+            .and_then(serde_json::Value::as_u64)
+            .map(|node| node as usize)
+        else {
+            return (BTreeMap::new(), Vec::new());
+        };
+        let mut pending = vec![root];
+        let mut seen = BTreeSet::new();
+        let mut values = BTreeMap::new();
+        let mut reads = BTreeMap::<usize, MemoryReadTrace>::new();
+        while let Some(index) = pending.pop() {
+            if !seen.insert(index) {
+                continue;
+            }
+            if let Some(value) = self.draw_argument_value_texts.get(&index) {
+                values.insert(index, value.clone());
+            }
+            if let Some(read) = self
+                .draw_memory_reads
+                .iter()
+                .rev()
+                .find(|read| read.node == index)
+            {
+                reads.insert(index, read.clone());
+            }
+            if let Some(node) = self.nodes.get(index) {
+                pending.extend(
+                    node.args
+                        .iter()
+                        .filter_map(serde_json::Value::as_u64)
+                        .map(|node| node as usize),
+                );
+            }
+        }
+        (values, reads.into_values().collect())
+    }
+
+    fn all_args(&mut self, node_index: usize) -> Result<Vec<f64>> {
+        let count = self
+            .nodes
+            .get(node_index)
+            .with_context(|| format!("Watch node index {node_index} is out of bounds"))?
+            .args
+            .len();
+        (0..count)
+            .map(|index| self.arg(node_index, index))
+            .collect()
+    }
+
+    fn eval_function(&mut self, index: usize, name: &str) -> Result<f64> {
+        *self.function_counts.entry(name.to_owned()).or_default() += 1;
+        let count = self.nodes[index].args.len();
+        let unary = |this: &mut Self| this.arg(index, 0);
+        let binary = |this: &mut Self| -> Result<(f64, f64)> {
+            Ok((this.arg(index, 0)?, this.arg(index, 1)?))
+        };
+        match name {
+            "Execute" => {
+                let mut result = 0.0;
+                for arg in 0..count {
+                    result = self.arg(index, arg)?;
+                    if self.break_signal.is_some() {
+                        break;
+                    }
+                }
+                Ok(result)
+            }
+            "If" => {
+                let test = unary(self)?;
+                let selected = if test == 0.0 { 2 } else { 1 };
+                self.record_diagnostic(|| {
+                    format!("If node={index} condition={test} selected_argument={selected}")
+                });
+                self.arg(index, selected)
+            }
+            "HasSkinSprite" | "HasEffectClip" | "HasParticleEffect" => {
+                let resource = integer(self.arg(index, 0)?, "resource id")?;
+                let exists = match name {
+                    "HasSkinSprite" => self
+                        .context
+                        .skin_sprites
+                        .values()
+                        .any(|id| *id as i64 == resource),
+                    "HasEffectClip" => self
+                        .context
+                        .effect_clips
+                        .values()
+                        .any(|id| *id as i64 == resource),
+                    _ => self
+                        .context
+                        .particle_effects
+                        .values()
+                        .any(|id| *id as i64 == resource),
+                };
+                if name == "HasSkinSprite" {
+                    self.skin_checks.push((resource, exists));
+                }
+                Ok(truth(exists))
+            }
+            "TimeToTimeScale" => {
+                let time = self.arg(index, 0)?;
+                self.context.time_to_timescale(time)
+            }
+            "TimeToScaledTime" => {
+                let time = self.arg(index, 0)?;
+                self.context.scaled_time(time)
+            }
+            "TimeToStartingTime" => {
+                let time = self.arg(index, 0)?;
+                self.context.time_to_starting_time(time)
+            }
+            "TimeToStartingScaledTime" => {
+                let time = self.arg(index, 0)?;
+                self.context.time_to_starting_scaled_time(time)
+            }
+            "BeatToTime" => {
+                let beat = self.arg(index, 0)?;
+                self.context.beat_to_time(beat)
+            }
+            "BeatToStartingTime" => {
+                let beat = self.arg(index, 0)?;
+                self.context.beat_to_starting_time(beat)
+            }
+            "BeatToStartingBeat" => {
+                let beat = self.arg(index, 0)?;
+                self.context.beat_to_starting_beat(beat)
+            }
+            "BeatToBPM" => {
+                let beat = self.arg(index, 0)?;
+                self.context.bpm_at_beat(beat)
+            }
+            "StreamHas" | "StreamGetValue" | "StreamGetPreviousKey" | "StreamGetNextKey" => {
+                let stream = integer(self.arg(index, 0)?, "stream id")?;
+                let time = self.arg(index, 1)?;
+                let key = self.context.streams.get(&(stream, 0));
+                match name {
+                    "StreamHas" => {
+                        Ok(truth(key.is_some_and(|events| {
+                            events.iter().any(|(t, _)| *t == time)
+                        })))
+                    }
+                    "StreamGetValue" => {
+                        Ok(stream_value(key.map(Vec::as_slice).unwrap_or(&[]), time))
+                    }
+                    "StreamGetPreviousKey" => Ok(key
+                        .and_then(|events| events.iter().rev().find(|(t, _)| *t < time))
+                        .map(|(t, _)| *t)
+                        .unwrap_or(time)),
+                    _ => Ok(key
+                        .and_then(|events| events.iter().find(|(t, _)| *t > time))
+                        .map(|(t, _)| *t)
+                        .unwrap_or(time)),
+                }
+            }
+            "SwitchIntegerWithDefault" | "SwitchWithDefault" => {
+                let discriminant = self.arg(index, 0)?;
+                let branch = integer(discriminant, "switch discriminant")?;
+                let branch = usize::try_from(branch).ok();
+                if count < 2 {
+                    bail!("{name} requires a discriminant and default branch");
+                }
+                let selected = branch
+                    .filter(|branch| *branch < count - 2)
+                    .map(|branch| branch + 1)
+                    .unwrap_or(count - 1);
+                self.arg(index, selected)
+            }
+            "SwitchInteger" | "Switch" => {
+                let discriminant = integer(self.arg(index, 0)?, "switch discriminant")?;
+                let selected = usize::try_from(discriminant)
+                    .ok()
+                    .filter(|branch| *branch + 1 < count);
+                match selected {
+                    Some(branch) => self.arg(index, branch + 1),
+                    None => Ok(0.0),
+                }
+            }
+            "JumpLoop" => {
+                if count == 0 {
+                    return Ok(0.0);
+                }
+                let mut selected = 0;
+                self.loop_trace.push(LoopTraceFrame {
+                    node: index,
+                    iteration: 0,
+                    branch: selected,
+                });
+                loop {
+                    if let Some(frame) = self.loop_trace.last_mut() {
+                        frame.iteration += 1;
+                        frame.branch = selected;
+                    }
+                    let iteration = self
+                        .loop_trace
+                        .last()
+                        .map(|frame| frame.iteration)
+                        .unwrap_or_default();
+                    let branch_node = self.nodes[index]
+                        .args
+                        .get(selected)
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|value| value as usize)
+                        .unwrap_or(usize::MAX);
+                    self.record_diagnostic(|| {
+                        format!(
+                            "JumpLoop node={index} iteration={iteration} selected_branch={selected} branch_node={branch_node}"
+                        )
+                    });
+                    let result = self.arg(index, selected)?;
+                    self.record_diagnostic(|| {
+                        format!(
+                            "JumpLoop node={index} iteration={iteration} branch_result={result}"
+                        )
+                    });
+                    if self.break_signal.is_some() {
+                        self.loop_trace.pop();
+                        return Ok(result);
+                    }
+                    if selected == count - 1 {
+                        self.loop_trace.pop();
+                        return Ok(result);
+                    }
+                    let Some(next) = usize::try_from(integer(result, "JumpLoop branch")?).ok()
+                    else {
+                        self.loop_trace.pop();
+                        return Ok(0.0);
+                    };
+                    if next >= count {
+                        self.loop_trace.pop();
+                        return Ok(0.0);
+                    }
+                    selected = next;
+                }
+            }
+            "While" => {
+                if count != 1 && count != 2 {
+                    bail!("While requires a body, or a condition and body; got {count} arguments");
+                }
+                let (condition, body) = if count == 1 { (None, 0) } else { (Some(0), 1) };
+                self.block_depth += 1;
+                let loop_depth = self.block_depth;
+                let result = (|| -> Result<f64> {
+                    let mut last_result = 0.0;
+                    loop {
+                        if let Some(condition) = condition {
+                            if self.arg(index, condition)? == 0.0 {
+                                return Ok(last_result);
+                            }
+                        }
+                        last_result = self.arg(index, body)?;
+                        if let Some((target, value)) = self.break_signal {
+                            if target == loop_depth {
+                                self.break_signal = None;
+                                return Ok(value);
+                            }
+                            if target < loop_depth {
+                                return Ok(value);
+                            }
+                        }
+                    }
+                })();
+                self.block_depth -= 1;
+                result
+            }
+            "Block" => {
+                self.block_depth += 1;
+                let result = unary(self)?;
+                let depth = self.block_depth;
+                self.block_depth -= 1;
+                if let Some((target, value)) = self.break_signal {
+                    if target == depth {
+                        self.break_signal = None;
+                        return Ok(value);
+                    }
+                }
+                Ok(result)
+            }
+            "Break" => {
+                if count != 2 {
+                    bail!("Break requires a block count and return value");
+                }
+                let count = index_of(self.arg(index, 0)?)?;
+                let value = self.arg(index, 1)?;
+                if self.block_depth == 0 {
+                    bail!("Break executed outside a Block");
+                }
+                if count == 0 || count > self.block_depth {
+                    bail!(
+                        "Break count {count} is outside the active block depth {}",
+                        self.block_depth
+                    );
+                }
+                self.break_signal = Some((self.block_depth - count + 1, value));
+                Ok(value)
+            }
+            "Get" => {
+                let block = self.arg(index, 0)?;
+                let slot = self.arg(index, 1)?;
+                let Ok(block) = integer(block, "block id") else {
+                    return Ok(0.0);
+                };
+                let Ok(slot) = index_of(slot) else {
+                    return Ok(0.0);
+                };
+                let value = self.memory_get(block, slot);
+                if self.capture_draw_argument_values {
+                    self.draw_memory_reads.push(MemoryReadTrace {
+                        node: index,
+                        block,
+                        index: slot,
+                        value,
+                        last_write: self.last_memory_writes.get(&(block, slot)).copied(),
+                        value_text: trace_value(value),
+                        last_write_value_text: self
+                            .last_memory_writes
+                            .get(&(block, slot))
+                            .map(|(_, value)| trace_value(*value)),
+                        last_write_origin: self.context.memory_write_origins.read().ok().and_then(
+                            |origins| {
+                                origins
+                                    .get(&memory_origin_key(self.context.entity_id, block, slot))
+                                    .cloned()
+                            },
+                        ),
+                    });
+                }
+                self.record_diagnostic(|| {
+                    format!("Get node={index} block={block} index={slot} value={value}")
+                });
+                Ok(value)
+            }
+            "GetPointed" => {
+                let block = integer(self.arg(index, 0)?, "block id")?;
+                let pointer_block = integer(self.arg(index, 1)?, "pointer block id")?;
+                let pointer_slot = index_of(self.arg(index, 2)?)?;
+                let pointer = self.memory_get(pointer_block, pointer_slot);
+                let Ok(slot) = index_of(pointer) else {
+                    return Ok(0.0);
+                };
+                let value = self.memory_get(block, slot);
+                self.record_diagnostic(|| {
+                    format!("GetPointed node={index} pointer={pointer_block}[{pointer_slot}]={pointer} target={block}[{slot}] value={value}")
+                });
+                Ok(value)
+            }
+            "GetShifted" => {
+                let block = self.arg(index, 0)?;
+                let x = self.arg(index, 1)?;
+                let y = self.arg(index, 2)?;
+                let stride = self.arg(index, 3)?;
+                let Ok(block) = integer(block, "block id") else {
+                    return Ok(0.0);
+                };
+                let Ok(slot) = index_of(x + y * stride) else {
+                    return Ok(0.0);
+                };
+                let value = self.memory_get(block, slot);
+                self.record_diagnostic(|| {
+                    format!("GetShifted node={index} block={block} x={x} y={y} stride={stride} index={slot} value={value}")
+                });
+                Ok(value)
+            }
+            "Set" | "SetAdd" | "SetSubtract" | "SetMultiply" | "SetDivide" => {
+                let block = integer(self.arg(index, 0)?, "block id")?;
+                let slot = index_of(self.arg(index, 1)?)?;
+                let value = self.arg(index, 2)?;
+                let old = self.memory_get(block, slot);
+                let result = match name {
+                    "Set" => value,
+                    "SetAdd" => old + value,
+                    "SetSubtract" => old - value,
+                    "SetMultiply" => old * value,
+                    "SetDivide" => old / value,
+                    _ => unreachable!(),
+                };
+                if self.capture_draw_argument_values {
+                    self.draw_memory_operations.push(MemoryOperationTrace {
+                        node: index,
+                        function: name.to_owned(),
+                        block,
+                        index: slot,
+                        old_value: trace_value(old),
+                        operand: trace_value(value),
+                        result: trace_value(result),
+                    });
+                }
+                self.memory_set(block, slot, result, index)?;
+                self.record_diagnostic(|| {
+                    format!("{name} node={index} block={block} index={slot} old={old} new={result}")
+                });
+                Ok(result)
+            }
+            "SetShifted" => {
+                let block = integer(self.arg(index, 0)?, "block id")?;
+                let x = self.arg(index, 1)?;
+                let y = self.arg(index, 2)?;
+                let stride = self.arg(index, 3)?;
+                let value = self.arg(index, 4)?;
+                let slot = index_of(x + y * stride)?;
+                let old = self.memory_get(block, slot);
+                self.memory_set(block, slot, value, index)?;
+                self.record_diagnostic(|| {
+                    format!("SetShifted node={index} block={block} x={x} y={y} stride={stride} index={slot} old={old} new={value}")
+                });
+                Ok(value)
+            }
+            "SetPointed" | "SetAddPointed" | "SetSubtractPointed" | "SetMultiplyPointed"
+            | "SetDividePointed" => {
+                let block = integer(self.arg(index, 0)?, "block id")?;
+                let pointer_block = integer(self.arg(index, 1)?, "pointer block id")?;
+                let pointer_slot = index_of(self.arg(index, 2)?)?;
+                let pointer = self.memory_get(pointer_block, pointer_slot);
+                let slot = index_of(pointer)?;
+                let value = self.arg(index, 3)?;
+                let old = self.memory_get(block, slot);
+                let result = match name {
+                    "SetPointed" => value,
+                    "SetAddPointed" => old + value,
+                    "SetSubtractPointed" => old - value,
+                    "SetMultiplyPointed" => old * value,
+                    "SetDividePointed" => old / value,
+                    _ => unreachable!(),
+                };
+                self.memory_set(block, slot, result, index)?;
+                self.record_diagnostic(|| {
+                    format!("{name} node={index} pointer={pointer_block}[{pointer_slot}]={pointer} target={block}[{slot}] old={old} new={result}")
+                });
+                Ok(result)
+            }
+            "IncrementPre" | "IncrementPost" | "DecrementPre" | "DecrementPost" => {
+                let block = integer(self.arg(index, 0)?, "block id")?;
+                let slot = index_of(self.arg(index, 1)?)?;
+                let old = self.memory_get(block, slot);
+                let new = if name.starts_with("Increment") {
+                    old + 1.0
+                } else {
+                    old - 1.0
+                };
+                self.memory_set(block, slot, new, index)?;
+                self.record_diagnostic(|| {
+                    format!("{name} node={index} block={block} index={slot} old={old} new={new}")
+                });
+                Ok(if name.ends_with("Pre") { new } else { old })
+            }
+            "Draw" => {
+                let args = self.all_args(index)?;
+                if args.len() != 11 && args.len() != 14 {
+                    bail!("Draw requires 11 or 14 arguments, got {}", args.len());
+                }
+                let sprite_id = integer(args[0], "sprite id")?;
+                let sprite_id =
+                    u32::try_from(sprite_id).context("sprite id is outside u32 range")?;
+                self.display_list.sprites.push(SpriteDraw {
+                    sprite_id,
+                    corners: [
+                        [args[1], args[2]],
+                        [args[3], args[4]],
+                        [args[5], args[6]],
+                        [args[7], args[8]],
+                    ],
+                    z: [
+                        args[9],
+                        *args.get(11).unwrap_or(&args[9]),
+                        *args.get(12).unwrap_or(&args[9]),
+                        *args.get(13).unwrap_or(&args[9]),
+                    ],
+                    alpha: args[10],
+                    provenance: Some(DrawProvenance {
+                        entity_id: self.context.entity_id,
+                        archetype: self.context.entity_archetype.clone(),
+                        callback: self.context.callback_name.clone(),
+                        callback_node: self.context.callback_node,
+                        draw_node: index,
+                    }),
+                    trace: self.trace_draws.then(|| DrawTrace {
+                        argument_nodes: self.nodes[index]
+                            .args
+                            .iter()
+                            .map(|argument| {
+                                argument
+                                    .as_u64()
+                                    .map(|node| node as usize)
+                                    .unwrap_or(usize::MAX)
+                            })
+                            .collect(),
+                        node_values: self.draw_argument_values.clone(),
+                        node_value_texts: self.draw_argument_value_texts.clone(),
+                        memory_reads: self.draw_memory_reads.clone(),
+                        memory_writes: self
+                            .last_memory_writes
+                            .iter()
+                            .map(|(&(block, index), &(node, value))| MemoryWriteTrace {
+                                node,
+                                block,
+                                index,
+                                value,
+                                value_text: trace_value(value),
+                            })
+                            .collect(),
+                        memory_operations: self.draw_memory_operations.clone(),
+                    }),
+                });
+                Ok(0.0)
+            }
+            "Spawn" => {
+                if count == 0 {
+                    bail!("Spawn requires an archetype identifier");
+                }
+                let mut args = self.all_args(index)?.into_iter();
+                let archetype_id = integer(args.next().unwrap_or_default(), "archetype id")?;
+                self.spawn_queue.push(SpawnRequest {
+                    archetype_id,
+                    data: args.collect(),
+                });
+                Ok(0.0)
+            }
+            "PlayScheduled" => {
+                let args = self.all_args(index)?;
+                if args.len() != 3 {
+                    bail!("PlayScheduled requires 3 arguments, got {}", args.len());
+                }
+                let clip_id = integer(args[0], "effect clip id")?;
+                if clip_id < 0 {
+                    bail!("effect clip id must be nonnegative, got {clip_id}");
+                }
+                let time = args[1];
+                let minimum_distance = args[2];
+                self.scheduled_effects.push(ScheduledEffect {
+                    clip_id,
+                    time,
+                    minimum_distance,
+                    requested_at: self.context.time,
+                    has_required_lead_time: time - self.context.time >= 0.5,
+                });
+                Ok(0.0)
+            }
+            "DestroyParticleEffect" => {
+                let args = self.all_args(index)?;
+                if args.len() != 1 {
+                    bail!(
+                        "DestroyParticleEffect requires 1 argument, got {}",
+                        args.len()
+                    );
+                }
+                let particle_id = integer(args[0], "particle effect instance id")?;
+                self.context
+                    .particle_instances
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("particle instance state lock was poisoned"))?
+                    .instances
+                    .remove(&particle_id);
+                self.destroyed_particle_effects
+                    .push(DestroyedParticleEffect { particle_id });
+                self.particle_events.push(ParticleEffectEvent::Destroy {
+                    instance_id: particle_id,
+                });
+                Ok(0.0)
+            }
+            "SpawnParticleEffect" => {
+                let args = self.all_args(index)?;
+                if args.len() != 11 {
+                    bail!(
+                        "SpawnParticleEffect requires 11 arguments, got {}",
+                        args.len()
+                    );
+                }
+                let effect_id = integer(args[0], "particle effect id")?;
+                if effect_id < 0 {
+                    bail!("particle effect id must be nonnegative, got {effect_id}");
+                }
+                let corners = [
+                    [args[1], args[2]],
+                    [args[3], args[4]],
+                    [args[5], args[6]],
+                    [args[7], args[8]],
+                ];
+                let duration = args[9];
+                let is_looped = args[10] != 0.0;
+
+                // The specification requires a unique instance identifier but
+                // leaves its numeric origin unspecified. Allocate monotonically
+                // from zero so identifiers are unique and deterministic.
+                let instance = {
+                    let mut state = self.context.particle_instances.write().map_err(|_| {
+                        anyhow::anyhow!("particle instance state lock was poisoned")
+                    })?;
+                    let instance_id = state.next_instance_id;
+                    if instance_id > (1_i64 << 53) {
+                        bail!("particle instance identifier space exhausted");
+                    }
+                    state.next_instance_id = instance_id
+                        .checked_add(1)
+                        .context("particle instance identifier space exhausted")?;
+                    let instance = ParticleEffectInstance {
+                        instance_id,
+                        effect_id,
+                        corners,
+                        duration,
+                        is_looped,
+                        spawned_at: self.context.time,
+                    };
+                    state.instances.insert(instance_id, instance.clone());
+                    instance
+                };
+                self.particle_events
+                    .push(ParticleEffectEvent::Spawn(instance.clone()));
+                Ok(instance.instance_id as f64)
+            }
+            "And" => {
+                let argument_count = self.nodes[index].args.len();
+                if argument_count == 0 {
+                    bail!("And requires at least one argument");
+                }
+                let mut result = 0.0;
+                for argument in 0..argument_count {
+                    result = self.arg(index, argument)?;
+                    if result == 0.0 {
+                        return Ok(0.0);
+                    }
+                }
+                Ok(result)
+            }
+            "Add" | "Multiply" | "Min" | "Max" | "Or" | "Mod" | "Rem" => {
+                let args = self.all_args(index)?;
+                let first = *args
+                    .first()
+                    .context("variadic function requires an argument")?;
+                Ok(match name {
+                    "Add" => args.iter().sum(),
+                    "Multiply" => args.iter().product(),
+                    "Min" => args.iter().copied().fold(first, f64::min),
+                    "Max" => args.iter().copied().fold(first, f64::max),
+                    "Or" => truth(args.iter().any(|value| *value != 0.0)),
+                    "Mod" => args
+                        .windows(2)
+                        .try_fold(first, |a, pair| modulus(a, pair[1]))?,
+                    "Rem" => args.windows(2).fold(first, |a, pair| a % pair[1]),
+                    _ => unreachable!(),
+                })
+            }
+            "Subtract" | "Divide" | "Power" | "Equal" | "NotEqual" | "Greater" | "GreaterOr"
+            | "Less" | "LessOr" => {
+                let (left, right) = binary(self)?;
+                Ok(match name {
+                    "Subtract" => left - right,
+                    "Divide" => left / right,
+                    "Power" => left.powf(right),
+                    "Equal" => truth(left == right),
+                    "NotEqual" => truth(left != right),
+                    "Greater" => truth(left > right),
+                    "GreaterOr" => truth(left >= right),
+                    "Less" => truth(left < right),
+                    "LessOr" => truth(left <= right),
+                    _ => unreachable!(),
+                })
+            }
+            "Abs" | "Arctan" | "Ceil" | "Copy" | "Cos" | "Floor" | "Log" | "Negate" | "Not"
+            | "Round" | "Sin" | "Trunc" | "Frac" | "Sign" | "Radian" | "Degree" | "Arcsin"
+            | "Arccos" | "Tan" | "Cosh" | "Sinh" | "Tanh" => {
+                let value = unary(self)?;
+                Ok(match name {
+                    "Abs" => value.abs(),
+                    "Arctan" => value.atan(),
+                    "Ceil" => value.ceil(),
+                    "Copy" => value,
+                    "Cos" => value.cos(),
+                    "Floor" => value.floor(),
+                    "Log" => value.ln(),
+                    "Negate" => -value,
+                    "Not" => truth(value == 0.0),
+                    "Round" => value.round(),
+                    "Sin" => value.sin(),
+                    "Trunc" => value.trunc(),
+                    "Frac" => value - value.trunc(),
+                    "Sign" => value.signum(),
+                    "Radian" => value.to_radians(),
+                    "Degree" => value.to_degrees(),
+                    "Arcsin" => value.asin(),
+                    "Arccos" => value.acos(),
+                    "Tan" => value.tan(),
+                    "Cosh" => value.cosh(),
+                    "Sinh" => value.sinh(),
+                    "Tanh" => value.tanh(),
+                    _ => unreachable!(),
+                })
+            }
+            "Clamp" | "Lerp" | "LerpClamped" | "Unlerp" | "UnlerpClamped" | "Remap"
+            | "RemapClamped" => {
+                let args = self.all_args(index)?;
+                if args.len() < 3 {
+                    bail!("{name} requires at least three arguments");
+                }
+                let (x, a, b) = (args[0], args[1], args[2]);
+                let result = match name {
+                    "Clamp" => x.clamp(a.min(b), a.max(b)),
+                    "Lerp" | "LerpClamped" => {
+                        if args.len() != 3 {
+                            bail!("{name} requires three arguments");
+                        }
+                        let t = if name == "LerpClamped" {
+                            b.clamp(0.0, 1.0)
+                        } else {
+                            b
+                        };
+                        x + (a - x) * t
+                    }
+                    // Sonolus orders Unlerp arguments as (minimum, maximum, value),
+                    // matching Lerp's endpoint-first convention.
+                    "Unlerp" => (b - x) / (a - x),
+                    "UnlerpClamped" => ((b - x) / (a - x)).clamp(0.0, 1.0),
+                    "Remap" | "RemapClamped" if args.len() == 5 => {
+                        let (from_min, from_max, to_min, to_max, value) =
+                            (args[0], args[1], args[2], args[3], args[4]);
+                        let t = (value - from_min) / (from_max - from_min);
+                        let t = if name == "RemapClamped" {
+                            t.clamp(0.0, 1.0)
+                        } else {
+                            t
+                        };
+                        to_min + (to_max - to_min) * t
+                    }
+                    _ => bail!("{name} requires five arguments"),
+                };
+                Ok(result)
+            }
+            name if name.starts_with("Ease") => {
+                let value = unary(self)?;
+                let curve = match name {
+                    "EaseInSine" => 1.0 - (value * std::f64::consts::FRAC_PI_2).cos(),
+                    "EaseOutSine" => (value * std::f64::consts::FRAC_PI_2).sin(),
+                    "EaseInOutSine" => {
+                        if value < 0.5 {
+                            (1.0 - (value * std::f64::consts::PI).cos()) / 2.0
+                        } else {
+                            (1.0 + ((value - 0.5) * std::f64::consts::PI).sin()) / 2.0
+                        }
+                    }
+                    "EaseInQuad" => value * value,
+                    "EaseOutQuad" => 1.0 - (1.0 - value) * (1.0 - value),
+                    "EaseInOutQuad" => {
+                        if value < 0.5 {
+                            2.0 * value * value
+                        } else {
+                            1.0 - (-2.0 * value + 2.0).powi(2) / 2.0
+                        }
+                    }
+                    _ => bail!("unsupported Watch function {name} at node {index}"),
+                };
+                Ok(curve)
+            }
+            _ => bail!("unsupported Watch function {name} at node {index}"),
+        }
+    }
+}
+
+impl VmContext {
+    pub fn scaled_time(&self, time: f64) -> Result<f64> {
+        let (anchor_time, anchor_scaled) = self
+            .time_map
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= time)
+            .copied()
+            .or_else(|| self.time_map.first().copied())
+            .context("scaled-time conversion requires a configured time map")?;
+        Ok(anchor_scaled + (time - anchor_time) * self.time_to_timescale(time)?)
+    }
+    pub fn time_to_timescale(&self, time: f64) -> Result<f64> {
+        Ok(self
+            .timescale_map
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= time)
+            .map(|(_, scale)| *scale)
+            .unwrap_or(1.0))
+    }
+    fn time_to_starting_time(&self, time: f64) -> Result<f64> {
+        Ok(time - self.starting_time)
+    }
+    fn time_to_starting_scaled_time(&self, time: f64) -> Result<f64> {
+        Ok(self.scaled_time(time)? - self.scaled_time(self.starting_time)?)
+    }
+    pub(crate) fn beat_to_time(&self, beat: f64) -> Result<f64> {
+        if self.bpm_map.is_empty() {
+            bail!("beat conversion requires a configured BPM map");
+        }
+        let mut elapsed = 0.0;
+        let mut previous_beat = self.bpm_map[0].0;
+        let mut bpm = self.bpm_map[0].1;
+        for (next_beat, next_bpm) in self.bpm_map.iter().copied().skip(1) {
+            if beat <= next_beat {
+                return Ok(elapsed + (beat - previous_beat) * 60.0 / bpm);
+            }
+            elapsed += (next_beat - previous_beat) * 60.0 / bpm;
+            previous_beat = next_beat;
+            bpm = next_bpm;
+        }
+        Ok(elapsed + (beat - previous_beat) * 60.0 / bpm)
+    }
+    fn beat_to_starting_time(&self, beat: f64) -> Result<f64> {
+        Ok(self.beat_to_time(beat)? - self.starting_time)
+    }
+    fn beat_to_starting_beat(&self, beat: f64) -> Result<f64> {
+        Ok(beat - self.starting_beat)
+    }
+    fn bpm_at_beat(&self, beat: f64) -> Result<f64> {
+        self.bpm_map
+            .iter()
+            .rev()
+            .find(|(b, _)| *b <= beat)
+            .map(|(_, v)| *v)
+            .or_else(|| self.bpm_map.first().map(|(_, v)| *v))
+            .context("BPM query requires a configured BPM map")
+    }
+}
+
+fn integer(value: f64, label: &str) -> Result<i64> {
+    if !value.is_finite()
+        || value.fract() != 0.0
+        || value < i64::MIN as f64
+        || value > i64::MAX as f64
+    {
+        bail!("{label} must be a finite integer, got {value}");
+    }
+    Ok(value as i64)
+}
+
+fn modulus(left: f64, right: f64) -> Result<f64> {
+    if right == 0.0 {
+        bail!("modulus by zero");
+    }
+    Ok(((left % right) + right.abs()) % right.abs())
+}
+
+fn stream_value(events: &[(f64, f64)], key: f64) -> f64 {
+    if events.is_empty() {
+        return 0.0;
+    }
+    if key <= events[0].0 {
+        return events[0].1;
+    }
+    for pair in events.windows(2) {
+        let (left_key, left_value) = pair[0];
+        let (right_key, right_value) = pair[1];
+        if key <= right_key {
+            return left_value
+                + (right_value - left_value) * ((key - left_key) / (right_key - left_key));
+        }
+    }
+    events.last().map(|(_, value)| *value).unwrap_or(0.0)
+}
+
+fn truth(value: bool) -> f64 {
+    if value {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn trace_value(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value == f64::INFINITY {
+        "+Infinity".to_owned()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+fn memory_origin_key(
+    entity_id: Option<usize>,
+    block: i64,
+    slot: usize,
+) -> (Option<usize>, i64, usize) {
+    let owner = matches!(block, 4000 | 4001 | 4002)
+        .then_some(entity_id)
+        .flatten();
+    (owner, block, slot)
+}
+
+fn index_of(value: f64) -> Result<usize> {
+    if !value.is_finite() || value.fract() != 0.0 || value < 0.0 || value > usize::MAX as f64 {
+        bail!("memory index must be a finite non-negative integer, got {value}");
+    }
+    Ok(value as usize)
+}

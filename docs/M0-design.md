@@ -41,7 +41,7 @@ Future crate extraction can follow dependency direction: `formats` is independen
 - Watch nodes preserve arbitrary operation/function names, indices, and operands (including operands not understood by this version).
 - Level entities preserve archetype identifiers and named/value data without requiring the selected engine to implement them.
 - SCP indexing resolves category/name records and resource blobs by repository hash, with hash verification when the package format provides an expected digest.
-- Compatibility output includes Sonolus/engine version, archetypes, node operations, memory-block references, resource bindings and required resources, plus level archetype matches. Parse, VM, rendering, particle, and audio status are separate fields; M0 reports runtime capabilities as unimplemented rather than inferring support from parse success.
+- Compatibility output includes Sonolus/engine version, archetypes, node operations, memory-block references, resource bindings and required resources, plus level archetype matches. Parse, VM, rendering, particle, and audio status are separate fields. VM/runtime support is reported as partial; package parsing does not imply complete runtime support.
 
 ## Open specification questions to verify against fixtures
 
