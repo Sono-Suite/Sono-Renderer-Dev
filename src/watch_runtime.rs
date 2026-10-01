@@ -19,6 +19,7 @@ const ENTITY_DATA: i64 = 4001;
 const ENTITY_SHARED_MEMORY: i64 = 4002;
 const TEMPORARY_MEMORY: i64 = 10000;
 const RUNTIME_UPDATE: i64 = 1001;
+const RUNTIME_SKIN_TRANSFORM: i64 = 1002;
 const RUNTIME_ENVIRONMENT: i64 = 1000;
 const LEVEL_OPTION: i64 = 2002;
 
@@ -86,6 +87,8 @@ pub struct FrameReport {
     pub vm_evaluations: u64,
     pub spawn_requests_produced: u64,
     pub runtime_background_quad: [f64; 8],
+    /// Runtime Skin Transform matrix as seen after this frame's callbacks.
+    pub runtime_skin_transform: [f64; 16],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -198,6 +201,13 @@ impl<'a> WatchRuntime<'a> {
             diagnostic_target: None,
             trace_draws: false,
         };
+        for index in 0..16 {
+            runtime.global_memory.set(
+                RUNTIME_SKIN_TRANSFORM,
+                index,
+                if index % 5 == 0 { 1.0 } else { 0.0 },
+            );
+        }
 
         for (index, source) in level.entities.iter().enumerate() {
             let archetype_name = source
@@ -623,6 +633,9 @@ impl<'a> WatchRuntime<'a> {
                 .read()
                 .map(|values| *values)
                 .unwrap_or_default(),
+            runtime_skin_transform: std::array::from_fn(|index| {
+                self.global_memory.get(RUNTIME_SKIN_TRANSFORM, index)
+            }),
         };
         Ok(report)
     }

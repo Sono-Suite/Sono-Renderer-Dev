@@ -399,6 +399,10 @@ fn main() -> Result<()> {
                     .map(|xy| [xy[0], xy[1]])
                     .collect::<Vec<_>>()
             );
+            println!(
+                "Runtime Skin Transform (row-major values 0..15): {:?}",
+                report.runtime_skin_transform
+            );
             let mut stages = std::collections::BTreeMap::new();
             for callback in &report.callbacks {
                 *stages
@@ -552,14 +556,17 @@ fn main() -> Result<()> {
                 let background = background_assets
                     .as_ref()
                     .map(|assets| (assets, runtime_background));
-                let ppm = report.display_list.render_skin_ppm_with_background(
-                    width,
-                    height,
-                    f64::from(width) / f64::from(height),
-                    skin,
-                    &skin_bindings,
-                    background,
-                )?;
+                let ppm = report
+                    .display_list
+                    .render_skin_ppm_with_runtime_transform_and_background(
+                        width,
+                        height,
+                        f64::from(width) / f64::from(height),
+                        skin,
+                        &skin_bindings,
+                        &report.runtime_skin_transform,
+                        background,
+                    )?;
                 println!(
                     "pre-encode RGB SHA-1: {}",
                     renderer::offline::hash_rgb(&renderer::offline::ppm_rgb_payload(
@@ -579,13 +586,16 @@ fn main() -> Result<()> {
                 let skin = skin_assets
                     .as_ref()
                     .context("--render-diagnostics-output requires loaded --resources")?;
-                let diagnostics = report.display_list.skin_render_diagnostics(
-                    width,
-                    height,
-                    f64::from(width) / f64::from(height),
-                    skin,
-                    &skin_bindings,
-                )?;
+                let diagnostics = report
+                    .display_list
+                    .skin_render_diagnostics_with_runtime_transform(
+                        width,
+                        height,
+                        f64::from(width) / f64::from(height),
+                        skin,
+                        &skin_bindings,
+                        &report.runtime_skin_transform,
+                    )?;
                 std::fs::write(&path, serde_json::to_vec_pretty(&diagnostics)?)
                     .with_context(|| format!("writing render diagnostics {}", path.display()))?;
                 println!("wrote per-Draw render diagnostics to {}", path.display());

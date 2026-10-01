@@ -13,6 +13,7 @@ const MAX_EVALUATIONS: usize = 5_000_000;
 const MAX_CALL_DEPTH: usize = 2048;
 const ENGINE_ROM_BLOCK: i64 = 3000;
 const RUNTIME_UPDATE_BLOCK: i64 = 1001;
+const RUNTIME_SKIN_TRANSFORM_BLOCK: i64 = 1002;
 const ENTITY_DATA_ARRAY_BLOCK: i64 = 4101;
 const ENTITY_SHARED_MEMORY_ARRAY_BLOCK: i64 = 4102;
 const ENTITY_INFO_ARRAY_BLOCK: i64 = 4103;
@@ -130,6 +131,9 @@ pub struct SkinDrawDiagnostic {
     pub atlas_nontransparent_pixels: u32,
     pub atlas_alpha_range: [u8; 2],
     pub input_corners: [[f64; 2]; 4],
+    /// Corners after Runtime Skin Transform and before the sprite Skin Data transform.
+    #[serde(default)]
+    pub runtime_transformed_corners: [[f64; 2]; 4],
     pub transformed_corners: [[f64; 2]; 4],
     pub screen_pixel_corners: [[f64; 2]; 4],
     pub atlas_rect: [u32; 4],
@@ -308,6 +312,25 @@ impl DisplayList {
         skin: &crate::formats::SkinAssets,
         bindings: &BTreeMap<u32, String>,
     ) -> Result<Vec<SkinDrawDiagnostic>> {
+        self.skin_render_diagnostics_with_runtime_transform(
+            width,
+            height,
+            aspect_ratio,
+            skin,
+            bindings,
+            &identity_skin_transform(),
+        )
+    }
+
+    pub fn skin_render_diagnostics_with_runtime_transform(
+        &self,
+        width: u32,
+        height: u32,
+        aspect_ratio: f64,
+        skin: &crate::formats::SkinAssets,
+        bindings: &BTreeMap<u32, String>,
+        runtime_transform: &[f64; 16],
+    ) -> Result<Vec<SkinDrawDiagnostic>> {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             bail!("frame dimensions must be in 1..=8192");
         }
@@ -344,7 +367,9 @@ impl DisplayList {
             {
                 bail!("skin sprite {sprite_name:?} has an invalid atlas rectangle");
             }
-            let transformed_corners = transform_skin_corners(draw.corners, sprite);
+            let runtime_transformed_corners =
+                transform_runtime_skin_corners(draw, runtime_transform);
+            let transformed_corners = transform_skin_corners(runtime_transformed_corners, sprite);
             let screen_pixel_corners = transformed_corners.map(|[x, y]| {
                 [
                     ((x / aspect_ratio + 1.0) * 0.5) * f64::from(width),
@@ -438,6 +463,7 @@ impl DisplayList {
                 atlas_nontransparent_pixels,
                 atlas_alpha_range: [min_alpha, max_alpha],
                 input_corners: draw.corners,
+                runtime_transformed_corners,
                 transformed_corners,
                 screen_pixel_corners,
                 atlas_rect: [sprite.x, sprite.y, sprite.width, sprite.height],
@@ -552,6 +578,27 @@ impl DisplayList {
         bindings: &BTreeMap<u32, String>,
         background: Option<(&crate::formats::BackgroundAssets, [[f64; 2]; 4])>,
     ) -> Result<Vec<u8>> {
+        self.render_skin_ppm_with_runtime_transform_and_background(
+            width,
+            height,
+            aspect_ratio,
+            skin,
+            bindings,
+            &identity_skin_transform(),
+            background,
+        )
+    }
+
+    pub fn render_skin_ppm_with_runtime_transform_and_background(
+        &self,
+        width: u32,
+        height: u32,
+        aspect_ratio: f64,
+        skin: &crate::formats::SkinAssets,
+        bindings: &BTreeMap<u32, String>,
+        runtime_transform: &[f64; 16],
+        background: Option<(&crate::formats::BackgroundAssets, [[f64; 2]; 4])>,
+    ) -> Result<Vec<u8>> {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             bail!("frame dimensions must be in 1..=8192");
         }
@@ -600,7 +647,8 @@ impl DisplayList {
             {
                 continue;
             }
-            let corners = transform_skin_corners(draw.corners, sprite);
+            let runtime_corners = transform_runtime_skin_corners(draw, runtime_transform);
+            let corners = transform_skin_corners(runtime_corners, sprite);
             if !corners.iter().flatten().all(|value| value.is_finite()) {
                 continue;
             }
@@ -782,6 +830,23 @@ pub fn compare_z_tuples(left: &[f64; 4], right: &[f64; 4]) -> std::cmp::Ordering
         }
     }
     std::cmp::Ordering::Equal
+}
+
+fn identity_skin_transform() -> [f64; 16] {
+    std::array::from_fn(|index| if index % 5 == 0 { 1.0 } else { 0.0 })
+}
+
+fn transform_runtime_skin_corners(draw: &SpriteDraw, matrix: &[f64; 16]) -> [[f64; 2]; 4] {
+    // Watch Draw corners are 2D screen positions; the Z tuple remains the
+    // painter-order input. Apply the first two rows of Runtime Skin Transform
+    // to each XY corner before the per-sprite Skin Data transform.
+    std::array::from_fn(|corner| {
+        let [x, y] = draw.corners[corner];
+        [
+            x * matrix[0] + y * matrix[1] + matrix[2] + matrix[3],
+            x * matrix[4] + y * matrix[5] + matrix[6] + matrix[7],
+        ]
+    })
 }
 
 fn transform_skin_corners(
@@ -1444,6 +1509,17 @@ impl<'a> WatchVm<'a> {
     }
 
     fn memory_set(&mut self, block: i64, slot: usize, value: f64, node: usize) -> Result<()> {
+        if block == RUNTIME_SKIN_TRANSFORM_BLOCK {
+            if !matches!(self.context.lifecycle_stage, Some(0 | 5)) {
+                bail!("Runtime Skin Transform is read-only in this lifecycle stage");
+            }
+            if slot >= 16 {
+                bail!("Runtime Skin Transform index {slot} exceeds 15");
+            }
+            self.memory.set(block, slot, value);
+            self.last_memory_writes.insert((block, slot), (node, value));
+            return Ok(());
+        }
         if block == 1004 {
             if !matches!(self.context.lifecycle_stage, Some(0 | 5)) {
                 bail!("Runtime Background is read-only in this lifecycle stage");

@@ -250,14 +250,17 @@ impl<'a> FrameSession<'a> {
             .try_into()
             .map_err(|_| anyhow::anyhow!("Runtime Background quad has invalid length"))?;
         let background = self.background.as_ref().map(|assets| (assets, quad));
-        let ppm = report.display_list.render_skin_ppm_with_background(
-            self.width,
-            self.height,
-            f64::from(self.width) / f64::from(self.height),
-            &self.skin,
-            &self.bindings,
-            background,
-        )?;
+        let ppm = report
+            .display_list
+            .render_skin_ppm_with_runtime_transform_and_background(
+                self.width,
+                self.height,
+                f64::from(self.width) / f64::from(self.height),
+                &self.skin,
+                &self.bindings,
+                &report.runtime_skin_transform,
+                background,
+            )?;
         Ok(RenderedFrame {
             report,
             rgb: ppm_rgb_payload(&ppm, self.width, self.height)?,

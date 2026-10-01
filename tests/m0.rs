@@ -1238,6 +1238,101 @@ fn skin_rasterizer_samples_bound_sprite_and_composites_alpha() {
 }
 
 #[test]
+fn runtime_skin_transform_precedes_sprite_transform_and_preserves_draw() {
+    use renderer::formats::{SkinAssets, SkinSpriteAsset};
+    use renderer::runtime::{DisplayList, SpriteDraw};
+    use std::collections::BTreeMap;
+
+    let sprite_transform = [
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    ];
+    let skin = SkinAssets {
+        width: 1,
+        height: 1,
+        interpolation: false,
+        rgba: vec![255, 255, 255, 255],
+        sprites: BTreeMap::from([(
+            "white".to_owned(),
+            SkinSpriteAsset {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                transform: sprite_transform,
+            },
+        )]),
+    };
+    let draw = SpriteDraw {
+        sprite_id: 0,
+        corners: [[-0.5, -0.5], [-0.5, 0.5], [0.5, 0.5], [0.5, -0.5]],
+        z: [0.0; 4],
+        alpha: 1.0,
+        provenance: None,
+        trace: None,
+    };
+    let display_list = DisplayList {
+        sprites: vec![draw.clone()],
+    };
+    let bindings = BTreeMap::from([(0, "white".to_owned())]);
+    let matrix = [
+        2.0, 0.0, 0.1, 0.25, 0.0, 2.0, 0.2, -0.25, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    let diagnostic = display_list
+        .skin_render_diagnostics_with_runtime_transform(100, 100, 1.0, &skin, &bindings, &matrix)
+        .unwrap()
+        .remove(0);
+    assert_eq!(diagnostic.input_corners, draw.corners);
+    assert_eq!(
+        diagnostic.runtime_transformed_corners,
+        [[-0.65, -1.05], [-0.65, 0.95], [1.35, 0.95], [1.35, -1.05]]
+    );
+    assert_eq!(
+        diagnostic.transformed_corners,
+        diagnostic.runtime_transformed_corners
+    );
+    assert_eq!(display_list.sprites[0], draw);
+}
+
+#[test]
+fn watch_runtime_skin_transform_starts_identity_and_accepts_preprocess_write() {
+    let level: renderer::formats::LevelData = serde_json::from_value(serde_json::json!({
+        "entities":[{"archetype":"Initialization","data":[]}]
+    }))
+    .unwrap();
+    let identity_watch: renderer::watch::WatchData = serde_json::from_value(serde_json::json!({
+        "archetypes":[{"name":"Initialization"}], "nodes":[]
+    }))
+    .unwrap();
+    let report = renderer::watch_runtime::WatchRuntime::new(&identity_watch, &level)
+        .unwrap()
+        .frame(0.0)
+        .unwrap();
+    assert_eq!(
+        report.runtime_skin_transform,
+        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    );
+
+    let watch: renderer::watch::WatchData = serde_json::from_value(serde_json::json!({
+        "archetypes":[{"name":"Initialization","preprocess":{"index":3}}],
+        "nodes":[{"value":1002},{"value":7},{"value":1.5},{"func":"Set","args":[0,1,2]}]
+    }))
+    .unwrap();
+    let report = renderer::watch_runtime::WatchRuntime::new(&watch, &level)
+        .unwrap()
+        .frame(0.0)
+        .unwrap();
+    assert_eq!(report.runtime_skin_transform[7], 1.5);
+    assert_eq!(report.runtime_skin_transform[0], 1.0);
+}
+
+#[test]
 fn skin_rasterizer_preserves_sonolus_bottom_left_corner_and_texture_orientation() {
     use renderer::formats::{SkinAssets, SkinSpriteAsset};
     use renderer::runtime::{DisplayList, SpriteDraw};
