@@ -155,6 +155,8 @@ impl<'a> FrameSession<'a> {
         resources_path: &std::path::Path,
         skin_name: &str,
         background_name: Option<&str>,
+        effect_name: Option<&str>,
+        particle_name: Option<&str>,
         width: u32,
         height: u32,
         fps: u32,
@@ -175,8 +177,49 @@ impl<'a> FrameSession<'a> {
         let bindings = skin_bindings(watch)?;
         let sprite_names = skin.sprites.keys().cloned().collect();
         runtime.bind_skin_sprite_names(&sprite_names)?;
+        if let Some(name) = effect_name {
+            let names = formats::load_effect_clip_names(resources_path, name)
+                .with_context(|| format!("resolving selected effect resource {name:?}"))?;
+            if watch
+                .effect
+                .get("clips")
+                .and_then(serde_json::Value::as_array)
+                .is_some()
+            {
+                runtime.bind_effect_clip_names(&names)?;
+            }
+        } else if watch
+            .effect
+            .get("clips")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|bindings| !bindings.is_empty())
+        {
+            bail!("engine declares effect clips but no effect resource was selected");
+        }
+        if let Some(name) = particle_name {
+            let names = formats::load_particle_effect_names(resources_path, name)
+                .with_context(|| format!("resolving selected particle resource {name:?}"))?;
+            if watch
+                .particle
+                .get("effects")
+                .and_then(serde_json::Value::as_array)
+                .is_some()
+            {
+                runtime.bind_particle_effect_names(&names)?;
+            }
+        } else if watch
+            .particle
+            .get("effects")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|bindings| !bindings.is_empty())
+        {
+            bail!("engine declares particle effects but no particle resource was selected");
+        }
         let background = background_name
-            .map(|name| formats::load_background_assets(resources_path, name))
+            .map(|name| {
+                formats::load_background_assets(resources_path, name)
+                    .with_context(|| format!("resolving selected background resource {name:?}"))
+            })
             .transpose()?;
         if let Some(assets) = background.as_ref() {
             let quad = assets.data.runtime_quad(

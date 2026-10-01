@@ -20,3 +20,7 @@ TestingSuite/
 artifacts/
 # Private Sonolus client analysis — NEVER COMMIT
 /sono-apk/
+/sdb-ref/
+/sonorust-ref/
+/sonorust-poc-ref/
+/nxsk-preview-ref/

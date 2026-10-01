@@ -3,7 +3,8 @@
 use crate::{
     formats::LevelData,
     runtime::{
-        DestroyedParticleEffect, DisplayList, Memory, ParticleEffectEvent, ScheduledEffect,
+        AudioEffectEvent, DebugEvent, DestroyedParticleEffect, DisplayList, Memory,
+        ParticleEffectEvent, ScheduledEffect, ScheduledLoopedEffect, ScheduledLoopedEffectStop,
         VmContext, WatchVm,
     },
     watch::{WatchArchetype, WatchData},
@@ -74,8 +75,12 @@ pub struct FrameReport {
     pub spawned: Vec<usize>,
     pub display_list: DisplayList,
     pub scheduled_effects: Vec<ScheduledEffect>,
+    pub scheduled_looped_effects: Vec<ScheduledLoopedEffect>,
+    pub scheduled_looped_effect_stops: Vec<ScheduledLoopedEffectStop>,
+    pub audio_events: Vec<AudioEffectEvent>,
     pub destroyed_particle_effects: Vec<DestroyedParticleEffect>,
     pub particle_events: Vec<ParticleEffectEvent>,
+    pub debug_events: Vec<DebugEvent>,
     pub function_counts: BTreeMap<String, u64>,
     pub skin_checks: Vec<(i64, bool)>,
     pub vm_evaluations: u64,
@@ -104,8 +109,12 @@ pub struct WatchRuntime<'a> {
     pub callback_log: Vec<CallbackRecord>,
     frame_display_list: DisplayList,
     frame_scheduled_effects: Vec<ScheduledEffect>,
+    frame_scheduled_looped_effects: Vec<ScheduledLoopedEffect>,
+    frame_scheduled_looped_effect_stops: Vec<ScheduledLoopedEffectStop>,
+    frame_audio_events: Vec<AudioEffectEvent>,
     frame_destroyed_particle_effects: Vec<DestroyedParticleEffect>,
     frame_particle_events: Vec<ParticleEffectEvent>,
+    frame_debug_events: Vec<DebugEvent>,
     frame_function_counts: BTreeMap<String, u64>,
     frame_skin_checks: Vec<(i64, bool)>,
     last_frame_time: Option<f64>,
@@ -175,8 +184,12 @@ impl<'a> WatchRuntime<'a> {
             callback_log: Vec::new(),
             frame_display_list: DisplayList::default(),
             frame_scheduled_effects: Vec::new(),
+            frame_scheduled_looped_effects: Vec::new(),
+            frame_scheduled_looped_effect_stops: Vec::new(),
+            frame_audio_events: Vec::new(),
             frame_destroyed_particle_effects: Vec::new(),
             frame_particle_events: Vec::new(),
+            frame_debug_events: Vec::new(),
             frame_function_counts: BTreeMap::new(),
             frame_skin_checks: Vec::new(),
             last_frame_time: None,
@@ -382,9 +395,36 @@ impl<'a> WatchRuntime<'a> {
                 .and_then(Value::as_u64)
                 .context("EngineWatchData skin binding has no nonnegative ID")?;
             if present_names.contains(name) {
-                self.context.skin_sprites.insert(name.to_owned(), id as u32);
+                let id = u32::try_from(id).context("skin sprite ID exceeds u32")?;
+                self.context.skin_sprites.insert(id);
             }
         }
+        Ok(())
+    }
+
+    /// Bind only effect clips declared by EngineWatchData and present in the
+    /// selected effect resource. Missing individual clips remain unavailable
+    /// to `HasEffectClip` instead of invalidating the resource package.
+    pub fn bind_effect_clip_names(&mut self, present_names: &BTreeSet<String>) -> Result<()> {
+        self.context.effect_clips = bind_named_ids(
+            &self.watch.effect,
+            "clips",
+            present_names,
+            "EngineWatchData effect binding",
+        )?;
+        Ok(())
+    }
+
+    /// Bind only particle effects declared by EngineWatchData and present in
+    /// the selected particle resource. Missing individual effects remain
+    /// unavailable to `HasParticleEffect`.
+    pub fn bind_particle_effect_names(&mut self, present_names: &BTreeSet<String>) -> Result<()> {
+        self.context.particle_effects = bind_named_ids(
+            &self.watch.particle,
+            "effects",
+            present_names,
+            "EngineWatchData particle binding",
+        )?;
         Ok(())
     }
 
@@ -482,8 +522,12 @@ impl<'a> WatchRuntime<'a> {
         self.callback_log.clear();
         self.frame_display_list = DisplayList::default();
         self.frame_scheduled_effects.clear();
+        self.frame_scheduled_looped_effects.clear();
+        self.frame_scheduled_looped_effect_stops.clear();
+        self.frame_audio_events.clear();
         self.frame_destroyed_particle_effects.clear();
         self.frame_particle_events.clear();
+        self.frame_debug_events.clear();
         self.frame_function_counts.clear();
         self.frame_skin_checks.clear();
         self.frame_vm_evaluations = 0;
@@ -563,8 +607,12 @@ impl<'a> WatchRuntime<'a> {
             spawned: (initial_entity_count..self.entities.len()).collect(),
             display_list: self.frame_display_list.clone(),
             scheduled_effects: self.frame_scheduled_effects.clone(),
+            scheduled_looped_effects: self.frame_scheduled_looped_effects.clone(),
+            scheduled_looped_effect_stops: self.frame_scheduled_looped_effect_stops.clone(),
+            audio_events: self.frame_audio_events.clone(),
             destroyed_particle_effects: self.frame_destroyed_particle_effects.clone(),
             particle_events: self.frame_particle_events.clone(),
+            debug_events: self.frame_debug_events.clone(),
             function_counts: self.frame_function_counts.clone(),
             skin_checks: self.frame_skin_checks.clone(),
             vm_evaluations: self.frame_vm_evaluations,
@@ -737,9 +785,15 @@ impl<'a> WatchRuntime<'a> {
             .sprites
             .extend(vm.display_list.sprites);
         self.frame_scheduled_effects.extend(vm.scheduled_effects);
+        self.frame_scheduled_looped_effects
+            .extend(vm.scheduled_looped_effects);
+        self.frame_scheduled_looped_effect_stops
+            .extend(vm.scheduled_looped_effect_stops);
+        self.frame_audio_events.extend(vm.audio_events);
         self.frame_destroyed_particle_effects
             .extend(vm.destroyed_particle_effects);
         self.frame_particle_events.extend(vm.particle_events);
+        self.frame_debug_events.extend(vm.debug_events);
         for (name, count) in vm.function_counts {
             *self.frame_function_counts.entry(name).or_default() += count;
         }
@@ -776,9 +830,15 @@ impl<'a> WatchRuntime<'a> {
             .sprites
             .extend(vm.display_list.sprites);
         self.frame_scheduled_effects.extend(vm.scheduled_effects);
+        self.frame_scheduled_looped_effects
+            .extend(vm.scheduled_looped_effects);
+        self.frame_scheduled_looped_effect_stops
+            .extend(vm.scheduled_looped_effect_stops);
+        self.frame_audio_events.extend(vm.audio_events);
         self.frame_destroyed_particle_effects
             .extend(vm.destroyed_particle_effects);
         self.frame_particle_events.extend(vm.particle_events);
+        self.frame_debug_events.extend(vm.debug_events);
         for (name, count) in vm.function_counts {
             *self.frame_function_counts.entry(name).or_default() += count;
         }
@@ -841,6 +901,34 @@ impl<'a> WatchRuntime<'a> {
             }
         }
     }
+}
+
+fn bind_named_ids(
+    binding_root: &Value,
+    collection: &str,
+    present_names: &BTreeSet<String>,
+    label: &str,
+) -> Result<BTreeSet<u32>> {
+    let bindings = binding_root
+        .get(collection)
+        .and_then(Value::as_array)
+        .with_context(|| format!("{label} has no {collection} array"))?;
+    let mut result = BTreeSet::new();
+    for (index, binding) in bindings.iter().enumerate() {
+        let name = binding
+            .get("name")
+            .and_then(Value::as_str)
+            .with_context(|| format!("{label} entry {index} has no string name"))?;
+        let id = binding
+            .get("id")
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+            .with_context(|| format!("{label} entry {index} has an invalid ID"))?;
+        if present_names.contains(name) {
+            result.insert(id);
+        }
+    }
+    Ok(result)
 }
 
 fn collect_entity_names(

@@ -442,6 +442,51 @@ fn supplied_skin_asset_loader_verifies_and_decodes_atlas() {
 }
 
 #[test]
+fn supplied_scp_resolves_next_sekai_effect_and_particle_names() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let scp = repo.join("ProSeka Faithful 0.8.3.scp");
+    let clips = renderer::formats::load_effect_clip_names(&scp, "sekai_q").unwrap();
+    let particles = renderer::formats::load_particle_effect_names(&scp, "NexintWaterMark").unwrap();
+    assert!(clips.contains("#PERFECT"));
+    assert!(clips.contains("Sekai Trace"));
+    assert!(particles.contains("#NOTE_LINEAR_TAP_GREEN"));
+    assert!(particles.contains("Sekai Note Lane Linear"));
+}
+
+#[test]
+fn watch_resource_binding_preserves_partial_has_effect_and_particle_availability() {
+    let watch: renderer::watch::WatchData = serde_json::from_value(serde_json::json!({
+        "skin":{"sprites":[]},
+        "effect":{"clips":[{"name":"present clip","id":11},{"name":"missing clip","id":12}]},
+        "particle":{"effects":[{"name":"present particle","id":21},{"name":"missing particle","id":22}]},
+        "archetypes":[],"nodes":[]
+    })).unwrap();
+    let level: renderer::formats::LevelData =
+        serde_json::from_value(serde_json::json!({"entities":[]})).unwrap();
+    let mut runtime = renderer::watch_runtime::WatchRuntime::new(&watch, &level).unwrap();
+    runtime
+        .bind_effect_clip_names(&["present clip".to_owned()].into())
+        .unwrap();
+    runtime
+        .bind_particle_effect_names(&["present particle".to_owned()].into())
+        .unwrap();
+
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value":11}, {"func":"HasEffectClip","args":[0]},
+        {"value":12}, {"func":"HasEffectClip","args":[2]},
+        {"value":21}, {"func":"HasParticleEffect","args":[4]},
+        {"value":22}, {"func":"HasParticleEffect","args":[6]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    vm.context = runtime.context.clone();
+    assert_eq!(vm.execute(1).unwrap(), 1.0);
+    assert_eq!(vm.execute(3).unwrap(), 0.0);
+    assert_eq!(vm.execute(5).unwrap(), 1.0);
+    assert_eq!(vm.execute(7).unwrap(), 0.0);
+}
+
+#[test]
 fn scp_resource_parsing_does_not_depend_on_filename_extension() {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let bytes = std::fs::read(repo.join("ProSeka Faithful 0.8.3.scp")).unwrap();
@@ -540,6 +585,44 @@ fn supplied_fixture_trace_reaches_a_real_entity_preprocess_callback() {
     runtime
         .bind_engine_option_defaults(&engine.configuration)
         .unwrap();
+    let resources = repo.join("ProSeka Faithful 0.8.3.scp");
+    let skin_name = engine.metadata.skin_name.as_deref().unwrap();
+    let skin = renderer::formats::load_skin_assets(&resources, skin_name).unwrap();
+    let sprite_names = skin.sprites.keys().cloned().collect();
+    runtime.bind_skin_sprite_names(&sprite_names).unwrap();
+    let effect_name = engine.metadata.effect_name.as_deref().unwrap();
+    let effect_names = renderer::formats::load_effect_clip_names(&resources, effect_name).unwrap();
+    runtime.bind_effect_clip_names(&effect_names).unwrap();
+    let particle_name = engine.metadata.particle_name.as_deref().unwrap();
+    let particle_names =
+        renderer::formats::load_particle_effect_names(&resources, particle_name).unwrap();
+    runtime.bind_particle_effect_names(&particle_names).unwrap();
+    let background_name = engine.metadata.background_name.as_deref().unwrap();
+    let background =
+        renderer::formats::load_background_assets(&resources, background_name).unwrap();
+    let background_quad = background
+        .data
+        .runtime_quad(
+            1280.0 / 720.0,
+            f64::from(background.width) / f64::from(background.height),
+        )
+        .unwrap();
+    runtime
+        .set_runtime_background_quad(background_quad)
+        .unwrap();
+    assert!(runtime.context.skin_sprites.contains(&70));
+    assert!(runtime.context.skin_sprites.contains(&258));
+    assert!(runtime.context.effect_clips.contains(&0));
+    assert!(!runtime.context.particle_effects.is_empty());
+    let resource_check_nodes: Vec<renderer::watch::EngineNode> =
+        serde_json::from_value(serde_json::json!([
+            {"value": 70},
+            {"func": "HasSkinSprite", "args": [0]}
+        ]))
+        .unwrap();
+    let mut resource_check = renderer::runtime::WatchVm::new(&resource_check_nodes);
+    resource_check.context = runtime.context.clone();
+    assert_eq!(resource_check.execute(1).unwrap(), 1.0);
     runtime
         .bind_engine_option_defaults(&engine.configuration)
         .unwrap();
@@ -777,6 +860,237 @@ fn watch_vm_executes_control_memory_math_and_draw() {
     assert_eq!(trace.argument_nodes, (10..=20).collect::<Vec<_>>());
     assert_eq!(trace.node_values[&10], 1.0);
     assert_eq!(trace.node_values[&20], 8.0);
+}
+
+#[test]
+fn watch_draw_negative_one_is_oracle_verified_noop_and_execution_continues() {
+    use renderer::watch::EngineNode as N;
+    let nodes: Vec<N> = serde_json::from_value(serde_json::json!([
+        {"value":-1},
+        {"value":-0.2}, {"value":-0.2}, {"value":-0.2}, {"value":0.2},
+        {"value":0.2}, {"value":0.2}, {"value":0.2}, {"value":-0.2},
+        {"value":0}, {"value":1},
+        {"func":"Draw","args":[0,1,2,3,4,5,6,7,8,9,10]},
+        {"value":1},
+        {"value":0}, {"value":-0.2}, {"value":0.2}, {"value":-0.2},
+        {"value":0.2}, {"value":0.2}, {"value":0.2}, {"value":-0.2},
+        {"value":0}, {"value":1},
+        {"func":"Draw","args":[12,13,14,15,16,17,18,19,20,21,22]},
+        {"func":"Execute","args":[11,23]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+
+    assert_eq!(vm.execute(24).unwrap(), 0.0);
+    assert_eq!(vm.display_list.sprites.len(), 1);
+    assert_eq!(vm.display_list.sprites[0].sprite_id, 1);
+}
+
+#[test]
+fn watch_draw_negative_one_evaluates_other_arguments_before_noop() {
+    use renderer::watch::EngineNode as N;
+    let nodes: Vec<N> = serde_json::from_value(serde_json::json!([
+        {"value":-1}, {"value":10000}, {"value":3}, {"value":42},
+        {"func":"Set","args":[1,2,3]},
+        {"value":0}, {"value":0}, {"value":0}, {"value":1},
+        {"value":1}, {"value":1}, {"value":0}, {"value":0}, {"value":0},
+        {"func":"Draw","args":[0,4,5,6,7,8,9,10,11,12,13]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+
+    assert_eq!(vm.execute(14).unwrap(), 0.0);
+    assert_eq!(vm.memory.get(10000, 3), 42.0);
+    assert!(vm.display_list.sprites.is_empty());
+}
+
+#[test]
+fn watch_draw_negative_two_keeps_existing_rejection() {
+    use renderer::watch::EngineNode as N;
+    let nodes: Vec<N> = serde_json::from_value(serde_json::json!([
+        {"value":-2}, {"value":-0.2}, {"value":-0.2}, {"value":-0.2},
+        {"value":0.2}, {"value":0.2}, {"value":0.2}, {"value":0.2},
+        {"value":-0.2}, {"value":0}, {"value":1},
+        {"func":"Draw","args":[0,1,2,3,4,5,6,7,8,9,10]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+
+    let error = vm.execute(11).unwrap_err();
+    assert!(format!("{error:#}").contains("sprite id is outside u32 range"));
+    assert!(vm.display_list.sprites.is_empty());
+}
+
+#[test]
+fn watch_pointed_memory_uses_in_block_pointer_pair_and_offset() {
+    use renderer::watch::EngineNode as N;
+    let nodes: Vec<N> = serde_json::from_value(serde_json::json!([
+        {"value":10000}, {"value":0}, {"value":2},
+        {"func":"GetPointed","args":[0,1,2]},
+        {"value":5}, {"func":"SetAddPointed","args":[0,1,2,4]},
+        {"func":"GetPointed","args":[0,1,2]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    vm.memory.set(10000, 0, 2000.0);
+    vm.memory.set(10000, 1, 4.0);
+    vm.memory.set(2000, 6, 77.0);
+
+    assert_eq!(vm.execute(3).unwrap(), 77.0);
+    assert_eq!(vm.execute(5).unwrap(), 82.0);
+    assert_eq!(vm.memory.get(2000, 6), 82.0);
+    assert_eq!(vm.execute(6).unwrap(), 82.0);
+}
+
+#[test]
+fn watch_shifted_and_pointed_memory_variants_apply_documented_updates() {
+    use renderer::watch::EngineNode as N;
+    let nodes: Vec<N> = serde_json::from_value(serde_json::json!([
+        {"value":10000}, {"value":1}, {"value":2}, {"value":3}, {"value":4},
+        {"func":"SetModShifted","args":[0,1,2,3,4]},
+        {"value":10000}, {"value":0}, {"value":0}, {"value":3},
+        {"func":"IncrementPrePointed","args":[6,7,8]},
+        {"value":10000}, {"value":2}, {"value":3}, {"value":1},
+        {"func":"DecrementPostShifted","args":[11,12,13,14]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    vm.memory.set(10000, 7, 17.0); // shifted slot x + y*s = 1 + 2*3
+    vm.memory.set(10000, 0, 10000.0); // pointed target block
+    vm.memory.set(10000, 1, 8.0); // pointed target index
+    vm.memory.set(10000, 8, 5.0); // pointed target before increment
+    vm.memory.set(10000, 5, 5.0); // shifted decrement slot x + y*s = 2 + 3*1
+
+    assert_eq!(vm.execute(5).unwrap(), 1.0); // 17 mod 4
+    assert_eq!(vm.memory.get(10000, 7), 1.0);
+    assert_eq!(vm.execute(10).unwrap(), 6.0);
+    assert_eq!(vm.memory.get(10000, 8), 6.0);
+    assert_eq!(vm.execute(15).unwrap(), 5.0); // post-decrement returns old
+    assert_eq!(vm.memory.get(10000, 5), 4.0);
+}
+
+#[test]
+fn watch_do_while_runs_body_before_test_and_returns_zero() {
+    use renderer::watch::EngineNode as N;
+    let nodes: Vec<N> = serde_json::from_value(serde_json::json!([
+        {"value":10000}, {"value":0}, {"value":1},
+        {"func":"SetAdd","args":[0,1,2]},
+        {"value":10000}, {"value":0}, {"func":"Get","args":[4,5]},
+        {"value":3}, {"func":"Less","args":[6,7]},
+        {"func":"DoWhile","args":[3,8]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+
+    assert_eq!(vm.execute(9).unwrap(), 0.0);
+    assert_eq!(vm.memory.get(10000, 0), 3.0);
+}
+
+#[test]
+fn watch_stream_queries_use_keyed_entries_and_interpolation() {
+    use renderer::watch::EngineNode as N;
+    let nodes: Vec<N> = serde_json::from_value(serde_json::json!([
+        {"value": 7}, {"value": 0.5}, {"func":"StreamHas","args":[0,1]},
+        {"value": 7}, {"value": 1}, {"func":"StreamHas","args":[3,4]},
+        {"value": 7}, {"value": 2}, {"func":"StreamGetValue","args":[6,7]},
+        {"value": 7}, {"value": 1}, {"func":"StreamGetNextKey","args":[9,10]},
+        {"value": 7}, {"value": 2}, {"func":"StreamGetPreviousKey","args":[12,13]},
+        {"value": 7}, {"value": -1}, {"func":"StreamGetPreviousKey","args":[15,16]},
+        {"value": 7}, {"value": 5}, {"func":"StreamGetNextKey","args":[18,19]},
+        {"value": 7}, {"value": -1}, {"func":"StreamGetValue","args":[21,22]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    vm.context
+        .streams
+        .insert((7, 0), vec![(1.0, 10.0), (3.0, 30.0)]);
+
+    assert_eq!(vm.execute(2).unwrap(), 0.0);
+    assert_eq!(vm.execute(5).unwrap(), 1.0);
+    assert_eq!(vm.execute(8).unwrap(), 20.0);
+    assert_eq!(vm.execute(11).unwrap(), 3.0);
+    assert_eq!(vm.execute(14).unwrap(), 1.0);
+    assert_eq!(vm.execute(17).unwrap(), -1.0);
+    assert_eq!(vm.execute(20).unwrap(), 5.0);
+    assert_eq!(vm.execute(23).unwrap(), 10.0);
+}
+
+fn execute_copy(
+    source_block: i64,
+    source_index: usize,
+    destination_block: i64,
+    destination_index: usize,
+    count: usize,
+    initial: &[(i64, usize, f64)],
+) -> (f64, renderer::runtime::Memory) {
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value":source_block}, {"value":source_index}, {"value":destination_block},
+        {"value":destination_index}, {"value":count},
+        {"func":"Copy","args":[0,1,2,3,4]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    for &(block, index, value) in initial {
+        vm.memory.set(block, index, value);
+    }
+    let result = vm.execute(5).unwrap();
+    (result, vm.memory)
+}
+
+#[test]
+fn watch_vm_copy_copies_ranges_and_returns_zero() {
+    // Disjoint ranges in one block.
+    let (result, memory) = execute_copy(10000, 1, 10000, 4, 2, &[(10000, 1, 7.0), (10000, 2, 8.0)]);
+    assert_eq!(result, 0.0);
+    assert_eq!(memory.get(10000, 4), 7.0);
+    assert_eq!(memory.get(10000, 5), 8.0);
+
+    // Distinct supported blocks.
+    let (result, memory) = execute_copy(2000, 0, 10000, 3, 2, &[(2000, 0, 11.0), (2000, 1, 12.0)]);
+    assert_eq!(result, 0.0);
+    assert_eq!(memory.get(10000, 3), 11.0);
+    assert_eq!(memory.get(10000, 4), 12.0);
+
+    // Destination starts before source.
+    let initial: Vec<_> = (0..5)
+        .map(|index| (10000, index, (index + 1) as f64 * 10.0))
+        .collect();
+    let (result, memory) = execute_copy(10000, 1, 10000, 0, 4, &initial);
+    assert_eq!(result, 0.0);
+    assert_eq!(
+        (0..5).map(|i| memory.get(10000, i)).collect::<Vec<_>>(),
+        [20.0, 30.0, 40.0, 50.0, 50.0]
+    );
+
+    // Destination starts inside/after source. Snapshot semantics avoid
+    // overwriting values that later source reads still need.
+    let initial: Vec<_> = (0..5)
+        .map(|index| (10000, index, (index + 1) as f64 * 10.0))
+        .collect();
+    let (result, memory) = execute_copy(10000, 0, 10000, 1, 4, &initial);
+    assert_eq!(result, 0.0);
+    assert_eq!(
+        (0..5).map(|i| memory.get(10000, i)).collect::<Vec<_>>(),
+        [10.0, 10.0, 20.0, 30.0, 40.0]
+    );
+
+    // A zero count copies no values and still returns the specified zero.
+    let (result, memory) = execute_copy(10000, 1, 10000, 0, 0, &[(10000, 0, 5.0)]);
+    assert_eq!(result, 0.0);
+    assert_eq!(memory.get(10000, 0), 5.0);
+
+    // Exact Next SEKAI regression: overlapping shift of the two-slot cursor.
+    let (result, memory) = execute_copy(
+        10000,
+        1,
+        10000,
+        0,
+        2,
+        &[(10000, 0, 1.0), (10000, 1, 37.0), (10000, 2, 39.0)],
+    );
+    assert_eq!(result, 0.0);
+    assert_eq!(memory.get(10000, 0), 37.0);
+    assert_eq!(memory.get(10000, 1), 39.0);
 }
 
 #[test]
@@ -1319,6 +1633,90 @@ fn watch_vm_ease_in_out_quad_matches_sonolus_piecewise_curve_without_clamping() 
 }
 
 #[test]
+fn watch_vm_implements_all_documented_sonolus_easing_curves() {
+    // Reference samples at x=0.25 and x=0.75 calculated from the
+    // specification-linked easings.net equations. Two interior points also
+    // exercise both halves of each InOut/OutIn curve.
+    let cases = [
+        ("EaseInSine", 0.07612046748871326, 0.6173165676349102),
+        ("EaseInQuad", 0.0625, 0.5625),
+        ("EaseInCubic", 0.015625, 0.421875),
+        ("EaseInQuart", 0.00390625, 0.31640625),
+        ("EaseInQuint", 0.0009765625, 0.2373046875),
+        ("EaseInExpo", 0.005524271728019903, 0.1767766952966369),
+        ("EaseInCirc", 0.031754163448145745, 0.3385621722338523),
+        ("EaseInBack", -0.0641365625, 0.1825903124999997),
+        ("EaseInElastic", -0.005524271728019903, 0.08838834764831845),
+        ("EaseOutSine", 0.3826834323650898, 0.9238795325112867),
+        ("EaseOutQuad", 0.4375, 0.9375),
+        ("EaseOutCubic", 0.578125, 0.984375),
+        ("EaseOutQuart", 0.68359375, 0.99609375),
+        ("EaseOutQuint", 0.7626953125, 0.9990234375),
+        ("EaseOutExpo", 0.8232233047033631, 0.99447572827198),
+        ("EaseOutCirc", 0.6614378277661477, 0.9682458365518543),
+        ("EaseOutBack", 0.8174096875000002, 1.0641365625),
+        ("EaseOutElastic", 0.9116116523516816, 1.00552427172802),
+        ("EaseInOutSine", 0.1464466094067262, 0.8535533905932737),
+        ("EaseInOutQuad", 0.125, 0.875),
+        ("EaseInOutCubic", 0.0625, 0.9375),
+        ("EaseInOutQuart", 0.03125, 0.96875),
+        ("EaseInOutQuint", 0.015625, 0.984375),
+        ("EaseInOutExpo", 0.015625, 0.984375),
+        ("EaseInOutCirc", 0.0669872981077807, 0.9330127018922193),
+        ("EaseInOutBack", -0.04384875000000002, 1.04384875),
+        ("EaseInOutElastic", -0.007812500000000023, 1.0078125),
+        ("EaseOutInSine", 0.3535533905932737, 0.6464466094067263),
+        ("EaseOutInQuad", 0.375, 0.625),
+        ("EaseOutInCubic", 0.4375, 0.5625),
+        ("EaseOutInQuart", 0.46875, 0.53125),
+        ("EaseOutInQuint", 0.484375, 0.515625),
+        ("EaseOutInExpo", 0.484375, 0.515625),
+        ("EaseOutInCirc", 0.4330127018922193, 0.5669872981077807),
+        ("EaseOutInBack", 0.54384875, 0.45615125),
+        ("EaseOutInElastic", 0.5078125, 0.4921875),
+    ];
+
+    for (name, at_quarter, at_three_quarters) in cases {
+        for (input, expected) in [
+            (0.0, 0.0),
+            (0.25, at_quarter),
+            (0.75, at_three_quarters),
+            (1.0, 1.0),
+        ] {
+            let nodes: Vec<renderer::watch::EngineNode> =
+                serde_json::from_value(serde_json::json!([
+                    {"value":input}, {"func":name,"args":[0]}
+                ]))
+                .unwrap();
+            let mut vm = renderer::runtime::WatchVm::new(&nodes);
+            let actual = vm.execute(1).unwrap();
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "{name}({input}) = {actual}, expected {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn watch_vm_easing_extrapolates_without_undocumented_clamping() {
+    for (name, input, expected) in [
+        ("EaseInQuad", -0.5, 0.25),
+        ("EaseOutQuad", 1.5, 0.75),
+        ("EaseInOutQuad", -0.5, 0.5),
+        ("EaseOutInQuad", 1.5, 2.5),
+    ] {
+        let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+            {"value":input}, {"func":name,"args":[0]}
+        ]))
+        .unwrap();
+        let mut vm = renderer::runtime::WatchVm::new(&nodes);
+        let actual = vm.execute(1).unwrap();
+        assert_eq!(actual, expected, "{name}({input})");
+    }
+}
+
+#[test]
 fn watch_vm_play_scheduled_emits_timeline_effect_and_returns_zero() {
     let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
         {"value": 7}, {"value": 2.0}, {"value": 0.25},
@@ -1349,6 +1747,175 @@ fn watch_vm_play_scheduled_emits_timeline_effect_and_returns_zero() {
     vm.context.time = 1.0;
     assert_eq!(vm.execute(3).unwrap(), 0.0);
     assert!(!vm.scheduled_effects[0].has_required_lead_time);
+}
+
+#[test]
+fn watch_vm_immediate_audio_emits_commands_and_shares_loop_handles() {
+    let play_nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": 12}, {"value": 0.25}, {"func":"Play","args":[0,1]},
+        {"value": 13}, {"func":"PlayLooped","args":[3]}
+    ]))
+    .unwrap();
+    let mut play_vm = renderer::runtime::WatchVm::new(&play_nodes);
+    play_vm.context.time = 1.5;
+    assert_eq!(play_vm.execute(2).unwrap(), 0.0);
+    let instance_id = play_vm.execute(4).unwrap();
+    assert_eq!(instance_id, 0.0);
+    assert_eq!(
+        play_vm.audio_events,
+        vec![
+            renderer::runtime::AudioEffectEvent::Play {
+                clip_id: 12,
+                minimum_distance: 0.25,
+                requested_at: 1.5,
+            },
+            renderer::runtime::AudioEffectEvent::StartLoop {
+                instance_id: 0,
+                clip_id: 13,
+                requested_at: 1.5,
+            }
+        ]
+    );
+
+    let stop_nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": instance_id}, {"func":"StopLooped","args":[0]}
+    ]))
+    .unwrap();
+    let mut stop_vm = renderer::runtime::WatchVm::new(&stop_nodes);
+    stop_vm.context = play_vm.context.clone();
+    stop_vm.context.time = 2.0;
+    assert_eq!(stop_vm.execute(1).unwrap(), 0.0);
+    assert_eq!(
+        stop_vm.audio_events,
+        vec![renderer::runtime::AudioEffectEvent::StopLoop {
+            instance_id: 0,
+            requested_at: 2.0,
+        }]
+    );
+}
+
+#[test]
+fn watch_vm_play_looped_scheduled_returns_unique_ids_and_retains_schedule() {
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": 7}, {"value": 3.0},
+        {"func":"PlayLoopedScheduled","args":[0,1]},
+        {"value": 7}, {"value": 4.0},
+        {"func":"PlayLoopedScheduled","args":[3,4]},
+        {"value": 9}, {"value": 2.25},
+        {"func":"PlayLoopedScheduled","args":[6,7]},
+        {"value": 10000}, {"value": 0}, {"func":"Set","args":[9,10,2]},
+        {"value": 1}, {"func":"Set","args":[9,12,5]},
+        {"value": 2}, {"func":"Set","args":[9,14,8]},
+        {"func":"Execute","args":[11,13,15]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    vm.context.time = 2.0;
+
+    let final_id = vm.execute(16).unwrap();
+    let events = &vm.scheduled_looped_effects;
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].clip_id, 7);
+    assert_eq!(events[0].start_time, 3.0);
+    assert_eq!(events[0].requested_at, 2.0);
+    assert!(events[0].has_required_lead_time);
+    assert_eq!(events[1].clip_id, 7);
+    assert_eq!(events[1].start_time, 4.0);
+    assert_eq!(events[2].clip_id, 9);
+    assert_eq!(events[2].start_time, 2.25);
+    assert!(!events[2].has_required_lead_time);
+
+    assert_ne!(events[0].instance_id, events[1].instance_id);
+    assert_ne!(events[0].instance_id, events[2].instance_id);
+    assert_ne!(events[1].instance_id, events[2].instance_id);
+    assert_eq!(vm.memory.get(10000, 0), events[0].instance_id as f64);
+    assert_eq!(vm.memory.get(10000, 1), events[1].instance_id as f64);
+    assert_eq!(vm.memory.get(10000, 2), events[2].instance_id as f64);
+    assert_eq!(final_id, events[2].instance_id as f64);
+}
+
+#[test]
+fn watch_vm_play_looped_scheduled_ids_are_shared_between_callback_vms() {
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": 7}, {"value": 3.0},
+        {"func":"PlayLoopedScheduled","args":[0,1]}
+    ]))
+    .unwrap();
+    let mut first = renderer::runtime::WatchVm::new(&nodes);
+    let first_id = first.execute(2).unwrap();
+
+    let mut second = renderer::runtime::WatchVm::new(&nodes);
+    second.context = first.context.clone();
+    let second_id = second.execute(2).unwrap();
+
+    assert_ne!(first_id, second_id);
+    assert_eq!(first.scheduled_looped_effects[0].clip_id, 7);
+    assert_eq!(second.scheduled_looped_effects[0].clip_id, 7);
+}
+
+#[test]
+fn watch_vm_stop_looped_scheduled_targets_instance_and_returns_zero() {
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": 7}, {"value": 3.0},
+        {"func":"PlayLoopedScheduled","args":[0,1]},
+        {"value": 7}, {"value": 4.0},
+        {"func":"PlayLoopedScheduled","args":[3,4]},
+        {"value": 4.0}, {"value": 1.0}, {"func":"Add","args":[6,7]},
+        {"func":"StopLoopedScheduled","args":[2,8]},
+        {"value": 4.25},
+        {"func":"StopLoopedScheduled","args":[5,10]},
+        {"func":"Execute","args":[9,11]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    vm.context.time = 4.0;
+
+    assert_eq!(vm.execute(12).unwrap(), 0.0);
+    assert_eq!(vm.function_counts.get("Add"), Some(&1));
+    assert_eq!(vm.scheduled_looped_effects.len(), 2);
+    let [loop_a, loop_b] = vm.scheduled_looped_effects.as_slice() else {
+        panic!("expected two scheduled loop instances");
+    };
+    assert_ne!(loop_a.instance_id, loop_b.instance_id);
+    assert_eq!(loop_a.clip_id, 7);
+    assert_eq!(loop_b.clip_id, 7);
+
+    let [stop_a, stop_b] = vm.scheduled_looped_effect_stops.as_slice() else {
+        panic!("expected two scheduled loop stops");
+    };
+    assert_eq!(stop_a.instance_id, loop_a.instance_id);
+    assert_eq!(stop_a.end_time, 5.0);
+    assert_eq!(stop_a.requested_at, 4.0);
+    assert!(stop_a.has_required_lead_time);
+    assert_eq!(stop_b.instance_id, loop_b.instance_id);
+    assert_ne!(stop_a.instance_id, stop_b.instance_id);
+    assert_eq!(stop_b.end_time, 4.25);
+    assert_eq!(stop_b.requested_at, 4.0);
+    assert!(!stop_b.has_required_lead_time);
+}
+
+#[test]
+fn watch_vm_stop_looped_scheduled_accepts_shared_id_from_another_callback_vm() {
+    let play_nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": 7}, {"value": 3.0},
+        {"func":"PlayLoopedScheduled","args":[0,1]}
+    ]))
+    .unwrap();
+    let mut play_vm = renderer::runtime::WatchVm::new(&play_nodes);
+    let loop_id = play_vm.execute(2).unwrap();
+
+    let stop_nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": loop_id}, {"value": 8.0},
+        {"func":"StopLoopedScheduled","args":[0,1]}
+    ]))
+    .unwrap();
+    let mut stop_vm = renderer::runtime::WatchVm::new(&stop_nodes);
+    stop_vm.context = play_vm.context.clone();
+    assert_eq!(stop_vm.execute(2).unwrap(), 0.0);
+    assert_eq!(
+        stop_vm.scheduled_looped_effect_stops[0].instance_id as f64,
+        loop_id
+    );
 }
 
 #[test]
@@ -1474,6 +2041,45 @@ fn watch_vm_spawn_particle_effect_returns_unique_ids_and_can_be_destroyed() {
 }
 
 #[test]
+fn watch_vm_move_particle_effect_updates_live_instance_and_emits_corners() {
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": 3},
+        {"value": 0}, {"value": 1}, {"value": 2}, {"value": 3},
+        {"value": 4}, {"value": 5}, {"value": 6}, {"value": 7},
+        {"value": 30}, {"value": 1},
+        {"func":"SpawnParticleEffect","args":[0,1,2,3,4,5,6,7,8,9,10]},
+        {"value": 10}, {"value": 11}, {"value": 12}, {"value": 13},
+        {"value": 14}, {"value": 15}, {"value": 16}, {"value": 17},
+        {"func":"MoveParticleEffect","args":[11,12,13,14,15,16,17,18,19]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    assert_eq!(vm.execute(20).unwrap(), 0.0);
+    let instance_id = 0;
+    let expected_corners = [[10.0, 11.0], [12.0, 13.0], [14.0, 15.0], [16.0, 17.0]];
+    let instances = vm.context.particle_instances.read().unwrap();
+    assert_eq!(
+        instances.instances()[&instance_id].corners,
+        expected_corners
+    );
+    assert!(matches!(
+        vm.particle_events.last(),
+        Some(renderer::runtime::ParticleEffectEvent::Move { instance_id: id, corners })
+            if *id == instance_id && *corners == expected_corners
+    ));
+}
+
+#[test]
+fn watch_vm_move_particle_effect_requires_documented_argument_count() {
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": 1}, {"func":"MoveParticleEffect","args":[0]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    assert!(format!("{:#}", vm.execute(1).unwrap_err()).contains("requires 9 arguments"));
+}
+
+#[test]
 fn watch_vm_spawn_particle_effect_rejects_invalid_arity_and_identifier() {
     for values in [
         vec![1.0; 10],
@@ -1585,6 +2191,58 @@ fn watch_host_reports_scheduled_effect_commands_from_entity_callbacks() {
 }
 
 #[test]
+fn watch_host_includes_immediate_audio_commands_in_frame_report() {
+    let watch: renderer::watch::WatchData = serde_json::from_value(serde_json::json!({
+        "archetypes":[{"name":"Thing","updateParallel":{"index":2}}],
+        "nodes":[
+            {"value":7}, {"value":0.1}, {"func":"Play","args":[0,1]}
+        ]
+    }))
+    .unwrap();
+    let level: renderer::formats::LevelData = serde_json::from_value(serde_json::json!({
+        "entities":[{"archetype":"Thing","data":[]}]
+    }))
+    .unwrap();
+    let mut runtime = renderer::watch_runtime::WatchRuntime::new(&watch, &level).unwrap();
+    let report = runtime.frame(0.0).unwrap();
+    assert_eq!(
+        report.audio_events,
+        vec![renderer::runtime::AudioEffectEvent::Play {
+            clip_id: 7,
+            minimum_distance: 0.1,
+            requested_at: 0.0,
+        }]
+    );
+}
+
+#[test]
+fn watch_host_reports_scheduled_loop_stops_from_entity_callbacks() {
+    let watch: renderer::watch::WatchData = serde_json::from_value(serde_json::json!({
+        "archetypes":[{"name":"Thing","updateParallel":{"index":4}}],
+        "nodes":[
+            {"value": 17}, {"value": 3.0},
+            {"func":"PlayLoopedScheduled","args":[0,1]},
+            {"value": 5.0},
+            {"func":"StopLoopedScheduled","args":[2,3]}
+        ]
+    }))
+    .unwrap();
+    let level: renderer::formats::LevelData = serde_json::from_value(serde_json::json!({
+        "entities":[{"archetype":"Thing","data":[]}]
+    }))
+    .unwrap();
+    let mut runtime = renderer::watch_runtime::WatchRuntime::new(&watch, &level).unwrap();
+    let report = runtime.frame(0.0).unwrap();
+    assert_eq!(report.scheduled_looped_effects.len(), 1);
+    assert_eq!(report.scheduled_looped_effect_stops.len(), 1);
+    assert_eq!(
+        report.scheduled_looped_effect_stops[0].instance_id,
+        report.scheduled_looped_effects[0].instance_id
+    );
+    assert_eq!(report.scheduled_looped_effect_stops[0].end_time, 5.0);
+}
+
+#[test]
 fn watch_draw_trace_preserves_non_finite_values_and_compound_memory_inputs() {
     let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
         {"value": 1}, {"value": 10000}, {"value": 0}, {"value": 0},
@@ -1644,6 +2302,118 @@ fn watch_vm_switch_with_default_uses_discriminant_branch_and_final_default() {
 }
 
 #[test]
+fn watch_vm_switch_with_default_matches_explicit_tests_and_uses_default() {
+    // The explicit tests are deliberately distinct from their pair indices:
+    // this distinguishes test/consequent matching from indexed selection.
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": 51},
+        {"value": 51}, {"value": 148},
+        {"value": 2}, {"value": 95},
+        {"value": 312},
+        {"func":"SwitchWithDefault","args":[0,1,2,3,4,5]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    assert_eq!(vm.execute(6).unwrap(), 148.0);
+
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": 2},
+        {"value": 51}, {"value": 148},
+        {"value": 2}, {"value": 95},
+        {"value": 312},
+        {"func":"SwitchWithDefault","args":[0,1,2,3,4,5]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    assert_eq!(vm.execute(6).unwrap(), 95.0);
+
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": 7},
+        {"value": 51}, {"value": 148},
+        {"value": 2}, {"value": 95},
+        {"value": 312},
+        {"func":"SwitchWithDefault","args":[0,1,2,3,4,5]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    assert_eq!(vm.execute(6).unwrap(), 312.0);
+}
+
+#[test]
+fn watch_vm_switch_with_default_matches_connector_shaped_pair() {
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": 2},
+        {"value": 0}, {"value": 10},
+        {"value": 1}, {"value": 20},
+        {"value": 2}, {"value": 95},
+        {"value": 312},
+        {"func":"SwitchWithDefault","args":[0,1,2,3,4,5,6,7]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    assert_eq!(vm.execute(8).unwrap(), 95.0);
+}
+
+#[test]
+fn watch_vm_switch_integer_with_default_remains_indexed() {
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": 1}, {"value": 10}, {"value": 20}, {"value": 30},
+        {"func":"SwitchIntegerWithDefault","args":[0,1,2,3]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    assert_eq!(vm.execute(4).unwrap(), 20.0);
+}
+
+#[test]
+fn watch_vm_integer_switches_match_exact_branch_indices_and_default_fractional_values() {
+    for (name, discriminant, expected) in [
+        ("SwitchInteger", 0.0, 10.0),
+        ("SwitchInteger", 1.0, 20.0),
+        ("SwitchInteger", 1.5, 0.0),
+        ("SwitchInteger", 4.5, 0.0),
+        ("SwitchIntegerWithDefault", 0.0, 10.0),
+        ("SwitchIntegerWithDefault", 1.0, 20.0),
+        ("SwitchIntegerWithDefault", 1.5, 99.0),
+        ("SwitchIntegerWithDefault", 4.5, 99.0),
+    ] {
+        let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+            {"value":discriminant},
+            {"value":10}, {"value":20}, {"value":99},
+            {"func":name,"args":[0,1,2,3]}
+        ]))
+        .unwrap();
+        let mut vm = renderer::runtime::WatchVm::new(&nodes);
+        assert_eq!(vm.execute(4).unwrap(), expected, "{name}({discriminant})");
+    }
+}
+
+#[test]
+fn watch_vm_integer_switches_evaluate_only_the_selected_consequent() {
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value":1},
+        {"func":"UnselectedBranchMustRemainLazy"},
+        {"value":42},
+        {"func":"AnotherUnselectedBranchMustRemainLazy"},
+        {"func":"SwitchInteger","args":[0,1,2,3]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    assert_eq!(vm.execute(4).unwrap(), 42.0);
+
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value":4.5},
+        {"func":"UnselectedBranchMustRemainLazy"},
+        {"func":"AnotherUnselectedBranchMustRemainLazy"},
+        {"value":99},
+        {"func":"SwitchIntegerWithDefault","args":[0,1,2,3]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    assert_eq!(vm.execute(4).unwrap(), 99.0);
+}
+
+#[test]
 fn watch_vm_remap_obeys_sonolus_argument_order() {
     let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
         {"value": 0}, {"value": 10}, {"value": 100}, {"value": 200}, {"value": 5},
@@ -1664,6 +2434,167 @@ fn watch_vm_unknown_function_errors_and_invalid_get_returns_zero() {
     let mut vm = renderer::runtime::WatchVm::new(&nodes);
     assert_eq!(vm.execute(2).unwrap(), 0.0);
     assert!(format!("{:#}", vm.execute(3).unwrap_err()).contains("unsupported Watch function"));
+}
+
+#[test]
+fn watch_vm_debug_log_captures_finite_and_nan_values_and_returns_zero() {
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": 123.5}, {"func":"DebugLog","args":[0]},
+        {"value": 0}, {"func":"Divide","args":[2,2]},
+        {"func":"DebugLog","args":[3]},
+        {"value": 1}, {"func":"Divide","args":[5,2]},
+        {"func":"DebugLog","args":[6]},
+        {"value": -1}, {"func":"Divide","args":[8,2]},
+        {"func":"DebugLog","args":[9]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+
+    assert_eq!(vm.execute(1).unwrap(), 0.0);
+    assert_eq!(vm.execute(4).unwrap(), 0.0);
+    assert_eq!(vm.execute(7).unwrap(), 0.0);
+    assert_eq!(vm.execute(10).unwrap(), 0.0);
+    assert_eq!(vm.debug_events.len(), 4);
+    match &vm.debug_events[0] {
+        renderer::runtime::DebugEvent::Log {
+            value, value_text, ..
+        } => {
+            assert_eq!(*value, 123.5);
+            assert_eq!(value_text, "123.5");
+        }
+        event => panic!("expected log event, got {event:?}"),
+    }
+    match &vm.debug_events[1] {
+        renderer::runtime::DebugEvent::Log {
+            value, value_text, ..
+        } => {
+            assert!(value.is_nan());
+            assert_eq!(value_text, "NaN");
+        }
+        event => panic!("expected log event, got {event:?}"),
+    }
+    match &vm.debug_events[2] {
+        renderer::runtime::DebugEvent::Log {
+            value, value_text, ..
+        } => {
+            assert_eq!(*value, f64::INFINITY);
+            assert_eq!(value_text, "inf");
+        }
+        event => panic!("expected log event, got {event:?}"),
+    }
+    match &vm.debug_events[3] {
+        renderer::runtime::DebugEvent::Log {
+            value, value_text, ..
+        } => {
+            assert_eq!(*value, f64::NEG_INFINITY);
+            assert_eq!(value_text, "-inf");
+        }
+        event => panic!("expected log event, got {event:?}"),
+    }
+    let serialized = serde_json::to_string(&vm.debug_events).unwrap();
+    assert!(serialized.contains("\"value_text\":\"NaN\""));
+    let serialized: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+    assert!(serialized[1].get("value").is_none());
+}
+
+#[test]
+fn watch_vm_debug_log_evaluates_side_effect_argument_once_and_execute_continues() {
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": 5000}, {"value": 0}, {"value": 1},
+        {"func":"SetAdd","args":[0,1,2]},
+        {"func":"DebugLog","args":[3]},
+        {"value": 42}, {"func":"Execute","args":[4,5]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    vm.memory.set(5000, 0, 0.0);
+
+    assert_eq!(vm.execute(6).unwrap(), 42.0);
+    assert_eq!(vm.memory.get(5000, 0), 1.0);
+    assert_eq!(vm.function_counts.get("SetAdd"), Some(&1));
+    assert_eq!(vm.function_counts.get("DebugLog"), Some(&1));
+    assert!(matches!(
+        vm.debug_events.as_slice(),
+        [renderer::runtime::DebugEvent::Log { value: 1.0, .. }]
+    ));
+}
+
+#[test]
+fn watch_vm_debug_events_preserve_order_signed_zero_and_nonblocking_pause() {
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": -0.0}, {"func":"DebugLog","args":[0]},
+        {"func":"DebugPause","args":[]},
+        {"func":"Execute","args":[1,2]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+
+    assert_eq!(vm.execute(3).unwrap(), 0.0);
+    assert_eq!(vm.debug_events.len(), 2);
+    match &vm.debug_events[0] {
+        renderer::runtime::DebugEvent::Log {
+            value, value_text, ..
+        } => {
+            assert_eq!(*value, 0.0);
+            assert!(value.is_sign_negative());
+            assert_eq!(value_text, "-0");
+        }
+        event => panic!("expected log event, got {event:?}"),
+    }
+    assert!(matches!(
+        vm.debug_events[1],
+        renderer::runtime::DebugEvent::Pause { .. }
+    ));
+}
+
+#[test]
+fn watch_runtime_collects_debug_events_in_callback_order_across_lifecycle() {
+    let watch: renderer::watch::WatchData = serde_json::from_value(serde_json::json!({
+        "archetypes": [{
+            "name":"DebugOracle",
+            "spawnTime":{"index":0,"order":0},
+            "despawnTime":{"index":1,"order":0},
+            "updateSequential":{"index":9,"order":0},
+            "updateParallel":{"index":8,"order":0}
+        }],
+        "nodes": [
+            {"value":-1}, {"value":5},
+            {"value":2000}, {"value":0}, {"value":321.25},
+            {"func":"Set","args":[2,3,4]},
+            {"func":"Get","args":[2,3]},
+            {"func":"DebugLog","args":[6]},
+            {"func":"DebugLog","args":[6]},
+            {"func":"Execute","args":[5,7]}
+        ]
+    }))
+    .unwrap();
+    let level: renderer::formats::LevelData = serde_json::from_value(serde_json::json!({
+        "entities":[{"archetype":"DebugOracle","data":[]}]
+    }))
+    .unwrap();
+    let mut runtime = renderer::watch_runtime::WatchRuntime::new(&watch, &level).unwrap();
+
+    let report = runtime.frame(0.0).unwrap();
+    let logs: Vec<_> = report
+        .debug_events
+        .iter()
+        .filter_map(|event| match event {
+            renderer::runtime::DebugEvent::Log {
+                value,
+                callback,
+                entity_id,
+                ..
+            } => Some((*value, callback.as_deref(), *entity_id)),
+            renderer::runtime::DebugEvent::Pause { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        logs,
+        vec![
+            (321.25, Some("UpdateSequential"), Some(0)),
+            (321.25, Some("UpdateParallel"), Some(0)),
+        ]
+    );
 }
 
 #[test]

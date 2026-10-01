@@ -1,5 +1,7 @@
 # Sono Renderer
 
+Please scroll down to find the AI disclosure section.
+
 An engine agnostic Sonolus Watch-mode renderer in development. The repository provides package parsing, static compatibility analysis, direct LevelData loading, project input checks, FFmpeg resolution, and partial Watch VM and entity lifecycle execution. A diagnostic PPM rasterizer can visualize abstract sprite rectangles; Sonolus resource rendering, gameplay video rendering, and video export are not implemented. The runtime and lifecycle cover only a subset of Sonolus semantics.
 
 ## Build and inspect
@@ -36,4 +38,23 @@ Engine directories may use the server fixture names (`engine.json`, `EngineWatch
 
 See [M0 format and architecture notes](docs/M0-design.md) for fixture observations, schema references, module boundaries, and unresolved format questions.
 
-I do not claim to have written any of the code in this project, as I do not personally know the programming language Rust. This project is AI assisted to the absolute extreme, and if you don't like that, it's fine. However, please make the distinction that I am not going to turn my YouTube content flow and actual creative works into AI slop machine. AI content slop is not something that I endorse in any way, shape or form. Please understand my intentions with this project are not to claim that I wrote the code in this project, but to provide a tool that helps automate the chart production process much much quicker.
+legal jargan lol:
+
+I do not claim to have written any of the code in this project, as I do not personally know the programming language Rust. This project is AI assisted "to the absolute extreme", and if you don't like that, it's fine. However, please make the distinction that I am not going to turn my YouTube content flow and actual creative works into AI slop machine. AI content slop is not something that I endorse in any way, shape or form. Please understand my intention with this project is not to claim that I wrote the code in this project, but to provide a tool that helps automate the chart production process much much quicker.
+
+Acknowledgements:
+
+Zihad - Sonolus Renderer Code provided as reference
+
+LittleYang0531 - More rendering code provided as reference
+
+qwewqa / Hyeon - Next Sekai Preview implementation for development reference
+
+Burrito (Sonolus) - literally the entire reason this exists, W
+
+Being mentioned here does not necessarily mean that they have endorsed this project.
+Credit is given to acknowledge the people who made related works that contribute to its testing.
+
+All developers whose code was provided to AI as a development reference were made explicitly aware and gave permission for my use case of their code. Again, this permission does not imply endorsement of Sono-Renderer.
+
+This program was built and tested against Sonolus v1.1.4.

@@ -454,6 +454,72 @@ pub fn load_skin_sprite_names(path: &Path, name: &str) -> Result<BTreeSet<String
     Ok(names)
 }
 
+/// Load the available clip names from a named Sonolus effect resource.
+/// The content-addressed data payload is verified before JSON decoding.
+pub fn load_effect_clip_names(path: &Path, name: &str) -> Result<BTreeSet<String>> {
+    load_named_resource_names(path, "effects", name, "clips")
+}
+
+/// Load the available effect names from a named Sonolus particle resource.
+/// The content-addressed data payload is verified before JSON decoding.
+pub fn load_particle_effect_names(path: &Path, name: &str) -> Result<BTreeSet<String>> {
+    load_named_resource_names(path, "particles", name, "effects")
+}
+
+fn load_named_resource_names(
+    path: &Path,
+    category: &str,
+    name: &str,
+    collection: &str,
+) -> Result<BTreeSet<String>> {
+    let file = fs::File::open(path).with_context(|| format!("opening SCP {}", path.display()))?;
+    let mut zip = ZipArchive::new(file).context("SCP is not a valid ZIP archive")?;
+    let manifest_path = format!("sonolus/{category}/{name}");
+    let mut manifest_bytes = Vec::new();
+    zip.by_name(&manifest_path)
+        .with_context(|| {
+            format!(
+                "{category} resource {name:?} is not present in {}",
+                path.display()
+            )
+        })?
+        .read_to_end(&mut manifest_bytes)?;
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("decoding resource manifest {manifest_path}"))?;
+    let item = manifest.get("item").unwrap_or(&manifest);
+    let hash = item
+        .get("data")
+        .and_then(|value| value.get("hash"))
+        .and_then(Value::as_str)
+        .context("resource manifest has no data hash")?;
+    let repository_path = format!("sonolus/repository/{hash}");
+    let mut payload = Vec::new();
+    zip.by_name(&repository_path)
+        .with_context(|| format!("resource data payload {repository_path} is missing"))?
+        .read_to_end(&mut payload)?;
+    let actual = hex::encode(Sha1::digest(&payload));
+    if actual != hash {
+        bail!("resource data payload digest {actual} does not match {hash}");
+    }
+    let data: Value =
+        serde_json::from_slice(&decode_payload(payload)?).context("decoding resource data JSON")?;
+    let entries = data
+        .get(collection)
+        .and_then(Value::as_array)
+        .with_context(|| format!("resource data has no {collection} array"))?;
+    let mut names = BTreeSet::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(entry_name) = entry.get("name").and_then(Value::as_str) {
+            if !names.insert(entry_name.to_owned()) {
+                bail!("resource data contains duplicate {collection} name {entry_name:?}");
+            }
+        } else {
+            bail!("{category} resource entry {index} has no string name");
+        }
+    }
+    Ok(names)
+}
+
 /// Load and verify the selected skin's data and texture from an SCP archive.
 pub fn load_skin_assets(path: &Path, name: &str) -> Result<SkinAssets> {
     let file = fs::File::open(path).with_context(|| format!("opening SCP {}", path.display()))?;

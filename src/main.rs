@@ -198,6 +198,47 @@ fn main() -> Result<()> {
         } => {
             let package = formats::load_engine(&engine)?;
             let level = formats::load_level(&level)?;
+            let defaults: std::collections::BTreeMap<_, _> =
+                package.metadata.resource_defaults().into_iter().collect();
+            let resource_path = resources.as_deref();
+            let has_skin_bindings = package
+                .watch
+                .skin
+                .get("sprites")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|bindings| !bindings.is_empty());
+            let has_effect_bindings = package
+                .watch
+                .effect
+                .get("clips")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|bindings| !bindings.is_empty());
+            let has_particle_bindings = package
+                .watch
+                .particle
+                .get("effects")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|bindings| !bindings.is_empty());
+            let needs_resources = has_skin_bindings
+                || has_effect_bindings
+                || has_particle_bindings
+                || ["skins", "backgrounds", "effects", "particles"]
+                    .iter()
+                    .any(|category| defaults.contains_key(*category));
+            let resource_path = match (resource_path, needs_resources) {
+                (Some(path), _) => Some(path),
+                (None, true) => {
+                    let selected = defaults
+                        .iter()
+                        .map(|(category, name)| format!("{category}={name}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    anyhow::bail!(
+                        "required resource package is missing (--resources); engine selections: {selected}"
+                    )
+                }
+                (None, false) => None,
+            };
             let mut runtime = renderer::watch_runtime::WatchRuntime::new(&package.watch, &level)?;
             runtime.set_draw_tracing(trace_draws);
             match (diagnostic_entity, diagnostic_stage) {
@@ -222,28 +263,105 @@ fn main() -> Result<()> {
                 anyhow::bail!("Watch frame dimensions must be positive");
             }
             runtime.set_screen_aspect_ratio(f64::from(width) / f64::from(height))?;
-            let skin_assets = if let Some(resources) = resources.as_ref() {
-                let skin_name =
-                    package.metadata.skin_name.as_deref().context(
-                        "engine has no default skin name; select an explicit skin first",
-                    )?;
-                let assets = formats::load_skin_assets(&resources, skin_name)?;
-                let sprite_names = assets.sprites.keys().cloned().collect();
-                runtime.bind_skin_sprite_names(&sprite_names)?;
-                println!(
-                    "selected skin: {skin_name} ({} sprites)",
-                    assets.sprites.len()
-                );
-                Some(assets)
+            let skin_assets = if let Some(resource_path) = resource_path {
+                let skin_name = defaults
+                    .get("skins")
+                    .map(String::as_str)
+                    .or(package.metadata.skin_name.as_deref());
+                let skin_name = match (skin_name, has_skin_bindings) {
+                    (Some(name), _) => Some(name),
+                    (None, true) => anyhow::bail!(
+                        "engine declares skin sprites but has no selected/default skin resource"
+                    ),
+                    (None, false) => None,
+                };
+                let assets = skin_name
+                    .map(|name| {
+                        formats::load_skin_assets(resource_path, name)
+                            .with_context(|| format!("resolving selected skin resource {name:?}"))
+                    })
+                    .transpose()?;
+                if let Some(assets) = assets.as_ref() {
+                    let sprite_names = assets.sprites.keys().cloned().collect();
+                    runtime.bind_skin_sprite_names(&sprite_names)?;
+                    println!(
+                        "selected skin: {} ({} sprites)",
+                        skin_name.unwrap_or("unspecified"),
+                        assets.sprites.len()
+                    );
+                }
+                let effect_name = defaults
+                    .get("effects")
+                    .map(String::as_str)
+                    .or(package.metadata.effect_name.as_deref());
+                if effect_name.is_none() && has_effect_bindings {
+                    anyhow::bail!(
+                        "engine declares effect clips but has no selected/default effect resource"
+                    );
+                }
+                if let Some(effect_name) = effect_name {
+                    let names = formats::load_effect_clip_names(resource_path, effect_name)
+                        .with_context(|| {
+                            format!("resolving selected effect resource {effect_name:?}")
+                        })?;
+                    if package
+                        .watch
+                        .effect
+                        .get("clips")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some()
+                    {
+                        runtime.bind_effect_clip_names(&names)?;
+                    }
+                    println!(
+                        "selected effect resource: {effect_name} ({} clips)",
+                        names.len()
+                    );
+                }
+                let particle_name = defaults
+                    .get("particles")
+                    .map(String::as_str)
+                    .or(package.metadata.particle_name.as_deref());
+                if particle_name.is_none() && has_particle_bindings {
+                    anyhow::bail!(
+                        "engine declares particle effects but has no selected/default particle resource"
+                    );
+                }
+                if let Some(particle_name) = particle_name {
+                    let names = formats::load_particle_effect_names(resource_path, particle_name)
+                        .with_context(|| {
+                        format!("resolving selected particle resource {particle_name:?}")
+                    })?;
+                    if package
+                        .watch
+                        .particle
+                        .get("effects")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some()
+                    {
+                        runtime.bind_particle_effect_names(&names)?;
+                    }
+                    println!(
+                        "selected particle resource: {particle_name} ({} effects)",
+                        names.len()
+                    );
+                }
+                assets
             } else {
                 None
             };
             let background_assets = match (
-                resources.as_ref(),
-                package.metadata.background_name.as_deref(),
+                resource_path,
+                defaults
+                    .get("backgrounds")
+                    .map(String::as_str)
+                    .or(package.metadata.background_name.as_deref()),
             ) {
                 (Some(resources), Some(background_name)) => {
-                    let assets = formats::load_background_assets(resources, background_name)?;
+                    let assets = formats::load_background_assets(resources, background_name)
+                        .with_context(|| {
+                            format!("resolving selected background resource {background_name:?}")
+                        })?;
                     let natural_aspect = f64::from(assets.width) / f64::from(assets.height);
                     let quad = assets
                         .data
@@ -255,7 +373,7 @@ fn main() -> Result<()> {
                     );
                     Some(assets)
                 }
-                _ => None,
+                (Some(_), None) | (None, _) => None,
             };
             let report = runtime.frame(time)?;
             println!(
@@ -346,6 +464,29 @@ fn main() -> Result<()> {
                 "executed Watch operations: {}",
                 serde_json::to_string(&report.function_counts)?
             );
+            println!("Watch debug events:");
+            for event in &report.debug_events {
+                match event {
+                    renderer::runtime::DebugEvent::Log {
+                        value,
+                        entity_id,
+                        callback,
+                        node,
+                        ..
+                    } => println!(
+                        "  DebugLog entity={entity_id:?} callback={callback:?} node={node}: {}",
+                        renderer::runtime::DebugEvent::display_value(*value)
+                    ),
+                    renderer::runtime::DebugEvent::Pause {
+                        entity_id,
+                        callback,
+                        node,
+                        ..
+                    } => println!(
+                        "  DebugPause entity={entity_id:?} callback={callback:?} node={node}"
+                    ),
+                }
+            }
             for entity_id in &report.spawned {
                 let entity = &runtime.entities[*entity_id];
                 println!(

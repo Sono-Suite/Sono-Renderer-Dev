@@ -130,6 +130,8 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
             request.resources,
             skin_name,
             package.metadata.background_name.as_deref(),
+            package.metadata.effect_name.as_deref(),
+            package.metadata.particle_name.as_deref(),
             request.width,
             request.height,
             request.fps,

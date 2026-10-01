@@ -6,6 +6,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
 const MAX_EVALUATIONS: usize = 5_000_000;
@@ -169,6 +170,46 @@ pub struct ScheduledEffect {
     pub has_required_lead_time: bool,
 }
 
+/// Deferred request to start a looping effect clip on the BGM timeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduledLoopedEffect {
+    pub instance_id: i64,
+    pub clip_id: i64,
+    pub start_time: f64,
+    pub requested_at: f64,
+    pub has_required_lead_time: bool,
+}
+
+/// Deferred request to stop one looping effect instance on the BGM timeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduledLoopedEffectStop {
+    pub instance_id: i64,
+    pub end_time: f64,
+    pub requested_at: f64,
+    pub has_required_lead_time: bool,
+}
+
+/// Backend-neutral audio commands emitted by Watch VM calls. These preserve
+/// the operation request and timeline time; they do not perform playback.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum AudioEffectEvent {
+    Play {
+        clip_id: i64,
+        minimum_distance: f64,
+        requested_at: f64,
+    },
+    StartLoop {
+        instance_id: i64,
+        clip_id: i64,
+        requested_at: f64,
+    },
+    StopLoop {
+        instance_id: i64,
+        requested_at: f64,
+    },
+}
+
 /// Request to destroy a previously spawned particle-effect instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DestroyedParticleEffect {
@@ -192,7 +233,55 @@ pub struct ParticleEffectInstance {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ParticleEffectEvent {
     Spawn(ParticleEffectInstance),
-    Destroy { instance_id: i64 },
+    Move {
+        instance_id: i64,
+        /// Sonolus corner order: bottom-left, top-left, top-right, bottom-right.
+        corners: [[f64; 2]; 4],
+    },
+    Destroy {
+        instance_id: i64,
+    },
+}
+
+/// Headless observations of Sonolus debug operations. `value` remains the
+/// original VM `f64`; `value_text` is the JSON-safe display form used by CLI
+/// and serialized frame reports for exceptional values.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum DebugEvent {
+    Log {
+        #[serde(skip_serializing)]
+        value: f64,
+        value_text: String,
+        entity_id: Option<usize>,
+        archetype: Option<String>,
+        callback: Option<String>,
+        callback_node: Option<usize>,
+        node: usize,
+    },
+    Pause {
+        entity_id: Option<usize>,
+        archetype: Option<String>,
+        callback: Option<String>,
+        callback_node: Option<usize>,
+        node: usize,
+    },
+}
+
+impl DebugEvent {
+    pub fn display_value(value: f64) -> String {
+        if value.is_nan() {
+            "NaN".to_owned()
+        } else if value == f64::INFINITY {
+            "inf".to_owned()
+        } else if value == f64::NEG_INFINITY {
+            "-inf".to_owned()
+        } else if value == 0.0 && value.is_sign_negative() {
+            "-0".to_owned()
+        } else {
+            value.to_string()
+        }
+    }
 }
 
 /// Shared particle instance allocator and live-instance table for a Watch run.
@@ -868,8 +957,12 @@ pub struct WatchVm<'a> {
     /// spawning-system boundary.
     pub spawn_queue: Vec<SpawnRequest>,
     pub scheduled_effects: Vec<ScheduledEffect>,
+    pub scheduled_looped_effects: Vec<ScheduledLoopedEffect>,
+    pub scheduled_looped_effect_stops: Vec<ScheduledLoopedEffectStop>,
+    pub audio_events: Vec<AudioEffectEvent>,
     pub destroyed_particle_effects: Vec<DestroyedParticleEffect>,
     pub particle_events: Vec<ParticleEffectEvent>,
+    pub debug_events: Vec<DebugEvent>,
     evaluations: usize,
     depth: usize,
     block_depth: usize,
@@ -908,13 +1001,15 @@ pub struct VmContext {
     pub timescale: f64,
     pub starting_time: f64,
     pub starting_beat: f64,
-    pub skin_sprites: BTreeMap<String, u32>,
-    pub effect_clips: BTreeMap<String, u32>,
-    pub particle_effects: BTreeMap<String, u32>,
+    pub skin_sprites: BTreeSet<u32>,
+    pub effect_clips: BTreeSet<u32>,
+    pub particle_effects: BTreeSet<u32>,
     /// Runtime Background quad in Sonolus BL, TL, TR, BR order, flattened x/y.
     pub runtime_background: Arc<RwLock<[f64; 8]>>,
     /// Live particle instances are shared across callback VMs in a Watch run.
     pub particle_instances: Arc<RwLock<ParticleEffectState>>,
+    /// Instance IDs are shared by all callback VMs in a Watch run.
+    pub next_looped_effect_id: Arc<AtomicI64>,
     pub streams: BTreeMap<(i64, i64), Vec<(f64, f64)>>,
     pub time_map: Vec<(f64, f64)>,
     pub timescale_map: Vec<(f64, f64)>,
@@ -953,8 +1048,12 @@ impl<'a> WatchVm<'a> {
             display_list: DisplayList::default(),
             spawn_queue: Vec::new(),
             scheduled_effects: Vec::new(),
+            scheduled_looped_effects: Vec::new(),
+            scheduled_looped_effect_stops: Vec::new(),
+            audio_events: Vec::new(),
             destroyed_particle_effects: Vec::new(),
             particle_events: Vec::new(),
+            debug_events: Vec::new(),
             evaluations: 0,
             depth: 0,
             block_depth: 0,
@@ -1292,6 +1391,58 @@ impl<'a> WatchVm<'a> {
         }
     }
 
+    /// Resolve the address used by the documented pointed memory operations.
+    /// `GetPointed(id, index, offset)` is specified as
+    /// `Get(Get(id, index), Get(id, index + 1) + offset)`; pointed writes use
+    /// the same two-cell pointer representation before applying Set.
+    fn pointed_location_values(
+        &self,
+        block_value: f64,
+        index_value: f64,
+        offset: f64,
+        writing: bool,
+    ) -> Result<Option<(i64, usize)>> {
+        // The two inner Gets follow Get's invalid-address behavior: an
+        // invalid block/index yields zero. The final operation then follows
+        // the corresponding Get or Set conversion behavior.
+        let base_block = integer(block_value, "block id").ok();
+        let first_slot = index_of(index_value).ok();
+        let pointed_block_value = match (base_block, first_slot) {
+            (Some(block), Some(slot)) => self.memory_get(block, slot),
+            _ => 0.0,
+        };
+
+        let second_slot = index_of(index_value + 1.0).ok();
+        let pointer_value = match (base_block, second_slot) {
+            (Some(block), Some(slot)) => self.memory_get(block, slot),
+            _ => 0.0,
+        };
+
+        let target_index_value = pointer_value + offset;
+        if writing {
+            let target_block = integer(pointed_block_value, "block id")?;
+            let target_index = index_of(target_index_value)?;
+            Ok(Some((target_block, target_index)))
+        } else {
+            let target_block = integer(pointed_block_value, "block id").ok();
+            let target_index = index_of(target_index_value).ok();
+            Ok(target_block.zip(target_index))
+        }
+    }
+
+    fn allocate_looped_effect_id(&self) -> Result<i64> {
+        self.context
+            .next_looped_effect_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                // VM numeric values are f64, so every issued handle remains
+                // exactly representable as well as within i64 range.
+                (next <= 9_007_199_254_740_991)
+                    .then(|| next.checked_add(1))
+                    .flatten()
+            })
+            .map_err(|_| anyhow::anyhow!("looped effect instance ID space exhausted"))
+    }
+
     fn memory_set(&mut self, block: i64, slot: usize, value: f64, node: usize) -> Result<()> {
         if block == 1004 {
             if !matches!(self.context.lifecycle_stage, Some(0 | 5)) {
@@ -1511,6 +1662,35 @@ impl<'a> WatchVm<'a> {
             Ok((this.arg(index, 0)?, this.arg(index, 1)?))
         };
         match name {
+            "DebugLog" => {
+                if count != 1 {
+                    bail!("DebugLog requires exactly one value");
+                }
+                let value = unary(self)?;
+                self.debug_events.push(DebugEvent::Log {
+                    value,
+                    value_text: DebugEvent::display_value(value),
+                    entity_id: self.context.entity_id,
+                    archetype: self.context.entity_archetype.clone(),
+                    callback: self.context.callback_name.clone(),
+                    callback_node: self.context.callback_node,
+                    node: index,
+                });
+                Ok(0.0)
+            }
+            "DebugPause" => {
+                if count != 0 {
+                    bail!("DebugPause does not take arguments");
+                }
+                self.debug_events.push(DebugEvent::Pause {
+                    entity_id: self.context.entity_id,
+                    archetype: self.context.entity_archetype.clone(),
+                    callback: self.context.callback_name.clone(),
+                    callback_node: self.context.callback_node,
+                    node: index,
+                });
+                Ok(0.0)
+            }
             "Execute" => {
                 let mut result = 0.0;
                 for arg in 0..count {
@@ -1535,17 +1715,17 @@ impl<'a> WatchVm<'a> {
                     "HasSkinSprite" => self
                         .context
                         .skin_sprites
-                        .values()
+                        .iter()
                         .any(|id| *id as i64 == resource),
                     "HasEffectClip" => self
                         .context
                         .effect_clips
-                        .values()
+                        .iter()
                         .any(|id| *id as i64 == resource),
                     _ => self
                         .context
                         .particle_effects
-                        .values()
+                        .iter()
                         .any(|id| *id as i64 == resource),
                 };
                 if name == "HasSkinSprite" {
@@ -1608,20 +1788,47 @@ impl<'a> WatchVm<'a> {
                         .unwrap_or(time)),
                 }
             }
-            "SwitchIntegerWithDefault" | "SwitchWithDefault" => {
+            "SwitchWithDefault" => {
                 let discriminant = self.arg(index, 0)?;
-                let branch = integer(discriminant, "switch discriminant")?;
-                let branch = usize::try_from(branch).ok();
                 if count < 2 {
-                    bail!("{name} requires a discriminant and default branch");
+                    bail!("SwitchWithDefault requires a discriminant and default branch");
                 }
-                let selected = branch
-                    .filter(|branch| *branch < count - 2)
+                if count % 2 != 0 {
+                    bail!("SwitchWithDefault requires test/consequent pairs and a default");
+                }
+                let pair_count = (count - 2) / 2;
+                for pair in 0..pair_count {
+                    let test = self.arg(index, 1 + pair * 2)?;
+                    if discriminant == test {
+                        return self.arg(index, 2 + pair * 2);
+                    }
+                }
+                self.arg(index, count - 1)
+            }
+            "SwitchIntegerWithDefault" => {
+                let discriminant = self.arg(index, 0)?;
+                if count < 2 {
+                    bail!("SwitchIntegerWithDefault requires a discriminant and default branch");
+                }
+                // The specification defines matching by equality to branch n;
+                // it does not require converting the discriminant to an integer.
+                let selected = (0..count - 2)
+                    .find(|branch| discriminant == *branch as f64)
                     .map(|branch| branch + 1)
                     .unwrap_or(count - 1);
                 self.arg(index, selected)
             }
-            "SwitchInteger" | "Switch" => {
+            "SwitchInteger" => {
+                let discriminant = self.arg(index, 0)?;
+                // A fractional value simply matches no integer-indexed branch.
+                let selected =
+                    (0..count.saturating_sub(1)).find(|branch| discriminant == *branch as f64);
+                match selected {
+                    Some(branch) => self.arg(index, branch + 1),
+                    None => Ok(0.0),
+                }
+            }
+            "Switch" => {
                 let discriminant = integer(self.arg(index, 0)?, "switch discriminant")?;
                 let selected = usize::try_from(discriminant)
                     .ok()
@@ -1690,7 +1897,7 @@ impl<'a> WatchVm<'a> {
             }
             "While" => {
                 if count != 1 && count != 2 {
-                    bail!("While requires a body, or a condition and body; got {count} arguments");
+                    bail!("While requires a body, or a legacy condition and body; got {count} arguments");
                 }
                 let (condition, body) = if count == 1 { (None, 0) } else { (Some(0), 1) };
                 self.block_depth += 1;
@@ -1712,6 +1919,32 @@ impl<'a> WatchVm<'a> {
                             if target < loop_depth {
                                 return Ok(value);
                             }
+                        }
+                    }
+                })();
+                self.block_depth -= 1;
+                result
+            }
+            "DoWhile" => {
+                if count != 2 {
+                    bail!("DoWhile requires body and test arguments, got {count}");
+                }
+                self.block_depth += 1;
+                let loop_depth = self.block_depth;
+                let result = (|| -> Result<f64> {
+                    loop {
+                        self.arg(index, 0)?;
+                        if let Some((target, value)) = self.break_signal {
+                            if target == loop_depth {
+                                self.break_signal = None;
+                                return Ok(value);
+                            }
+                            if target < loop_depth {
+                                return Ok(value);
+                            }
+                        }
+                        if self.arg(index, 1)? == 0.0 {
+                            return Ok(0.0);
                         }
                     }
                 })();
@@ -1786,17 +2019,12 @@ impl<'a> WatchVm<'a> {
                 Ok(value)
             }
             "GetPointed" => {
-                let block = integer(self.arg(index, 0)?, "block id")?;
-                let pointer_block = integer(self.arg(index, 1)?, "pointer block id")?;
-                let pointer_slot = index_of(self.arg(index, 2)?)?;
-                let pointer = self.memory_get(pointer_block, pointer_slot);
-                let Ok(slot) = index_of(pointer) else {
-                    return Ok(0.0);
-                };
-                let value = self.memory_get(block, slot);
-                self.record_diagnostic(|| {
-                    format!("GetPointed node={index} pointer={pointer_block}[{pointer_slot}]={pointer} target={block}[{slot}] value={value}")
-                });
+                let args = self.all_args(index)?;
+                let value = self
+                    .pointed_location_values(args[0], args[1], args[2], false)?
+                    .map(|(block, slot)| self.memory_get(block, slot))
+                    .unwrap_or(0.0);
+                self.record_diagnostic(|| format!("GetPointed node={index} value={value}"));
                 Ok(value)
             }
             "GetShifted" => {
@@ -1816,7 +2044,8 @@ impl<'a> WatchVm<'a> {
                 });
                 Ok(value)
             }
-            "Set" | "SetAdd" | "SetSubtract" | "SetMultiply" | "SetDivide" => {
+            "Set" | "SetAdd" | "SetSubtract" | "SetMultiply" | "SetDivide" | "SetMod"
+            | "SetRem" | "SetPower" => {
                 let block = integer(self.arg(index, 0)?, "block id")?;
                 let slot = index_of(self.arg(index, 1)?)?;
                 let value = self.arg(index, 2)?;
@@ -1827,6 +2056,9 @@ impl<'a> WatchVm<'a> {
                     "SetSubtract" => old - value,
                     "SetMultiply" => old * value,
                     "SetDivide" => old / value,
+                    "SetMod" => modulus(old, value)?,
+                    "SetRem" => old % value,
+                    "SetPower" => old.powf(value),
                     _ => unreachable!(),
                 };
                 if self.capture_draw_argument_values {
@@ -1846,7 +2078,8 @@ impl<'a> WatchVm<'a> {
                 });
                 Ok(result)
             }
-            "SetShifted" => {
+            "SetShifted" | "SetAddShifted" | "SetSubtractShifted" | "SetMultiplyShifted"
+            | "SetDivideShifted" | "SetModShifted" | "SetRemShifted" | "SetPowerShifted" => {
                 let block = integer(self.arg(index, 0)?, "block id")?;
                 let x = self.arg(index, 1)?;
                 let y = self.arg(index, 2)?;
@@ -1854,20 +2087,30 @@ impl<'a> WatchVm<'a> {
                 let value = self.arg(index, 4)?;
                 let slot = index_of(x + y * stride)?;
                 let old = self.memory_get(block, slot);
-                self.memory_set(block, slot, value, index)?;
+                let result = match name {
+                    "SetShifted" => value,
+                    "SetAddShifted" => old + value,
+                    "SetSubtractShifted" => old - value,
+                    "SetMultiplyShifted" => old * value,
+                    "SetDivideShifted" => old / value,
+                    "SetModShifted" => modulus(old, value)?,
+                    "SetRemShifted" => old % value,
+                    "SetPowerShifted" => old.powf(value),
+                    _ => unreachable!(),
+                };
+                self.memory_set(block, slot, result, index)?;
                 self.record_diagnostic(|| {
-                    format!("SetShifted node={index} block={block} x={x} y={y} stride={stride} index={slot} old={old} new={value}")
+                    format!("{name} node={index} block={block} x={x} y={y} stride={stride} index={slot} old={old} new={result}")
                 });
-                Ok(value)
+                Ok(result)
             }
             "SetPointed" | "SetAddPointed" | "SetSubtractPointed" | "SetMultiplyPointed"
-            | "SetDividePointed" => {
-                let block = integer(self.arg(index, 0)?, "block id")?;
-                let pointer_block = integer(self.arg(index, 1)?, "pointer block id")?;
-                let pointer_slot = index_of(self.arg(index, 2)?)?;
-                let pointer = self.memory_get(pointer_block, pointer_slot);
-                let slot = index_of(pointer)?;
-                let value = self.arg(index, 3)?;
+            | "SetDividePointed" | "SetModPointed" | "SetRemPointed" | "SetPowerPointed" => {
+                let args = self.all_args(index)?;
+                let (block, slot) = self
+                    .pointed_location_values(args[0], args[1], args[2], true)?
+                    .context("pointed write did not resolve an address")?;
+                let value = args[3];
                 let old = self.memory_get(block, slot);
                 let result = match name {
                     "SetPointed" => value,
@@ -1875,17 +2118,36 @@ impl<'a> WatchVm<'a> {
                     "SetSubtractPointed" => old - value,
                     "SetMultiplyPointed" => old * value,
                     "SetDividePointed" => old / value,
+                    "SetModPointed" => modulus(old, value)?,
+                    "SetRemPointed" => old % value,
+                    "SetPowerPointed" => old.powf(value),
                     _ => unreachable!(),
                 };
                 self.memory_set(block, slot, result, index)?;
                 self.record_diagnostic(|| {
-                    format!("{name} node={index} pointer={pointer_block}[{pointer_slot}]={pointer} target={block}[{slot}] old={old} new={result}")
+                    format!("{name} node={index} target={block}[{slot}] old={old} new={result}")
                 });
                 Ok(result)
             }
-            "IncrementPre" | "IncrementPost" | "DecrementPre" | "DecrementPost" => {
-                let block = integer(self.arg(index, 0)?, "block id")?;
-                let slot = index_of(self.arg(index, 1)?)?;
+            "IncrementPre"
+            | "IncrementPost"
+            | "DecrementPre"
+            | "DecrementPost"
+            | "IncrementPrePointed"
+            | "IncrementPostPointed"
+            | "DecrementPrePointed"
+            | "DecrementPostPointed" => {
+                let pointed = name.ends_with("Pointed");
+                let (block, slot) = if pointed {
+                    let args = self.all_args(index)?;
+                    self.pointed_location_values(args[0], args[1], args[2], true)?
+                        .context("pointed update did not resolve an address")?
+                } else {
+                    (
+                        integer(self.arg(index, 0)?, "block id")?,
+                        index_of(self.arg(index, 1)?)?,
+                    )
+                };
                 let old = self.memory_get(block, slot);
                 let new = if name.starts_with("Increment") {
                     old + 1.0
@@ -1896,12 +2158,56 @@ impl<'a> WatchVm<'a> {
                 self.record_diagnostic(|| {
                     format!("{name} node={index} block={block} index={slot} old={old} new={new}")
                 });
-                Ok(if name.ends_with("Pre") { new } else { old })
+                Ok(
+                    if name.starts_with("Increment") || name.starts_with("Decrement") {
+                        if name.ends_with("Pre") || name.ends_with("PrePointed") {
+                            new
+                        } else {
+                            old
+                        }
+                    } else {
+                        old
+                    },
+                )
+            }
+            "IncrementPreShifted"
+            | "IncrementPostShifted"
+            | "DecrementPreShifted"
+            | "DecrementPostShifted" => {
+                let block = integer(self.arg(index, 0)?, "block id")?;
+                let x = self.arg(index, 1)?;
+                let y = self.arg(index, 2)?;
+                let stride = self.arg(index, 3)?;
+                let slot = index_of(x + y * stride)?;
+                let old = self.memory_get(block, slot);
+                let new = if name.starts_with("Increment") {
+                    old + 1.0
+                } else {
+                    old - 1.0
+                };
+                self.memory_set(block, slot, new, index)?;
+                self.record_diagnostic(|| {
+                    format!("{name} node={index} block={block} x={x} y={y} stride={stride} index={slot} old={old} new={new}")
+                });
+                Ok(
+                    if name.starts_with("IncrementPre") || name.starts_with("DecrementPre") {
+                        new
+                    } else {
+                        old
+                    },
+                )
             }
             "Draw" => {
                 let args = self.all_args(index)?;
                 if args.len() != 11 && args.len() != 14 {
                     bail!("Draw requires 11 or 14 arguments, got {}", args.len());
+                }
+                // A controlled Sonolus v1.1.4 Watch oracle showed that the
+                // exact sprite sentinel -1 draws nothing and execution
+                // continues. Keep this narrowly scoped; other negative IDs
+                // still follow the normal integer/u32 validation below.
+                if args[0] == -1.0 {
+                    return Ok(0.0);
                 }
                 let sprite_id = integer(args[0], "sprite id")?;
                 let sprite_id =
@@ -1970,6 +2276,43 @@ impl<'a> WatchVm<'a> {
                 });
                 Ok(0.0)
             }
+            "Play" => {
+                let args = self.all_args(index)?;
+                if args.len() != 2 {
+                    bail!("Play requires 2 arguments, got {}", args.len());
+                }
+                self.audio_events.push(AudioEffectEvent::Play {
+                    clip_id: integer(args[0], "effect clip id")?,
+                    minimum_distance: args[1],
+                    requested_at: self.context.time,
+                });
+                Ok(0.0)
+            }
+            "PlayLooped" => {
+                let args = self.all_args(index)?;
+                if args.len() != 1 {
+                    bail!("PlayLooped requires 1 argument, got {}", args.len());
+                }
+                let clip_id = integer(args[0], "effect clip id")?;
+                let instance_id = self.allocate_looped_effect_id()?;
+                self.audio_events.push(AudioEffectEvent::StartLoop {
+                    instance_id,
+                    clip_id,
+                    requested_at: self.context.time,
+                });
+                Ok(instance_id as f64)
+            }
+            "StopLooped" => {
+                let args = self.all_args(index)?;
+                if args.len() != 1 {
+                    bail!("StopLooped requires 1 argument, got {}", args.len());
+                }
+                self.audio_events.push(AudioEffectEvent::StopLoop {
+                    instance_id: integer(args[0], "looped effect instance id")?,
+                    requested_at: self.context.time,
+                });
+                Ok(0.0)
+            }
             "PlayScheduled" => {
                 let args = self.all_args(index)?;
                 if args.len() != 3 {
@@ -1988,6 +2331,48 @@ impl<'a> WatchVm<'a> {
                     requested_at: self.context.time,
                     has_required_lead_time: time - self.context.time >= 0.5,
                 });
+                Ok(0.0)
+            }
+            "PlayLoopedScheduled" => {
+                let args = self.all_args(index)?;
+                if args.len() != 2 {
+                    bail!(
+                        "PlayLoopedScheduled requires 2 arguments, got {}",
+                        args.len()
+                    );
+                }
+                let clip_id = integer(args[0], "effect clip id")?;
+                if clip_id < 0 {
+                    bail!("effect clip id must be nonnegative, got {clip_id}");
+                }
+                let start_time = args[1];
+                let instance_id = self.allocate_looped_effect_id()?;
+                self.scheduled_looped_effects.push(ScheduledLoopedEffect {
+                    instance_id,
+                    clip_id,
+                    start_time,
+                    requested_at: self.context.time,
+                    has_required_lead_time: start_time - self.context.time >= 0.5,
+                });
+                Ok(instance_id as f64)
+            }
+            "StopLoopedScheduled" => {
+                let args = self.all_args(index)?;
+                if args.len() != 2 {
+                    bail!(
+                        "StopLoopedScheduled requires 2 arguments, got {}",
+                        args.len()
+                    );
+                }
+                let instance_id = integer(args[0], "looped effect instance id")?;
+                let end_time = args[1];
+                self.scheduled_looped_effect_stops
+                    .push(ScheduledLoopedEffectStop {
+                        instance_id,
+                        end_time,
+                        requested_at: self.context.time,
+                        has_required_lead_time: end_time - self.context.time >= 0.5,
+                    });
                 Ok(0.0)
             }
             "DestroyParticleEffect" => {
@@ -2009,6 +2394,37 @@ impl<'a> WatchVm<'a> {
                     .push(DestroyedParticleEffect { particle_id });
                 self.particle_events.push(ParticleEffectEvent::Destroy {
                     instance_id: particle_id,
+                });
+                Ok(0.0)
+            }
+            "MoveParticleEffect" => {
+                let args = self.all_args(index)?;
+                if args.len() != 9 {
+                    bail!(
+                        "MoveParticleEffect requires 9 arguments, got {}",
+                        args.len()
+                    );
+                }
+                let instance_id = integer(args[0], "particle effect instance id")?;
+                let corners = [
+                    [args[1], args[2]],
+                    [args[3], args[4]],
+                    [args[5], args[6]],
+                    [args[7], args[8]],
+                ];
+                if let Some(instance) = self
+                    .context
+                    .particle_instances
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("particle instance state lock was poisoned"))?
+                    .instances
+                    .get_mut(&instance_id)
+                {
+                    instance.corners = corners;
+                }
+                self.particle_events.push(ParticleEffectEvent::Move {
+                    instance_id,
+                    corners,
                 });
                 Ok(0.0)
             }
@@ -2062,6 +2478,37 @@ impl<'a> WatchVm<'a> {
                     .push(ParticleEffectEvent::Spawn(instance.clone()));
                 Ok(instance.instance_id as f64)
             }
+            "Copy" => {
+                if count != 5 {
+                    bail!("Copy requires exactly five arguments, got {count}");
+                }
+                let source_block = integer(self.arg(index, 0)?, "Copy source block")?;
+                let source_index = index_of(self.arg(index, 1)?)?;
+                let destination_block = integer(self.arg(index, 2)?, "Copy destination block")?;
+                let destination_index = index_of(self.arg(index, 3)?)?;
+                let count = integer(self.arg(index, 4)?, "Copy count")?;
+                let count = usize::try_from(count).context("Copy count must be non-negative")?;
+                source_index
+                    .checked_add(count)
+                    .context("Copy source range overflows address space")?;
+                destination_index
+                    .checked_add(count)
+                    .context("Copy destination range overflows address space")?;
+
+                // Snapshot the source before writing so both overlap directions
+                // preserve the original source values as the Sonolus spec requires.
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(count)
+                    .context("unable to allocate Copy source snapshot")?;
+                for offset in 0..count {
+                    values.push(self.memory_get(source_block, source_index + offset));
+                }
+                for (offset, value) in values.into_iter().enumerate() {
+                    self.memory_set(destination_block, destination_index + offset, value, index)?;
+                }
+                Ok(0.0)
+            }
             "And" => {
                 let argument_count = self.nodes[index].args.len();
                 if argument_count == 0 {
@@ -2110,15 +2557,21 @@ impl<'a> WatchVm<'a> {
                     _ => unreachable!(),
                 })
             }
-            "Abs" | "Arctan" | "Ceil" | "Copy" | "Cos" | "Floor" | "Log" | "Negate" | "Not"
-            | "Round" | "Sin" | "Trunc" | "Frac" | "Sign" | "Radian" | "Degree" | "Arcsin"
-            | "Arccos" | "Tan" | "Cosh" | "Sinh" | "Tanh" => {
+            "Arctan2" => {
+                if count != 2 {
+                    bail!("Arctan2 requires exactly two arguments");
+                }
+                let (y, x) = binary(self)?;
+                Ok(y.atan2(x))
+            }
+            "Abs" | "Arctan" | "Ceil" | "Cos" | "Floor" | "Log" | "Negate" | "Not" | "Round"
+            | "Sin" | "Trunc" | "Frac" | "Sign" | "Radian" | "Degree" | "Arcsin" | "Arccos"
+            | "Tan" | "Cosh" | "Sinh" | "Tanh" => {
                 let value = unary(self)?;
                 Ok(match name {
                     "Abs" => value.abs(),
                     "Arctan" => value.atan(),
                     "Ceil" => value.ceil(),
-                    "Copy" => value,
                     "Cos" => value.cos(),
                     "Floor" => value.floor(),
                     "Log" => value.ln(),
@@ -2181,30 +2634,144 @@ impl<'a> WatchVm<'a> {
             }
             name if name.starts_with("Ease") => {
                 let value = unary(self)?;
-                let curve = match name {
-                    "EaseInSine" => 1.0 - (value * std::f64::consts::FRAC_PI_2).cos(),
-                    "EaseOutSine" => (value * std::f64::consts::FRAC_PI_2).sin(),
-                    "EaseInOutSine" => {
-                        if value < 0.5 {
-                            (1.0 - (value * std::f64::consts::PI).cos()) / 2.0
-                        } else {
-                            (1.0 + ((value - 0.5) * std::f64::consts::PI).sin()) / 2.0
-                        }
-                    }
-                    "EaseInQuad" => value * value,
-                    "EaseOutQuad" => 1.0 - (1.0 - value) * (1.0 - value),
-                    "EaseInOutQuad" => {
-                        if value < 0.5 {
-                            2.0 * value * value
-                        } else {
-                            1.0 - (-2.0 * value + 2.0).powi(2) / 2.0
-                        }
-                    }
-                    _ => bail!("unsupported Watch function {name} at node {index}"),
-                };
-                Ok(curve)
+                let suffix = name.strip_prefix("Ease").unwrap_or_default();
+                let (direction, family) = ["InOut", "OutIn", "In", "Out"]
+                    .into_iter()
+                    .find_map(|direction| {
+                        suffix
+                            .strip_prefix(direction)
+                            .map(|family| (direction, family))
+                    })
+                    .context(format!("unsupported Watch function {name} at node {index}"))?;
+                if !matches!(
+                    family,
+                    "Sine"
+                        | "Quad"
+                        | "Cubic"
+                        | "Quart"
+                        | "Quint"
+                        | "Expo"
+                        | "Circ"
+                        | "Back"
+                        | "Elastic"
+                ) {
+                    bail!("unsupported Watch function {name} at node {index}");
+                }
+                Ok(ease_curve(family, direction, value))
             }
             _ => bail!("unsupported Watch function {name} at node {index}"),
+        }
+    }
+}
+
+/// Evaluate the documented Sonolus easing families. Compound curves compose
+/// the corresponding In/Out halves and preserve extrapolation outside [0, 1].
+fn ease_curve(family: &str, direction: &str, value: f64) -> f64 {
+    fn ease_in(family: &str, x: f64) -> f64 {
+        match family {
+            "Sine" => 1.0 - (x * std::f64::consts::FRAC_PI_2).cos(),
+            "Quad" => x * x,
+            "Cubic" => x * x * x,
+            "Quart" => x * x * x * x,
+            "Quint" => x * x * x * x * x,
+            "Expo" => {
+                if x == 0.0 {
+                    0.0
+                } else {
+                    (2.0_f64).powf(10.0 * x - 10.0)
+                }
+            }
+            "Circ" => 1.0 - (1.0 - x * x).sqrt(),
+            "Back" => {
+                const C1: f64 = 1.70158;
+                const C3: f64 = C1 + 1.0;
+                C3 * x * x * x - C1 * x * x
+            }
+            "Elastic" => {
+                if x == 0.0 {
+                    0.0
+                } else if x == 1.0 {
+                    1.0
+                } else {
+                    -(2.0_f64).powf(10.0 * x - 10.0)
+                        * ((x * 10.0 - 10.75) * (2.0 * std::f64::consts::PI / 3.0)).sin()
+                }
+            }
+            _ => unreachable!("family validated by caller"),
+        }
+    }
+
+    fn ease_out(family: &str, x: f64) -> f64 {
+        match family {
+            "Sine" => (x * std::f64::consts::FRAC_PI_2).sin(),
+            "Quad" => 1.0 - (1.0 - x) * (1.0 - x),
+            "Cubic" => 1.0 - (1.0 - x).powi(3),
+            "Quart" => 1.0 - (1.0 - x).powi(4),
+            "Quint" => 1.0 - (1.0 - x).powi(5),
+            "Expo" => {
+                if x == 1.0 {
+                    1.0
+                } else {
+                    1.0 - (2.0_f64).powf(-10.0 * x)
+                }
+            }
+            "Circ" => (1.0 - (x - 1.0) * (x - 1.0)).sqrt(),
+            "Back" => {
+                const C1: f64 = 1.70158;
+                const C3: f64 = C1 + 1.0;
+                1.0 + C3 * (x - 1.0).powi(3) + C1 * (x - 1.0).powi(2)
+            }
+            "Elastic" => {
+                if x == 0.0 {
+                    0.0
+                } else if x == 1.0 {
+                    1.0
+                } else {
+                    (2.0_f64).powf(-10.0 * x)
+                        * ((x * 10.0 - 0.75) * (2.0 * std::f64::consts::PI / 3.0)).sin()
+                        + 1.0
+                }
+            }
+            _ => unreachable!("family validated by caller"),
+        }
+    }
+
+    match direction {
+        "In" => ease_in(family, value),
+        "Out" => ease_out(family, value),
+        "InOut" => {
+            if value < 0.5 {
+                ease_in(family, value * 2.0) / 2.0
+            } else {
+                ease_out(family, value * 2.0 - 1.0) / 2.0 + 0.5
+            }
+        }
+        "OutIn" => {
+            if value < 0.5 {
+                ease_out(family, value * 2.0) / 2.0
+            } else {
+                ease_in(family, value * 2.0 - 1.0) / 2.0 + 0.5
+            }
+        }
+        _ => unreachable!("direction validated by caller"),
+    }
+}
+
+#[cfg(test)]
+mod easing_tests {
+    use super::ease_curve;
+
+    #[test]
+    fn documented_easings_preserve_nan_instead_of_clamping() {
+        for family in [
+            "Sine", "Quad", "Cubic", "Quart", "Quint", "Expo", "Circ", "Back", "Elastic",
+        ] {
+            for direction in ["In", "Out", "InOut", "OutIn"] {
+                assert!(
+                    ease_curve(family, direction, f64::NAN).is_nan(),
+                    "{direction}{family}"
+                );
+            }
         }
     }
 }
