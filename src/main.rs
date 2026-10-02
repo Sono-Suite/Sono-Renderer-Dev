@@ -10,6 +10,12 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum BackendArg {
+    Cpu,
+    Wgpu,
+}
+
 #[derive(Debug, Clone, Default, Args)]
 struct RenderLayerArgs {
     #[arg(long, conflicts_with = "no_ui")]
@@ -335,6 +341,15 @@ enum Command {
         width: u32,
         #[arg(long, default_value_t = 360)]
         height: u32,
+        /// Pixel backend used by shared preview and video rendering.
+        #[arg(long, value_enum, default_value_t = BackendArg::Cpu)]
+        backend: BackendArg,
+        /// Collect render-video pipeline timings and workload counters.
+        #[arg(long)]
+        profile: bool,
+        /// Print a detailed line for each profiled frame.
+        #[arg(long, requires = "profile")]
+        profile_frames: bool,
         /// Include Draw geometry/Unlerp values for a runtime entity in frame diagnostics.
         #[arg(long)]
         trace_entity: Option<usize>,
@@ -975,6 +990,9 @@ fn main() -> Result<()> {
             trace_entity,
             level_options,
             render_layers,
+            backend,
+            profile,
+            profile_frames,
         } => {
             if custom_mv.is_some() {
                 anyhow::bail!("custom MV compositing is not implemented");
@@ -1003,6 +1021,12 @@ fn main() -> Result<()> {
                 layers: render_layers.layers(),
                 ui: render_layers.ui_config()?,
                 trace_entity_id: trace_entity,
+                backend: match backend {
+                    BackendArg::Cpu => renderer::render::RenderBackend::Cpu,
+                    BackendArg::Wgpu => renderer::render::RenderBackend::Wgpu,
+                },
+                profile,
+                profile_frames,
             };
             let report = config.render_video()?;
             println!("wrote MP4 to {}", output.display());
@@ -1162,5 +1186,50 @@ mod cli_tests {
             }
             _ => panic!("expected render-video command"),
         }
+    }
+
+    #[test]
+    fn render_video_profile_flags_are_opt_in_and_frames_require_profile() {
+        let base = [
+            "renderer",
+            "render-video",
+            "engine.zip",
+            "resources.scp",
+            "level.json",
+            "music.mp3",
+            "out.mp4",
+        ];
+        assert!(super::Cli::try_parse_from(base).is_ok());
+        let profiled = super::Cli::try_parse_from([
+            "renderer",
+            "render-video",
+            "engine.zip",
+            "resources.scp",
+            "level.json",
+            "music.mp3",
+            "out.mp4",
+            "--profile",
+            "--profile-frames",
+        ])
+        .unwrap();
+        match profiled.command {
+            super::Command::RenderVideo {
+                profile,
+                profile_frames,
+                ..
+            } => assert!(profile && profile_frames),
+            _ => panic!("expected render-video"),
+        }
+        assert!(super::Cli::try_parse_from([
+            "renderer",
+            "render-video",
+            "engine.zip",
+            "resources.scp",
+            "level.json",
+            "music.mp3",
+            "out.mp4",
+            "--profile-frames"
+        ])
+        .is_err());
     }
 }

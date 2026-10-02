@@ -61,6 +61,20 @@ pub struct RenderConfig {
     pub layers: RenderLayers,
     #[serde(default)]
     pub ui: RendererUiConfig,
+    #[serde(default)]
+    pub backend: RenderBackend,
+    #[serde(default)]
+    pub profile: bool,
+    #[serde(default)]
+    pub profile_frames: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RenderBackend {
+    #[default]
+    Cpu,
+    Wgpu,
 }
 
 fn default_duration() -> f64 {
@@ -158,6 +172,8 @@ impl RenderConfig {
             self.ui.clone(),
             self.start_time,
             self.duration,
+            self.backend,
+            self.profile,
         )?;
         let index = (time * f64::from(self.fps)).ceil() as u64;
         session.render_global_frame(index)
@@ -264,14 +280,52 @@ mod tests {
             "start_time": 14.0,
             "duration": 2.0,
             "fps": 12,
-            "width": 640,
-            "height": 360,
+            "width": 128,
+            "height": 72,
             "level_options": [{"index": 1, "value": 10.8}, {"index": 22, "value": 1.0}],
             "layers": {"particles": false, "sfx": false, "bgm": false}
         })).unwrap();
 
         let frame = config.render_frame(14.0).unwrap();
         assert_eq!(frame.report.runtime_update[0], 14.0);
-        assert_eq!(frame.rgb.len(), 640 * 360 * 3);
+        assert_eq!(frame.rgb.len(), 128 * 72 * 3);
+
+        let mut gpu_config = config.clone();
+        gpu_config.backend = RenderBackend::Wgpu;
+        let gpu = gpu_config.render_frame(14.0).unwrap();
+        assert_close_rgb(&frame.rgb, &gpu.rgb, 3, 0.002);
+    }
+
+    #[test]
+    fn next_rush_lapis_shared_preview_matches_cpu_reference_on_wgpu() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config: RenderConfig = serde_json::from_value(serde_json::json!({
+            "engine": repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"),
+            "resources": repo.join("TestingSuite/Next Sekai Engine/skin/ProSeka Faithful 0.8.3.scp"),
+            "level": repo.join("TestingSuite/Next Sekai Engine/levels/DIAMOND Lapis/DIAMOND Lapis.json.gz"),
+            "start_time": 0.0, "duration": 1.0, "fps": 12, "width": 160, "height": 90,
+            "layers": {"particles": false, "sfx": false, "bgm": false}
+        })).unwrap();
+        let cpu = config.render_frame(0.0).unwrap();
+        let mut gpu_config = config;
+        gpu_config.backend = RenderBackend::Wgpu;
+        let gpu = gpu_config.render_frame(0.0).unwrap();
+        assert_close_rgb(&cpu.rgb, &gpu.rgb, 3, 0.002);
+    }
+
+    fn assert_close_rgb(cpu: &[u8], gpu: &[u8], max_delta: u8, max_outlier_fraction: f64) {
+        assert_eq!(cpu.len(), gpu.len());
+        let mut outliers = 0usize;
+        for (&a, &b) in cpu.iter().zip(gpu) {
+            if a.abs_diff(b) > max_delta {
+                outliers += 1;
+            }
+        }
+        let fraction = outliers as f64 / cpu.len().max(1) as f64;
+        assert!(
+            fraction <= max_outlier_fraction,
+            "{outliers}/{} RGB samples exceed {max_delta}: {fraction:.6}",
+            cpu.len()
+        );
     }
 }

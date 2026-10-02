@@ -998,6 +998,31 @@ fn transform_runtime_skin_corners(draw: &SpriteDraw, matrix: &[f64; 16]) -> [[f6
     })
 }
 
+pub(crate) fn gpu_transform_skin_corners(
+    draw: &SpriteDraw,
+    matrix: &[f64; 16],
+    sprite: &crate::formats::SkinSpriteAsset,
+) -> [[f64; 2]; 4] {
+    transform_skin_corners(transform_runtime_skin_corners(draw, matrix), sprite)
+}
+
+pub(crate) fn gpu_transform_particle_corners(
+    draw: &crate::particles::ParticleSpriteDraw,
+    matrix: &[f64; 16],
+) -> [[f64; 2]; 4] {
+    transform_runtime_skin_corners(
+        &SpriteDraw {
+            sprite_id: 0,
+            corners: draw.corners,
+            z: [0.0; 4],
+            alpha: draw.alpha,
+            provenance: None,
+            trace: None,
+        },
+        matrix,
+    )
+}
+
 fn transform_skin_corners(
     input_corners: [[f64; 2]; 4],
     sprite: &crate::formats::SkinSpriteAsset,

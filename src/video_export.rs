@@ -17,6 +17,7 @@ use std::{
     io::Write,
     path::Path,
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Serialize)]
@@ -98,6 +99,9 @@ pub struct ExportRequest<'a> {
     pub sfx_enabled: bool,
     pub bgm_enabled: bool,
     pub ui: &'a crate::render_ui::RendererUiConfig,
+    pub backend: crate::render::RenderBackend,
+    pub profile: bool,
+    pub profile_frames: bool,
 }
 
 pub fn export_config(config: &RenderConfig) -> Result<ExportReport> {
@@ -131,10 +135,26 @@ pub fn export_config(config: &RenderConfig) -> Result<ExportReport> {
         sfx_enabled: config.layers.sfx,
         bgm_enabled: config.layers.bgm,
         ui: &config.ui,
+        backend: config.backend,
+        profile: config.profile,
+        profile_frames: config.profile_frames,
     })
 }
 
 pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
+    let export_start = request.profile.then(Instant::now);
+    let mut profile = request.profile.then(|| {
+        crate::profiling::ProfileCollector::new(
+            request.profile_frames,
+            match request.backend {
+                crate::render::RenderBackend::Cpu => "cpu",
+                crate::render::RenderBackend::Wgpu => "wgpu",
+            },
+            (request.width, request.height),
+            request.fps,
+        )
+    });
+    let startup_start = request.profile.then(Instant::now);
     for (label, path) in [
         ("engine", request.engine),
         ("resources", request.resources),
@@ -215,14 +235,32 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
             request.ui.clone(),
             request.start_time,
             request.duration,
+            request.backend,
+            request.profile,
         )
     };
+    let initial_session = make_session()?;
+    if let Some(p) = profile.as_mut() {
+        p.record(
+            "Initialization/startup",
+            startup_start.map_or(Duration::ZERO, |t| t.elapsed()),
+        );
+    }
+    let preflight_start = request.profile.then(Instant::now);
     let expected_frames = render_diagnostic_pass(
-        make_session()?,
+        initial_session,
         range,
         &package.watch,
         request.trace_entity_id,
+        profile.as_mut(),
     )?;
+    if let Some(p) = profile.as_mut() {
+        p.record(
+            "Determinism preflight",
+            preflight_start.map_or(Duration::ZERO, |t| t.elapsed()),
+        );
+    }
+    let audio_start = request.profile.then(Instant::now);
     let effect_assets = request
         .sfx_enabled
         .then_some(effect_name)
@@ -266,7 +304,14 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
             .map(|frame| frame.rgb_sha1.clone())
             .collect::<Vec<_>>(),
     );
+    if let Some(p) = profile.as_mut() {
+        p.record(
+            "Audio/SFX preparation",
+            audio_start.map_or(Duration::ZERO, |t| t.elapsed()),
+        );
+    }
 
+    let ffmpeg_start = request.profile.then(Instant::now);
     let installation = ffmpeg::resolve()?;
     let mut command = Command::new(&installation.ffmpeg);
     command.args([
@@ -335,18 +380,35 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("launching FFmpeg at {}", installation.ffmpeg.display()))?;
+    if let Some(p) = profile.as_mut() {
+        p.record(
+            "FFmpeg startup",
+            ffmpeg_start.map_or(Duration::ZERO, |t| t.elapsed()),
+        );
+    }
+
+    let streaming_session_start = request.profile.then(Instant::now);
+    let streaming_session = make_session()?;
+    if let Some(p) = profile.as_mut() {
+        p.record(
+            "Streaming session initialization",
+            streaming_session_start.map_or(Duration::ZERO, |t| t.elapsed()),
+        );
+        p.begin_render();
+    }
 
     let stdin = child
         .stdin
         .take()
         .context("FFmpeg process did not expose its raw-video input")?;
     let actual_frames = match stream_frames(
-        make_session()?,
+        streaming_session,
         range,
         stdin,
         &expected_frames,
         &package.watch,
         request.trace_entity_id,
+        profile.as_mut(),
     ) {
         Ok(frames) => frames,
         Err(error) => {
@@ -355,9 +417,19 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
             return Err(error).context("streaming deterministic RGB frames to FFmpeg");
         }
     };
+    if let Some(p) = profile.as_mut() {
+        p.finish_render();
+    }
+    let finalize_start = request.profile.then(Instant::now);
     let output = child
         .wait_with_output()
         .context("waiting for FFmpeg export")?;
+    if let Some(p) = profile.as_mut() {
+        p.record(
+            "FFmpeg finalization",
+            finalize_start.map_or(Duration::ZERO, |t| t.elapsed()),
+        );
+    }
     if !output.status.success() {
         bail!(
             "FFmpeg failed with status {:?}: {}",
@@ -365,6 +437,7 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    let probe_start = request.profile.then(Instant::now);
     let probe_output = Command::new(&installation.ffprobe)
         .args([
             "-v",
@@ -377,6 +450,9 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         ])
         .output()
         .context("launching FFprobe on rendered MP4")?;
+    if let Some(p) = profile.as_ref() {
+        let _ = p;
+    }
     if !probe_output.status.success() {
         bail!(
             "FFprobe failed with status {:?}: {}",
@@ -395,6 +471,12 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         range.frame_count as f64 / f64::from(range.fps),
         request.bgm_enabled || sfx_file.is_some(),
     )?;
+    if let Some(p) = profile.as_mut() {
+        p.record(
+            "FFprobe validation",
+            probe_start.map_or(Duration::ZERO, |t| t.elapsed()),
+        );
+    }
     let second_pass_hash = hash_sequence(
         &actual_frames
             .iter()
@@ -408,6 +490,10 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
             .all(|(first, second)| {
                 first.raw_draw_sha1 == second.raw_draw_sha1 && first.rgb_sha1 == second.rgb_sha1
             });
+    if let (Some(p), Some(start)) = (profile.as_mut(), export_start) {
+        p.record("Total export", start.elapsed());
+        p.print(start.elapsed());
+    }
     Ok(ExportReport {
         ffmpeg_source: match installation.source {
             ffmpeg::FfmpegSource::SharedAddons => "shared addons".to_owned(),
@@ -434,11 +520,16 @@ fn render_diagnostic_pass(
     range: FrameRange,
     watch: &crate::watch::WatchData,
     target_entity_id: Option<usize>,
+    mut profile: Option<&mut crate::profiling::ProfileCollector>,
 ) -> Result<Vec<FrameDiagnostic>> {
     (0..range.frame_count)
         .map(|segment_index| {
             let frame_index = range.index(segment_index)?;
             let frame = session.render_global_frame(frame_index)?;
+            if let (Some(p), Some(frame_profile)) = (profile.as_deref_mut(), frame.profile.as_ref())
+            {
+                p.record_preflight(frame_profile);
+            }
             Ok(frame_diagnostic(
                 segment_index,
                 frame_index,
@@ -458,14 +549,19 @@ fn stream_frames(
     expected_frames: &[FrameDiagnostic],
     watch: &crate::watch::WatchData,
     target_entity_id: Option<usize>,
+    profile: Option<&mut crate::profiling::ProfileCollector>,
 ) -> Result<Vec<FrameDiagnostic>> {
     if expected_frames.len() != range.frame_count as usize {
         bail!("determinism preflight returned an unexpected number of frames");
     }
     let mut actual_frames = Vec::with_capacity(expected_frames.len());
+    let mut profile = profile;
     for (segment_index, expected) in expected_frames.iter().enumerate() {
+        let frame_wall = profile.as_ref().map(|_| Instant::now());
         let global_index = range.index(segment_index as u64)?;
         let frame = session.render_global_frame(global_index)?;
+        let frame_profile = frame.profile.clone();
+        let diagnostic_start = profile.as_ref().map(|_| Instant::now());
         let diagnostic = frame_diagnostic(
             segment_index as u64,
             global_index,
@@ -479,9 +575,27 @@ fn stream_frames(
         {
             bail!("frame {global_index} changed between deterministic passes");
         }
+        if let (Some(start), Some(p)) = (diagnostic_start, profile.as_deref_mut()) {
+            p.record("Frame diagnostics/hash", start.elapsed());
+        }
+        let handoff_start = profile.as_ref().map(|_| Instant::now());
         stdin
             .write_all(&frame.rgb)
             .with_context(|| format!("writing raw RGB frame {global_index} to FFmpeg"))?;
+        if let (Some(start), Some(p), Some(frame_profile)) = (
+            handoff_start,
+            profile.as_deref_mut(),
+            frame_profile.as_ref(),
+        ) {
+            p.record_frame(
+                "stream",
+                global_index,
+                range.time(global_index),
+                frame_profile,
+                start.elapsed(),
+                frame_wall.map_or(frame_profile.total, |t| t.elapsed()),
+            );
+        }
         actual_frames.push(diagnostic);
     }
     stdin.flush().context("flushing raw RGB frames to FFmpeg")?;
