@@ -863,6 +863,19 @@ fn watch_vm_executes_control_memory_math_and_draw() {
 }
 
 #[test]
+fn watch_subtract_folds_all_operands_left_to_right() {
+    use renderer::watch::EngineNode as N;
+    let nodes: Vec<N> = serde_json::from_value(serde_json::json!([
+        {"value": 10}, {"value": 4}, {"value": 1},
+        {"func":"Subtract","args":[0,1,2]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+
+    assert_eq!(vm.execute(3).unwrap(), 5.0);
+}
+
+#[test]
 fn watch_draw_negative_one_is_oracle_verified_noop_and_execution_continues() {
     use renderer::watch::EngineNode as N;
     let nodes: Vec<N> = serde_json::from_value(serde_json::json!([
@@ -1140,6 +1153,57 @@ fn watch_host_attaches_callback_and_draw_node_provenance() {
     assert_eq!(provenance.callback.as_deref(), Some("UpdateParallel"));
     assert_eq!(provenance.callback_node, Some(11));
     assert_eq!(provenance.draw_node, 11);
+}
+
+#[test]
+fn level_option_override_is_visible_during_preprocess_and_empty_override_preserves_default() {
+    fn run(overrides: &[(usize, f64)]) -> f64 {
+        let watch: renderer::watch::WatchData = serde_json::from_value(serde_json::json!({
+            "archetypes":[{"name":"Initialization","preprocess":{"index":3}}],
+            "nodes":[
+                {"value":2002}, {"value":0}, {"func":"Get","args":[0,1]},
+                {"func":"DebugLog","args":[2]}
+            ]
+        }))
+        .unwrap();
+        let level: renderer::formats::LevelData = serde_json::from_value(serde_json::json!({
+            "entities":[{"archetype":"Initialization","data":[]}]
+        }))
+        .unwrap();
+        let configuration = serde_json::json!({"options":[{"def":6.0}]});
+        let mut runtime = renderer::watch_runtime::WatchRuntime::new(&watch, &level).unwrap();
+        runtime.bind_engine_option_defaults(&configuration).unwrap();
+        assert_eq!(runtime.global_memory.get(2002, 0), 6.0);
+        runtime
+            .bind_engine_option_overrides(&configuration, overrides)
+            .unwrap();
+        let report = runtime.frame(0.0).unwrap();
+        match &report.debug_events[0] {
+            renderer::runtime::DebugEvent::Log { value, .. } => *value,
+            event => panic!("expected preprocess DebugLog, got {event:?}"),
+        }
+    }
+
+    assert_eq!(run(&[]), 6.0);
+    assert_eq!(run(&[(0, 10.8)]), 10.8);
+}
+
+#[test]
+fn level_option_override_rejects_out_of_range_index() {
+    let watch: renderer::watch::WatchData = serde_json::from_value(serde_json::json!({
+        "archetypes":[], "nodes":[]
+    }))
+    .unwrap();
+    let level: renderer::formats::LevelData =
+        serde_json::from_value(serde_json::json!({"entities":[]})).unwrap();
+    let configuration = serde_json::json!({"options":[{"def":6.0}]});
+    let mut runtime = renderer::watch_runtime::WatchRuntime::new(&watch, &level).unwrap();
+    runtime.bind_engine_option_defaults(&configuration).unwrap();
+    assert!(runtime
+        .bind_engine_option_overrides(&configuration, &[(1, 10.8)])
+        .unwrap_err()
+        .to_string()
+        .contains("outside EngineConfiguration options"));
 }
 
 #[test]
@@ -2180,7 +2244,6 @@ fn watch_vm_spawn_particle_effect_rejects_invalid_arity_and_identifier() {
         vec![1.0; 10],
         vec![1.0; 12],
         vec![1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-        vec![-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
     ] {
         let mut nodes: Vec<renderer::watch::EngineNode> = values
             .iter()
@@ -2232,6 +2295,31 @@ fn watch_vm_spawn_particle_effect_rejects_invalid_arity_and_identifier() {
             .instances()
             .is_empty());
     }
+}
+
+#[test]
+fn watch_vm_spawn_particle_effect_missing_sentinel_is_noop() {
+    let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+        {"value": -1},
+        {"value": -1.0}, {"value": -0.5},
+        {"value": -1.0}, {"value": 0.5},
+        {"value": 1.0}, {"value": 0.5},
+        {"value": 1.0}, {"value": -0.5},
+        {"value": 2.5}, {"value": 0},
+        {"func":"SpawnParticleEffect","args":[0,1,2,3,4,5,6,7,8,9,10]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+
+    assert_eq!(vm.execute(11).unwrap(), 0.0);
+    assert!(vm.particle_events.is_empty());
+    assert!(vm
+        .context
+        .particle_instances
+        .read()
+        .unwrap()
+        .instances()
+        .is_empty());
 }
 
 #[test]

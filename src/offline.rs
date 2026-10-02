@@ -64,9 +64,10 @@ impl FrameRange {
     }
 }
 
-/// Map level timeline time to the source-audio position using LevelData's
-/// positive `bgmOffset` as the music start delay relative to level time.
-/// Negative source positions become leading silence in the exported clip.
+/// Map level timeline time to source audio position. Sonolus starts the BGM at
+/// `bgmOffset` and derives level time as `audioPosition - bgmOffset`, so the
+/// inverse mapping is `sourcePosition = levelTime + bgmOffset`. Negative source
+/// positions become leading silence in the exported clip.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct AudioWindow {
     pub source_start: f64,
@@ -77,7 +78,7 @@ pub fn audio_window(level_start: f64, bgm_offset: f64) -> Result<AudioWindow> {
     if !level_start.is_finite() || level_start < 0.0 || !bgm_offset.is_finite() {
         bail!("audio timeline inputs must be finite and level start nonnegative");
     }
-    let source_time = level_start - bgm_offset;
+    let source_time = level_start + bgm_offset;
     Ok(AudioWindow {
         source_start: source_time.max(0.0),
         leading_silence: (-source_time).max(0.0),
@@ -116,6 +117,22 @@ impl<'a> WatchFrameStepper<'a> {
             fps,
             last_frame_index: None,
         })
+    }
+
+    pub fn new_with_engine_options(
+        watch: &'a WatchData,
+        rom: &[u8],
+        configuration: &serde_json::Value,
+        level: &formats::LevelData,
+        fps: u32,
+        overrides: &[(usize, f64)],
+    ) -> Result<Self> {
+        let mut stepper = Self::new(watch, level, fps)?;
+        let runtime = stepper.runtime_mut();
+        runtime.bind_engine_rom(rom)?;
+        runtime.bind_engine_option_defaults(configuration)?;
+        runtime.bind_engine_option_overrides(configuration, overrides)?;
+        Ok(stepper)
     }
 
     pub fn runtime_mut(&mut self) -> &mut WatchRuntime<'a> {
@@ -160,6 +177,7 @@ impl<'a> FrameSession<'a> {
         width: u32,
         height: u32,
         fps: u32,
+        level_option_overrides: &[(usize, f64)],
     ) -> Result<Self> {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             bail!("frame dimensions must be in 1..=8192");
@@ -167,11 +185,16 @@ impl<'a> FrameSession<'a> {
         if fps == 0 || fps > 240 {
             bail!("FPS must be in 1..=240");
         }
-        let mut stepper = WatchFrameStepper::new(watch, level, fps)?;
+        let mut stepper = WatchFrameStepper::new_with_engine_options(
+            watch,
+            rom,
+            configuration,
+            level,
+            fps,
+            level_option_overrides,
+        )?;
         let runtime = stepper.runtime_mut();
         runtime.set_draw_tracing(true);
-        runtime.bind_engine_rom(rom)?;
-        runtime.bind_engine_option_defaults(configuration)?;
         runtime.set_screen_aspect_ratio(f64::from(width) / f64::from(height))?;
         let skin = formats::load_skin_assets(resources_path, skin_name)?;
         let bindings = skin_bindings(watch)?;
@@ -372,12 +395,12 @@ mod tests {
         assert_eq!(
             audio_window(14.0, 0.05).unwrap(),
             AudioWindow {
-                source_start: 13.95,
+                source_start: 14.05,
                 leading_silence: 0.0
             }
         );
         assert_eq!(
-            audio_window(0.0, 0.05).unwrap(),
+            audio_window(0.0, -0.05).unwrap(),
             AudioWindow {
                 source_start: 0.0,
                 leading_silence: 0.05
@@ -386,7 +409,14 @@ mod tests {
         assert_eq!(
             audio_window(2.0, -0.25).unwrap(),
             AudioWindow {
-                source_start: 2.25,
+                source_start: 1.75,
+                leading_silence: 0.0
+            }
+        );
+        assert_eq!(
+            audio_window(15.0, -1.109).unwrap(),
+            AudioWindow {
+                source_start: 13.891,
                 leading_silence: 0.0
             }
         );
@@ -443,5 +473,37 @@ mod tests {
             .memory
             .entries_for_block(1001)
             .is_empty());
+    }
+
+    #[test]
+    fn configured_frame_stepper_applies_overrides_before_preprocessing() {
+        let watch: WatchData = serde_json::from_value(serde_json::json!({
+            "archetypes": [{"name":"Initialization", "preprocess":{"index":3}}],
+            "nodes": [
+                {"value":2002}, {"value":0}, {"func":"Get", "args":[0,1]},
+                {"func":"DebugLog", "args":[2]}
+            ]
+        }))
+        .unwrap();
+        let level: formats::LevelData = serde_json::from_value(serde_json::json!({
+            "entities":[{"archetype":"Initialization","data":[]}]
+        }))
+        .unwrap();
+        let configuration = serde_json::json!({"options":[{"def":6.0}]});
+        let mut timeline = WatchFrameStepper::new_with_engine_options(
+            &watch,
+            &[],
+            &configuration,
+            &level,
+            12,
+            &[(0, 10.8)],
+        )
+        .unwrap();
+
+        let frame = timeline.advance_to(0).unwrap();
+        assert!(matches!(
+            frame.debug_events.as_slice(),
+            [crate::runtime::DebugEvent::Log { value: 10.8, .. }]
+        ));
     }
 }

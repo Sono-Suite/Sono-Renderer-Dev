@@ -385,6 +385,42 @@ impl<'a> WatchRuntime<'a> {
         self.trace_draws = enabled;
     }
 
+    /// Collect the narrowly filtered Temp[0]/Temp[22] RHS provenance trace.
+    /// This is diagnostic-only and does not change callback execution.
+    pub fn rhs_forensic_reports(&self) -> Vec<(usize, Vec<String>)> {
+        self.entities
+            .iter()
+            .filter(|entity| entity.archetype == "NormalHeadTapNote")
+            .filter_map(|entity| {
+                let value = callback(
+                    self.archetype_defs[entity.archetype_index].clone(),
+                    LifecycleStage::UpdateParallel,
+                )?;
+                let node = callback_index(&value).ok()?;
+                let mut vm = WatchVm::new(&self.watch.nodes);
+                vm.context = self.context.clone();
+                vm.context.lifecycle_stage = Some(LifecycleStage::UpdateParallel as u8);
+                vm.context.entity_id = Some(entity.id);
+                vm.context.entity_archetype = Some(entity.archetype.clone());
+                vm.context.callback_name = Some("UpdateParallel".to_owned());
+                vm.context.callback_node = Some(node);
+                vm.context.has_entity_data = entity.has_entity_data;
+                vm.context.has_entity_shared_memory = entity.has_shared_memory;
+                vm.context.entity_info = (!entity.spawned).then_some([
+                    entity.id as f64,
+                    entity.archetype_index as f64,
+                    if entity.active { 1.0 } else { 0.0 },
+                ]);
+                vm.memory = self.global_memory.clone();
+                vm.memory.retain_other_than(TEMPORARY_MEMORY);
+                vm.memory.overlay(&entity.memory);
+                vm.memory.retain_other_than(TEMPORARY_MEMORY);
+                vm.execute(node).ok()?;
+                (!vm.rhs_forensic_events.is_empty()).then_some((entity.id, vm.rhs_forensic_events))
+            })
+            .collect()
+    }
+
     /// Bind only sprites declared by WatchData and present in the selected
     /// skin's SkinData. Engine-local numeric IDs are retained from WatchData.
     pub fn bind_skin_sprite_names(&mut self, present_names: &BTreeSet<String>) -> Result<()> {
@@ -465,6 +501,32 @@ impl<'a> WatchRuntime<'a> {
             let value = option.get("def").and_then(Value::as_f64).with_context(|| {
                 format!("EngineConfiguration option {index} has no numeric def")
             })?;
+            self.global_memory.set(LEVEL_OPTION, index, value);
+        }
+        Ok(())
+    }
+
+    /// Override selected Level Option slots after defaults are bound and before
+    /// preprocessing. Indices are the EngineConfiguration option positions.
+    pub fn bind_engine_option_overrides(
+        &mut self,
+        configuration: &Value,
+        overrides: &[(usize, f64)],
+    ) -> Result<()> {
+        let options = configuration
+            .get("options")
+            .and_then(Value::as_array)
+            .context("EngineConfiguration has no options array")?;
+        for &(index, value) in overrides {
+            if index >= options.len() {
+                bail!(
+                    "Level Option override index {index} is outside EngineConfiguration options ({} entries)",
+                    options.len()
+                );
+            }
+            if !value.is_finite() {
+                bail!("Level Option override at index {index} must be finite");
+            }
             self.global_memory.set(LEVEL_OPTION, index, value);
         }
         Ok(())

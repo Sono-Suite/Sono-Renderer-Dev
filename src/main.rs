@@ -50,6 +50,9 @@ enum Command {
         resources: Option<PathBuf>,
         #[arg(long, default_value_t = 0.0)]
         time: f64,
+        /// Override a Level Option after EngineConfiguration defaults are bound (repeatable: INDEX=VALUE).
+        #[arg(long = "level-option", value_name = "INDEX=VALUE", action = clap::ArgAction::Append)]
+        level_options: Vec<String>,
         #[arg(long, default_value_t = 1280)]
         width: u32,
         #[arg(long, default_value_t = 720)]
@@ -110,6 +113,9 @@ enum Command {
         /// Include Draw geometry/Unlerp values for a runtime entity in frame diagnostics.
         #[arg(long)]
         trace_entity: Option<usize>,
+        /// Override a Level Option after EngineConfiguration defaults are bound (repeatable: INDEX=VALUE).
+        #[arg(long = "level-option", value_name = "INDEX=VALUE", action = clap::ArgAction::Append)]
+        level_options: Vec<String>,
     },
 }
 
@@ -186,6 +192,7 @@ fn main() -> Result<()> {
             level,
             resources,
             time,
+            level_options,
             width,
             height,
             output,
@@ -259,6 +266,14 @@ fn main() -> Result<()> {
             }
             runtime.bind_engine_rom(&package.rom)?;
             runtime.bind_engine_option_defaults(&package.configuration)?;
+            let option_overrides = level_options
+                .iter()
+                .map(|value| parse_level_option_override(value))
+                .collect::<Result<Vec<_>>>()?;
+            runtime.bind_engine_option_overrides(&package.configuration, &option_overrides)?;
+            for (index, value) in &option_overrides {
+                println!("Level Option[{index}] override: {value}");
+            }
             if width == 0 || height == 0 {
                 anyhow::bail!("Watch frame dimensions must be positive");
             }
@@ -376,6 +391,18 @@ fn main() -> Result<()> {
                 (Some(_), None) | (None, _) => None,
             };
             let report = runtime.frame(time)?;
+            let rhs_forensic_reports = runtime.rhs_forensic_reports();
+            if !rhs_forensic_reports.is_empty() {
+                println!(
+                    "RHS forensic callback replays (time={time}, callback=NormalHeadTapNote.UpdateParallel, root=node88326):"
+                );
+                for (entity_id, events) in rhs_forensic_reports {
+                    println!("  entity={entity_id}");
+                    for event in events {
+                        println!("    {event}");
+                    }
+                }
+            }
             println!(
                 "Runtime Update [time, deltaTime, scaledTime, reserved]: {:?}; after callbacks={:?}; timescale={}",
                 report.runtime_update, report.runtime_update_after_callbacks, report.timescale
@@ -626,11 +653,16 @@ fn main() -> Result<()> {
             width,
             height,
             trace_entity,
+            level_options,
         } => {
             if custom_mv.is_some() {
                 anyhow::bail!("custom MV compositing is not implemented");
             }
             let _optional_cover = cover;
+            let option_overrides = level_options
+                .iter()
+                .map(|value| parse_level_option_override(value))
+                .collect::<Result<Vec<_>>>()?;
             let report = renderer::video_export::export(renderer::video_export::ExportRequest {
                 engine: &engine,
                 resources: &resources,
@@ -643,6 +675,7 @@ fn main() -> Result<()> {
                 width,
                 height,
                 trace_entity_id: trace_entity,
+                level_option_overrides: &option_overrides,
             })?;
             println!("wrote MP4 to {}", output.display());
             println!(
@@ -713,5 +746,90 @@ fn parse_lifecycle_stage(value: &str) -> Result<renderer::watch_runtime::Lifecyc
         "updateparallel" => Ok(LifecycleStage::UpdateParallel),
         "terminate" => Ok(LifecycleStage::Terminate),
         _ => anyhow::bail!("unknown diagnostic lifecycle stage {value:?}"),
+    }
+}
+
+fn parse_level_option_override(value: &str) -> Result<(usize, f64)> {
+    let (index, value) = value
+        .split_once('=')
+        .with_context(|| format!("invalid --level-option {value:?}; expected INDEX=VALUE"))?;
+    let index = index
+        .parse::<usize>()
+        .with_context(|| format!("invalid Level Option index {index:?}"))?;
+    let value = value
+        .parse::<f64>()
+        .with_context(|| format!("invalid Level Option value {value:?}"))?;
+    if !value.is_finite() {
+        anyhow::bail!("Level Option override must be finite");
+    }
+    Ok((index, value))
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::parse_level_option_override;
+    use clap::Parser;
+
+    #[test]
+    fn parses_level_option_override() {
+        assert_eq!(parse_level_option_override("22=0").unwrap(), (22, 0.0));
+        assert_eq!(parse_level_option_override("1=10.8").unwrap(), (1, 10.8));
+    }
+
+    #[test]
+    fn rejects_malformed_level_option_override() {
+        assert!(parse_level_option_override("22").is_err());
+        assert!(parse_level_option_override("x=1").is_err());
+        assert!(parse_level_option_override("1=abc").is_err());
+        assert!(parse_level_option_override("1=NaN").is_err());
+    }
+
+    #[test]
+    fn run_watch_accepts_repeated_level_option_flags() {
+        let cli = super::Cli::try_parse_from([
+            "renderer",
+            "run-watch",
+            "engine.zip",
+            "level.json.gz",
+            "--level-option",
+            "1=10.8",
+            "--level-option",
+            "22=0",
+        ])
+        .unwrap();
+        match cli.command {
+            super::Command::RunWatch { level_options, .. } => {
+                assert_eq!(level_options, ["1=10.8", "22=0"]);
+            }
+            _ => panic!("expected run-watch command"),
+        }
+    }
+
+    #[test]
+    fn render_video_accepts_repeated_level_option_flags() {
+        let cli = super::Cli::try_parse_from([
+            "renderer",
+            "render-video",
+            "engine.zip",
+            "resources.scp",
+            "level.json.gz",
+            "music.mp3",
+            "output.mp4",
+            "--level-option",
+            "1=10.8",
+            "--level-option",
+            "22=0",
+        ])
+        .unwrap();
+        match cli.command {
+            super::Command::RenderVideo { level_options, .. } => {
+                let parsed = level_options
+                    .iter()
+                    .map(|value| parse_level_option_override(value).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(parsed, [(1, 10.8), (22, 0.0)]);
+            }
+            _ => panic!("expected render-video command"),
+        }
     }
 }

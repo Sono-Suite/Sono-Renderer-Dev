@@ -80,6 +80,7 @@ pub struct ExportRequest<'a> {
     pub width: u32,
     pub height: u32,
     pub trace_entity_id: Option<usize>,
+    pub level_option_overrides: &'a [(usize, f64)],
 }
 
 pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
@@ -135,6 +136,7 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
             request.width,
             request.height,
             request.fps,
+            request.level_option_overrides,
         )
     };
     let expected_frames = render_diagnostic_pass(
