@@ -104,6 +104,55 @@ pub struct FrameReport {
     pub runtime_skin_transform: [f64; 16],
     /// Runtime Particle Transform matrix as seen after this frame's callbacks.
     pub runtime_particle_transform: [f64; 16],
+    #[serde(skip)]
+    pub runtime_profile: FrameRuntimeProfile,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FrameRuntimeProfile {
+    pub frame_count: u64,
+    pub frame: std::time::Duration,
+    pub preprocess: std::time::Duration,
+    pub update_spawn: std::time::Duration,
+    pub scheduling: std::time::Duration,
+    pub activation: std::time::Duration,
+    pub update_sequential: std::time::Duration,
+    pub update_parallel: std::time::Duration,
+    pub report_materialization: std::time::Duration,
+    pub callback_vm_construction: std::time::Duration,
+    pub callback_context_setup: std::time::Duration,
+    pub callback_memory_setup: std::time::Duration,
+    pub callback_execute: std::time::Duration,
+    pub callback_commit: std::time::Duration,
+    pub callbacks: u64,
+    pub evaluations: u64,
+    pub function_dispatches: u64,
+    pub memory_entries_copied: u64,
+    pub stepper_event_aggregation: std::time::Duration,
+}
+
+impl FrameRuntimeProfile {
+    pub(crate) fn accumulate(&mut self, other: &Self) {
+        self.frame_count += other.frame_count;
+        self.frame += other.frame;
+        self.preprocess += other.preprocess;
+        self.update_spawn += other.update_spawn;
+        self.scheduling += other.scheduling;
+        self.activation += other.activation;
+        self.update_sequential += other.update_sequential;
+        self.update_parallel += other.update_parallel;
+        self.report_materialization += other.report_materialization;
+        self.callback_vm_construction += other.callback_vm_construction;
+        self.callback_context_setup += other.callback_context_setup;
+        self.callback_memory_setup += other.callback_memory_setup;
+        self.callback_execute += other.callback_execute;
+        self.callback_commit += other.callback_commit;
+        self.callbacks += other.callbacks;
+        self.evaluations += other.evaluations;
+        self.function_dispatches += other.function_dispatches;
+        self.memory_entries_copied += other.memory_entries_copied;
+        self.stepper_event_aggregation += other.stepper_event_aggregation;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -141,6 +190,9 @@ pub struct WatchRuntime<'a> {
     frame_spawn_requests: u64,
     diagnostic_target: Option<WatchDiagnosticTarget>,
     trace_draws: bool,
+    profiling: bool,
+    collect_vm_accounting: bool,
+    frame_profile: FrameRuntimeProfile,
 }
 
 impl<'a> WatchRuntime<'a> {
@@ -218,6 +270,9 @@ impl<'a> WatchRuntime<'a> {
             frame_spawn_requests: 0,
             diagnostic_target: None,
             trace_draws: false,
+            profiling: false,
+            collect_vm_accounting: true,
+            frame_profile: FrameRuntimeProfile::default(),
         };
         for index in 0..16 {
             runtime.global_memory.set(
@@ -406,6 +461,14 @@ impl<'a> WatchRuntime<'a> {
     /// Capture the evaluated WatchData argument graphs for each executed Draw.
     pub fn set_draw_tracing(&mut self, enabled: bool) {
         self.trace_draws = enabled;
+    }
+
+    pub fn set_profiling(&mut self, enabled: bool) {
+        self.profiling = enabled;
+    }
+
+    pub fn set_vm_accounting(&mut self, enabled: bool) {
+        self.collect_vm_accounting = enabled;
     }
 
     /// Collect the narrowly filtered Temp[0]/Temp[22] RHS provenance trace.
@@ -647,6 +710,8 @@ impl<'a> WatchRuntime<'a> {
         if !time.is_finite() {
             bail!("Watch frame time must be finite");
         }
+        self.frame_profile = FrameRuntimeProfile::default();
+        let frame_start = self.profiling.then(std::time::Instant::now);
         let initial_entity_count = self.entities.len();
         self.callback_log.clear();
         self.frame_display_list = DisplayList::default();
@@ -670,7 +735,11 @@ impl<'a> WatchRuntime<'a> {
             .unwrap_or(0.0);
         // Preprocess is the one-time setup pass at the initial runtime state,
         // before advancing the requested playback frame.
+        let phase_start = self.profiling.then(std::time::Instant::now);
         self.preprocess()?;
+        if let Some(start) = phase_start {
+            self.frame_profile.preprocess += start.elapsed();
+        }
         self.context.time = time;
         let scaled_time = self.context.scaled_time(time)?;
         self.global_memory.set(RUNTIME_UPDATE, 0, time);
@@ -678,14 +747,23 @@ impl<'a> WatchRuntime<'a> {
         self.global_memory.set(RUNTIME_UPDATE, 2, scaled_time);
         self.global_memory.set(RUNTIME_UPDATE, 3, 0.0);
         self.context.timescale = self.context.time_to_timescale(time)?;
+        let phase_start = self.profiling.then(std::time::Instant::now);
         let timeline = if let Some(node) = self.watch.update_spawn {
             self.invoke_global(LifecycleStage::UpdateSpawn, node)?
         } else {
             time
         };
+        if let Some(start) = phase_start {
+            self.frame_profile.update_spawn += start.elapsed();
+        }
 
+        let phase_start = self.profiling.then(std::time::Instant::now);
         self.compute_schedules()?;
+        if let Some(start) = phase_start {
+            self.frame_profile.scheduling += start.elapsed();
+        }
 
+        let phase_start = self.profiling.then(std::time::Instant::now);
         let leaving: Vec<usize> = self
             .entities
             .iter()
@@ -715,12 +793,24 @@ impl<'a> WatchRuntime<'a> {
             self.invoke_entity(id, LifecycleStage::Initialize)?;
             self.entities[id].initialized = true;
         }
+        if let Some(start) = phase_start {
+            self.frame_profile.activation += start.elapsed();
+        }
 
+        let phase_start = self.profiling.then(std::time::Instant::now);
         self.run_active_stage(LifecycleStage::UpdateSequential)?;
+        if let Some(start) = phase_start {
+            self.frame_profile.update_sequential += start.elapsed();
+        }
+        let phase_start = self.profiling.then(std::time::Instant::now);
         self.run_active_stage(LifecycleStage::UpdateParallel)?;
+        if let Some(start) = phase_start {
+            self.frame_profile.update_parallel += start.elapsed();
+        }
         self.last_frame_time = Some(time);
 
-        let report = FrameReport {
+        let materialization_start = self.profiling.then(std::time::Instant::now);
+        let mut report = FrameReport {
             timeline: Some(timeline),
             runtime_update: [time, delta_time, scaled_time, 0.0],
             runtime_update_after_callbacks: [
@@ -758,7 +848,15 @@ impl<'a> WatchRuntime<'a> {
             runtime_particle_transform: std::array::from_fn(|index| {
                 self.global_memory.get(RUNTIME_PARTICLE_TRANSFORM, index)
             }),
+            runtime_profile: self.frame_profile.clone(),
         };
+        if let Some(start) = materialization_start {
+            report.runtime_profile.report_materialization += start.elapsed();
+        }
+        if let Some(start) = frame_start {
+            report.runtime_profile.frame += start.elapsed();
+            report.runtime_profile.frame_count = 1;
+        }
         Ok(report)
     }
 
@@ -842,8 +940,18 @@ impl<'a> WatchRuntime<'a> {
             stage,
             node,
         };
+        if self.profiling {
+            self.frame_profile.callbacks += 1;
+        }
+        let phase_start = self.profiling.then(std::time::Instant::now);
         let mut vm = WatchVm::new(&self.watch.nodes);
+        vm.set_profiling(self.profiling);
+        vm.set_accounting(self.collect_vm_accounting);
+        if let Some(start) = phase_start {
+            self.frame_profile.callback_vm_construction += start.elapsed();
+        }
         vm.set_evaluation_limit(callback_evaluation_limit(self.level_entity_count));
+        let phase_start = self.profiling.then(std::time::Instant::now);
         vm.context = self.context.clone();
         vm.context.entity_data_array_writable = stage == LifecycleStage::Preprocess;
         vm.context.lifecycle_stage = Some(stage as u8);
@@ -859,17 +967,37 @@ impl<'a> WatchRuntime<'a> {
             archetype_index as f64,
             if self.entities[id].active { 1.0 } else { 0.0 },
         ]);
-        vm.memory = self.global_memory.clone();
-        vm.memory.retain_other_than(TEMPORARY_MEMORY);
-        vm.memory.overlay(&self.entities[id].memory);
-        vm.memory.retain_other_than(TEMPORARY_MEMORY);
         if let Some(target) = self
             .diagnostic_target
             .filter(|target| target.entity_id == id && target.stage == stage)
         {
             vm.enable_limit_diagnostics(target.event_capacity)?;
         }
-        let result = match vm.execute(node) {
+        if let Some(start) = phase_start {
+            self.frame_profile.callback_context_setup += start.elapsed();
+        }
+        let phase_start = self.profiling.then(std::time::Instant::now);
+        if self.profiling {
+            self.frame_profile.memory_entries_copied +=
+                self.global_memory.len() as u64 + self.entities[id].memory.len() as u64;
+        }
+        vm.memory = self.global_memory.clone();
+        vm.memory.retain_other_than(TEMPORARY_MEMORY);
+        vm.memory.overlay(&self.entities[id].memory);
+        vm.memory.retain_other_than(TEMPORARY_MEMORY);
+        if let Some(start) = phase_start {
+            self.frame_profile.callback_memory_setup += start.elapsed();
+        }
+        let phase_start = self.profiling.then(std::time::Instant::now);
+        let execution = vm.execute(node);
+        if self.profiling {
+            if let Some(start) = phase_start {
+                self.frame_profile.callback_execute += start.elapsed();
+            }
+            self.frame_profile.evaluations += vm.evaluation_count() as u64;
+            self.frame_profile.function_dispatches += vm.profile_function_dispatches;
+        }
+        let result = match execution {
             Ok(result) => result,
             Err(error) => {
                 let callback_error = error.context(format!(
@@ -900,22 +1028,21 @@ impl<'a> WatchRuntime<'a> {
                 return Err(callback_error);
             }
         };
+        let commit_start = self.profiling.then(std::time::Instant::now);
         let requests = std::mem::take(&mut vm.spawn_queue);
         self.frame_vm_evaluations += vm.evaluation_count() as u64;
         self.frame_spawn_requests += requests.len() as u64;
         if self.entities[id].has_entity_data && stage == LifecycleStage::Preprocess {
             self.entities[id].entity_data = self.entity_data_row(id);
         }
-        self.global_memory = vm.memory.clone();
-        self.global_memory.retain_other_than(ENTITY_MEMORY);
-        self.global_memory.retain_other_than(ENTITY_DATA);
-        self.global_memory.retain_other_than(ENTITY_SHARED_MEMORY);
-        self.global_memory.retain_other_than(TEMPORARY_MEMORY);
-        self.entities[id].memory = vm.memory.clone();
-        // Entity Memory is the only per-entity persistent block. Keeping a
-        // snapshot of global blocks here lets the next callback overwrite
-        // fresh Runtime Update inputs with this entity's stale snapshot.
-        self.entities[id].memory.retain_only(ENTITY_MEMORY);
+        let (global_memory, entity_memory) = vm.memory.into_watch_entity_parts(
+            ENTITY_MEMORY,
+            &[ENTITY_DATA, ENTITY_SHARED_MEMORY, TEMPORARY_MEMORY],
+        );
+        self.global_memory = global_memory;
+        // Entity Memory is the only per-entity persistent block. The split
+        // keeps the next callback from reapplying this entity's global snapshot.
+        self.entities[id].memory = entity_memory;
         self.callback_log.push(record);
         self.frame_display_list
             .sprites
@@ -937,21 +1064,52 @@ impl<'a> WatchRuntime<'a> {
         for request in requests {
             self.enqueue_spawn(request.archetype_id, request.data)?;
         }
+        if let Some(start) = commit_start {
+            self.frame_profile.callback_commit += start.elapsed();
+        }
         Ok(result)
     }
 
     fn invoke_global(&mut self, stage: LifecycleStage, node: usize) -> Result<f64> {
+        if self.profiling {
+            self.frame_profile.callbacks += 1;
+        }
+        let phase_start = self.profiling.then(std::time::Instant::now);
         let mut vm = WatchVm::new(&self.watch.nodes);
+        vm.set_profiling(self.profiling);
+        vm.set_accounting(self.collect_vm_accounting);
+        if let Some(start) = phase_start {
+            self.frame_profile.callback_vm_construction += start.elapsed();
+        }
         vm.set_evaluation_limit(callback_evaluation_limit(self.level_entity_count));
+        let phase_start = self.profiling.then(std::time::Instant::now);
         vm.context = self.context.clone();
         vm.context.callback_name = Some(format!("{stage:?}"));
         vm.context.callback_node = Some(node);
         vm.set_draw_tracing(self.trace_draws);
+        if let Some(start) = phase_start {
+            self.frame_profile.callback_context_setup += start.elapsed();
+        }
+        let phase_start = self.profiling.then(std::time::Instant::now);
+        if self.profiling {
+            self.frame_profile.memory_entries_copied += self.global_memory.len() as u64;
+        }
         vm.memory = self.global_memory.clone();
         vm.memory.retain_other_than(TEMPORARY_MEMORY);
-        let result = vm
-            .execute(node)
-            .with_context(|| format!("global {stage:?} callback node {node}"))?;
+        if let Some(start) = phase_start {
+            self.frame_profile.callback_memory_setup += start.elapsed();
+        }
+        let phase_start = self.profiling.then(std::time::Instant::now);
+        let execution = vm.execute(node);
+        if self.profiling {
+            if let Some(start) = phase_start {
+                self.frame_profile.callback_execute += start.elapsed();
+            }
+            self.frame_profile.evaluations += vm.evaluation_count() as u64;
+            self.frame_profile.function_dispatches += vm.profile_function_dispatches;
+        }
+        let result = execution.with_context(|| format!("global {stage:?} callback node {node}"))?;
+        let commit_start = self.profiling.then(std::time::Instant::now);
         let requests = std::mem::take(&mut vm.spawn_queue);
         self.frame_vm_evaluations += vm.evaluation_count() as u64;
         self.frame_spawn_requests += requests.len() as u64;
@@ -982,6 +1140,9 @@ impl<'a> WatchRuntime<'a> {
         self.frame_skin_checks.extend(vm.skin_checks);
         for request in requests {
             self.enqueue_spawn(request.archetype_id, request.data)?;
+        }
+        if let Some(start) = commit_start {
+            self.frame_profile.callback_commit += start.elapsed();
         }
         Ok(result)
     }

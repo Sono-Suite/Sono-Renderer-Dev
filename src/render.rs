@@ -72,8 +72,8 @@ pub struct RenderConfig {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RenderBackend {
-    #[default]
     Cpu,
+    #[default]
     Wgpu,
 }
 
@@ -174,6 +174,7 @@ impl RenderConfig {
             self.duration,
             self.backend,
             self.profile,
+            self.trace_entity_id.is_some(),
         )?;
         let index = (time * f64::from(self.fps)).ceil() as u64;
         session.render_global_frame(index)
@@ -222,6 +223,7 @@ mod tests {
         assert_eq!(config.duration, 2.0);
         assert_eq!((config.fps, config.width, config.height), (12, 640, 360));
         assert_eq!(config.layers, RenderLayers::default());
+        assert_eq!(config.backend, RenderBackend::Wgpu);
         assert!(!config.ui.enabled);
         assert_eq!((0.01_f64 * 12.0).ceil() as u64, 1);
     }
@@ -268,6 +270,30 @@ mod tests {
         }));
         assert_eq!(stepper.runtime_mut().global_memory.get(2002, 1), 10.8);
         assert_eq!(stepper.runtime_mut().global_memory.get(2002, 22), 1.0);
+    }
+
+    #[test]
+    fn next_rush_baumkuchen_shared_preview_has_deterministic_wgpu_frame() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config: RenderConfig = serde_json::from_value(serde_json::json!({
+            "engine": repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"),
+            "resources": repo.join("TestingSuite/Next Sekai Engine/skin/ProSeka Faithful 0.8.3.scp"),
+            "level": repo.join("TestingSuite/Next Sekai Engine/levels/Various Artists - Baumkuchen x Retry Now/Baumkuchen x Retry Now.json.gz"),
+            "start_time": 0.0,
+            "duration": 0.25,
+            "fps": 12,
+            "width": 320,
+            "height": 180,
+            "level_options": [{"index": 1, "value": 10.8}, {"index": 22, "value": 1.0}],
+            "layers": {"particles": false, "sfx": false, "bgm": false},
+            "backend": "wgpu"
+        })).unwrap();
+
+        let frame = config.render_frame(0.0).unwrap();
+        assert_eq!(
+            crate::offline::hash_rgb(&frame.rgb),
+            "d45f286a15fac6be9b51ded7d0015356b8b92a72"
+        );
     }
 
     #[test]

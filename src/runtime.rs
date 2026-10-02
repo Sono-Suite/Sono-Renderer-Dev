@@ -1163,6 +1163,10 @@ impl Memory {
         self.values.get(&(block, index)).copied().unwrap_or(0.0)
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.values.len()
+    }
+
     pub fn set(&mut self, block: i64, index: usize, value: f64) {
         self.values.insert((block, index), value);
     }
@@ -1185,6 +1189,23 @@ impl Memory {
     pub fn overlay(&mut self, source: &Memory) {
         self.values
             .extend(source.values.iter().map(|(k, v)| (*k, *v)));
+    }
+
+    pub(crate) fn into_watch_entity_parts(
+        mut self,
+        entity_memory_block: i64,
+        excluded_global_blocks: &[i64],
+    ) -> (Self, Self) {
+        let mut entity_and_later = self.values.split_off(&(entity_memory_block, 0));
+        let mut later = entity_and_later.split_off(&(entity_memory_block.saturating_add(1), 0));
+        later.retain(|(block, _), _| !excluded_global_blocks.contains(block));
+        self.values.append(&mut later);
+        (
+            self,
+            Self {
+                values: entity_and_later,
+            },
+        )
     }
 }
 
@@ -1216,6 +1237,9 @@ pub struct WatchVm<'a> {
     max_evaluations: usize,
     trace_draws: bool,
     capture_draw_argument_values: bool,
+    profiling: bool,
+    collect_accounting: bool,
+    pub(crate) profile_function_dispatches: u64,
     draw_argument_values: BTreeMap<usize, f64>,
     draw_argument_value_texts: BTreeMap<usize, String>,
     draw_memory_reads: Vec<MemoryReadTrace>,
@@ -1312,6 +1336,9 @@ impl<'a> WatchVm<'a> {
             max_evaluations: MAX_EVALUATIONS,
             trace_draws: false,
             capture_draw_argument_values: false,
+            profiling: false,
+            collect_accounting: true,
+            profile_function_dispatches: 0,
             draw_argument_values: BTreeMap::new(),
             draw_argument_value_texts: BTreeMap::new(),
             draw_memory_reads: Vec::new(),
@@ -1323,6 +1350,14 @@ impl<'a> WatchVm<'a> {
     pub fn set_draw_tracing(&mut self, enabled: bool) {
         self.trace_draws = enabled;
         self.capture_draw_argument_values = enabled;
+    }
+
+    pub(crate) fn set_profiling(&mut self, enabled: bool) {
+        self.profiling = enabled;
+    }
+
+    pub(crate) fn set_accounting(&mut self, enabled: bool) {
+        self.collect_accounting = enabled;
     }
 
     /// Capture a bounded VM trace from the start of the next execution.
@@ -1740,7 +1775,9 @@ impl<'a> WatchVm<'a> {
                 bail!("Runtime Skin Transform index {slot} exceeds 15");
             }
             self.memory.set(block, slot, value);
-            self.last_memory_writes.insert((block, slot), (node, value));
+            if self.capture_draw_argument_values {
+                self.last_memory_writes.insert((block, slot), (node, value));
+            }
             return Ok(());
         }
         if block == RUNTIME_PARTICLE_TRANSFORM_BLOCK {
@@ -1751,7 +1788,9 @@ impl<'a> WatchVm<'a> {
                 bail!("Runtime Particle Transform index {slot} exceeds 15");
             }
             self.memory.set(block, slot, value);
-            self.last_memory_writes.insert((block, slot), (node, value));
+            if self.capture_draw_argument_values {
+                self.last_memory_writes.insert((block, slot), (node, value));
+            }
             return Ok(());
         }
         if block == 1007 {
@@ -1762,7 +1801,9 @@ impl<'a> WatchVm<'a> {
                 bail!("Runtime UI Configuration index {slot} exceeds 9");
             }
             self.memory.set(block, slot, value);
-            self.last_memory_writes.insert((block, slot), (node, value));
+            if self.capture_draw_argument_values {
+                self.last_memory_writes.insert((block, slot), (node, value));
+            }
             return Ok(());
         }
         if block == 1004 {
@@ -1778,7 +1819,9 @@ impl<'a> WatchVm<'a> {
                 .get_mut(slot)
                 .with_context(|| format!("Runtime Background index {slot} exceeds 7"))?;
             *target = value;
-            self.last_memory_writes.insert((block, slot), (node, value));
+            if self.capture_draw_argument_values {
+                self.last_memory_writes.insert((block, slot), (node, value));
+            }
             return Ok(());
         }
         if block == ENGINE_ROM_BLOCK {
@@ -1800,7 +1843,9 @@ impl<'a> WatchVm<'a> {
                 );
             }
             values[slot] = value;
-            self.last_memory_writes.insert((block, slot), (node, value));
+            if self.capture_draw_argument_values {
+                self.last_memory_writes.insert((block, slot), (node, value));
+            }
             return Ok(());
         }
         if block == ENTITY_SHARED_MEMORY_ARRAY_BLOCK {
@@ -1819,7 +1864,9 @@ impl<'a> WatchVm<'a> {
                 );
             }
             values[slot] = value;
-            self.last_memory_writes.insert((block, slot), (node, value));
+            if self.capture_draw_argument_values {
+                self.last_memory_writes.insert((block, slot), (node, value));
+            }
             return Ok(());
         }
         if block == 4001 {
@@ -1846,7 +1893,9 @@ impl<'a> WatchVm<'a> {
                 bail!("Entity Data row for entity {id} is outside the array");
             }
             values[index] = value;
-            self.last_memory_writes.insert((block, slot), (node, value));
+            if self.capture_draw_argument_values {
+                self.last_memory_writes.insert((block, slot), (node, value));
+            }
             return Ok(());
         }
         if block == 4002 {
@@ -1873,7 +1922,9 @@ impl<'a> WatchVm<'a> {
                 bail!("Entity Shared Memory row for entity {id} is outside the array");
             }
             values[index] = value;
-            self.last_memory_writes.insert((block, slot), (node, value));
+            if self.capture_draw_argument_values {
+                self.last_memory_writes.insert((block, slot), (node, value));
+            }
             return Ok(());
         }
         if block == ENTITY_INFO_ARRAY_BLOCK || block == 4003 {
@@ -1915,7 +1966,9 @@ impl<'a> WatchVm<'a> {
                 );
             }
         }
-        self.last_memory_writes.insert((block, slot), (node, value));
+        if self.capture_draw_argument_values {
+            self.last_memory_writes.insert((block, slot), (node, value));
+        }
         Ok(())
     }
 
@@ -1976,7 +2029,12 @@ impl<'a> WatchVm<'a> {
     }
 
     fn eval_function(&mut self, index: usize, name: &str) -> Result<f64> {
-        *self.function_counts.entry(name.to_owned()).or_default() += 1;
+        if self.profiling {
+            self.profile_function_dispatches += 1;
+        }
+        if self.collect_accounting {
+            *self.function_counts.entry(name.to_owned()).or_default() += 1;
+        }
         let count = self.nodes[index].args.len();
         let unary = |this: &mut Self| this.arg(index, 0);
         let binary = |this: &mut Self| -> Result<(f64, f64)> {
@@ -2050,7 +2108,9 @@ impl<'a> WatchVm<'a> {
                         .any(|id| *id as i64 == resource),
                 };
                 if name == "HasSkinSprite" {
-                    self.skin_checks.push((resource, exists));
+                    if self.collect_accounting {
+                        self.skin_checks.push((resource, exists));
+                    }
                 }
                 Ok(truth(exists))
             }
@@ -3249,4 +3309,46 @@ fn index_of(value: f64) -> Result<usize> {
         bail!("memory index must be a finite non-negative integer, got {value}");
     }
     Ok(value as usize)
+}
+
+#[cfg(test)]
+mod memory_partition_tests {
+    use super::Memory;
+
+    #[test]
+    fn entity_commit_split_matches_previous_clone_and_filter_rules() {
+        let mut input = Memory::new();
+        for block in [3999, 4000, 4001, 4002, 4003, 9999, 10000, 10001] {
+            input.set(block, 3, block as f64 + 0.25);
+        }
+        input.set(4000, 7, -4.5);
+
+        let mut expected_global = input.clone();
+        for excluded in [4000, 4001, 4002, 10000] {
+            expected_global.retain_other_than(excluded);
+        }
+        let mut expected_entity = input.clone();
+        expected_entity.retain_only(4000);
+
+        let (actual_global, actual_entity) =
+            input.into_watch_entity_parts(4000, &[4001, 4002, 10000]);
+        assert_eq!(actual_global.values, expected_global.values);
+        assert_eq!(actual_entity.values, expected_entity.values);
+    }
+
+    #[test]
+    fn disabling_vm_accounting_keeps_evaluation_result_and_omits_operation_map() {
+        let nodes: Vec<crate::watch::EngineNode> = serde_json::from_value(serde_json::json!([
+            {"value": 4}, {"value": 6}, {"func": "Add", "args": [0, 1]}
+        ]))
+        .unwrap();
+        let mut vm = super::WatchVm::new(&nodes);
+        assert_eq!(vm.execute(2).unwrap(), 10.0);
+        assert_eq!(vm.function_counts.get("Add"), Some(&1));
+
+        vm.function_counts.clear();
+        vm.set_accounting(false);
+        assert_eq!(vm.execute(2).unwrap(), 10.0);
+        assert!(vm.function_counts.is_empty());
+    }
 }

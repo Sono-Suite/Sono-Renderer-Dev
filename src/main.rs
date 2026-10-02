@@ -342,7 +342,7 @@ enum Command {
         #[arg(long, default_value_t = 360)]
         height: u32,
         /// Pixel backend used by shared preview and video rendering.
-        #[arg(long, value_enum, default_value_t = BackendArg::Cpu)]
+        #[arg(long, value_enum, default_value_t = BackendArg::Wgpu)]
         backend: BackendArg,
         /// Collect render-video pipeline timings and workload counters.
         #[arg(long)]
@@ -1214,10 +1214,14 @@ mod cli_tests {
         .unwrap();
         match profiled.command {
             super::Command::RenderVideo {
+                backend,
                 profile,
                 profile_frames,
                 ..
-            } => assert!(profile && profile_frames),
+            } => {
+                assert!(profile && profile_frames);
+                assert!(matches!(backend, super::BackendArg::Wgpu));
+            }
             _ => panic!("expected render-video"),
         }
         assert!(super::Cli::try_parse_from([

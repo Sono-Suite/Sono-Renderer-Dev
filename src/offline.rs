@@ -102,6 +102,7 @@ pub struct FrameSession<'a> {
     backend: crate::render::RenderBackend,
     gpu: Option<&'static crate::gpu_render::GpuRenderer>,
     profile: bool,
+    runtime_construction: std::time::Duration,
 }
 
 pub struct RenderedFrame {
@@ -129,6 +130,8 @@ pub struct FrameStageProfile {
     pub atlas_uploads: usize,
     pub readback_bytes: u64,
     pub adapter: Option<String>,
+    pub runtime: crate::watch_runtime::FrameRuntimeProfile,
+    pub runtime_construction: std::time::Duration,
 }
 
 pub fn effect_clip_bindings(watch: &WatchData) -> Result<BTreeMap<i64, String>> {
@@ -228,13 +231,16 @@ impl<'a> WatchFrameStepper<'a> {
         }
         let start = self.last_frame_index.map_or(0, |previous| previous + 1);
         let mut final_report = None;
+        let mut runtime_profile = crate::watch_runtime::FrameRuntimeProfile::default();
         let mut audio_events = Vec::new();
         let mut scheduled_effects = Vec::new();
         let mut scheduled_looped_effects = Vec::new();
         let mut scheduled_looped_effect_stops = Vec::new();
         for index in start..=frame_index {
             let time = index as f64 / f64::from(self.fps);
-            let report = self.runtime.frame(time)?;
+            let mut report = self.runtime.frame(time)?;
+            let aggregation_start =
+                (report.runtime_profile.frame_count > 0).then(std::time::Instant::now);
             audio_events.extend(report.audio_events.iter().cloned());
             scheduled_effects.extend(report.scheduled_effects.iter().cloned());
             scheduled_looped_effects.extend(report.scheduled_looped_effects.iter().cloned());
@@ -242,11 +248,17 @@ impl<'a> WatchFrameStepper<'a> {
                 .extend(report.scheduled_looped_effect_stops.iter().cloned());
             self.last_frame_index = Some(index);
             if index == frame_index {
-                let mut report = report;
                 report.audio_events = audio_events.clone();
                 report.scheduled_effects = scheduled_effects.clone();
                 report.scheduled_looped_effects = scheduled_looped_effects.clone();
                 report.scheduled_looped_effect_stops = scheduled_looped_effect_stops.clone();
+            }
+            if let Some(start) = aggregation_start {
+                report.runtime_profile.stepper_event_aggregation += start.elapsed();
+            }
+            runtime_profile.accumulate(&report.runtime_profile);
+            if index == frame_index {
+                report.runtime_profile = runtime_profile.clone();
                 final_report = Some(report);
             }
         }
@@ -290,6 +302,7 @@ impl<'a> FrameSession<'a> {
             1.0,
             crate::render::RenderBackend::Cpu,
             false,
+            false,
         )
     }
 
@@ -314,6 +327,7 @@ impl<'a> FrameSession<'a> {
         ui_segment_duration: f64,
         backend: crate::render::RenderBackend,
         profile: bool,
+        draw_tracing: bool,
     ) -> Result<Self> {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             bail!("frame dimensions must be in 1..=8192");
@@ -321,6 +335,7 @@ impl<'a> FrameSession<'a> {
         if fps == 0 || fps > 240 {
             bail!("FPS must be in 1..=240");
         }
+        let runtime_start = profile.then(std::time::Instant::now);
         let mut stepper = WatchFrameStepper::new_with_engine_options(
             watch,
             rom,
@@ -329,8 +344,13 @@ impl<'a> FrameSession<'a> {
             fps,
             level_option_overrides,
         )?;
+        let runtime_construction = runtime_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
         let runtime = stepper.runtime_mut();
-        runtime.set_draw_tracing(true);
+        runtime.set_draw_tracing(draw_tracing);
+        runtime.set_profiling(profile);
+        runtime.set_vm_accounting(false);
         runtime.set_screen_aspect_ratio(f64::from(width) / f64::from(height))?;
         let skin = formats::load_skin_assets(resources_path, skin_name)?;
         let bindings = skin_bindings(watch)?;
@@ -417,6 +437,7 @@ impl<'a> FrameSession<'a> {
                 None
             },
             profile,
+            runtime_construction,
         })
     }
 
@@ -562,6 +583,7 @@ impl<'a> FrameSession<'a> {
         let framebuffer_copy = framebuffer_copy_start
             .map(|t| t.elapsed())
             .unwrap_or_default();
+        let runtime_construction = std::mem::take(&mut self.runtime_construction);
         let profile = total_start.map(|t| FrameStageProfile {
             vm,
             preparation,
@@ -588,6 +610,8 @@ impl<'a> FrameSession<'a> {
             atlas_uploads: gpu_profile.as_ref().map_or(0, |p| p.atlas_uploads),
             readback_bytes: gpu_profile.as_ref().map_or(0, |p| p.readback_bytes),
             adapter: gpu_profile.and_then(|p| p.adapter),
+            runtime: report.runtime_profile.clone(),
+            runtime_construction,
         });
         Ok(RenderedFrame {
             report,

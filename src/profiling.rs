@@ -54,6 +54,16 @@ pub(crate) struct ProfileCollector {
     backend: &'static str,
     fps: u32,
     render_start: Option<std::time::Instant>,
+    stream_runtime_frames: u64,
+    stream_watch_callbacks: u64,
+    stream_watch_evaluations: u64,
+    stream_function_dispatches: u64,
+    stream_memory_entries: u64,
+    preflight_runtime_frames: u64,
+    preflight_watch_callbacks: u64,
+    preflight_watch_evaluations: u64,
+    preflight_function_dispatches: u64,
+    preflight_memory_entries: u64,
 }
 impl ProfileCollector {
     pub(crate) fn new(
@@ -77,6 +87,16 @@ impl ProfileCollector {
             backend,
             fps,
             render_start: None,
+            stream_runtime_frames: 0,
+            stream_watch_callbacks: 0,
+            stream_watch_evaluations: 0,
+            stream_function_dispatches: 0,
+            stream_memory_entries: 0,
+            preflight_runtime_frames: 0,
+            preflight_watch_callbacks: 0,
+            preflight_watch_evaluations: 0,
+            preflight_function_dispatches: 0,
+            preflight_memory_entries: 0,
         }
     }
     pub(crate) fn begin_render(&mut self) {
@@ -100,6 +120,120 @@ impl ProfileCollector {
         wall: Duration,
     ) {
         self.record("Watch VM", profile.vm);
+        self.record("Watch runtime frame", profile.runtime.frame);
+        self.record("Watch preprocess", profile.runtime.preprocess);
+        self.record("Watch update-spawn", profile.runtime.update_spawn);
+        self.record("Watch scheduling", profile.runtime.scheduling);
+        self.record("Watch activation", profile.runtime.activation);
+        self.record("Watch UpdateSequential", profile.runtime.update_sequential);
+        self.record("Watch UpdateParallel", profile.runtime.update_parallel);
+        self.record(
+            "Watch report materialization",
+            profile.runtime.report_materialization,
+        );
+        self.record(
+            "Watch event aggregation",
+            profile.runtime.stepper_event_aggregation,
+        );
+        self.record(
+            "Callback VM construction",
+            profile.runtime.callback_vm_construction,
+        );
+        self.record(
+            "Callback context setup",
+            profile.runtime.callback_context_setup,
+        );
+        self.record(
+            "Callback memory setup",
+            profile.runtime.callback_memory_setup,
+        );
+        self.record("Callback evaluator", profile.runtime.callback_execute);
+        self.record("Callback commit", profile.runtime.callback_commit);
+        self.record("Watch runtime construction", profile.runtime_construction);
+        if self.frame_count == 0 {
+            self.record("First-frame Watch VM", profile.vm);
+            self.record("First-frame runtime total", profile.runtime.frame);
+            self.record("First-frame preprocess", profile.runtime.preprocess);
+            self.record("First-frame UpdateSpawn", profile.runtime.update_spawn);
+            self.record("First-frame scheduling", profile.runtime.scheduling);
+            self.record("First-frame activation", profile.runtime.activation);
+            self.record(
+                "First-frame UpdateSequential",
+                profile.runtime.update_sequential,
+            );
+            self.record(
+                "First-frame UpdateParallel",
+                profile.runtime.update_parallel,
+            );
+            self.record(
+                "First-frame report build",
+                profile.runtime.report_materialization,
+            );
+            self.record(
+                "First-frame runtime construction",
+                profile.runtime_construction,
+            );
+            self.record(
+                "First-frame callback construction",
+                profile.runtime.callback_vm_construction,
+            );
+            self.record(
+                "First-frame callback context",
+                profile.runtime.callback_context_setup,
+            );
+            self.record(
+                "First-frame callback memory",
+                profile.runtime.callback_memory_setup,
+            );
+            self.record(
+                "First-frame callback setup",
+                profile.runtime.callback_vm_construction
+                    + profile.runtime.callback_context_setup
+                    + profile.runtime.callback_memory_setup,
+            );
+            self.record(
+                "First-frame callback evaluator",
+                profile.runtime.callback_execute,
+            );
+            self.record(
+                "First-frame callback commit",
+                profile.runtime.callback_commit,
+            );
+        } else {
+            self.record("Steady-state Watch VM", profile.vm);
+            self.record(
+                "Steady callback context",
+                profile.runtime.callback_context_setup,
+            );
+            self.record(
+                "Steady callback memory",
+                profile.runtime.callback_memory_setup,
+            );
+            self.record(
+                "Steady-state UpdateSequential",
+                profile.runtime.update_sequential,
+            );
+            self.record(
+                "Steady-state UpdateParallel",
+                profile.runtime.update_parallel,
+            );
+            self.record(
+                "Steady callback setup",
+                profile.runtime.callback_vm_construction
+                    + profile.runtime.callback_context_setup
+                    + profile.runtime.callback_memory_setup,
+            );
+            self.record(
+                "Steady callback evaluator",
+                profile.runtime.callback_execute,
+            );
+            self.record("Steady callback commit", profile.runtime.callback_commit);
+        }
+        self.stream_runtime_frames += profile.runtime.frame_count;
+        self.stream_watch_callbacks += profile.runtime.callbacks;
+        self.stream_watch_evaluations += profile.runtime.evaluations;
+        self.stream_function_dispatches += profile.runtime.function_dispatches;
+        self.stream_memory_entries += profile.runtime.memory_entries_copied;
         self.record("Draw preparation", profile.preparation);
         self.record(
             "CPU render-command preparation",
@@ -144,6 +278,53 @@ impl ProfileCollector {
     }
     pub(crate) fn record_preflight(&mut self, profile: &FrameStageProfile) {
         self.atlas_uploads += profile.atlas_uploads as u64;
+        self.record("Preflight Watch runtime frame", profile.runtime.frame);
+        self.record("Preflight Watch preprocess", profile.runtime.preprocess);
+        self.record("Preflight Watch update-spawn", profile.runtime.update_spawn);
+        self.record("Preflight Watch scheduling", profile.runtime.scheduling);
+        self.record("Preflight Watch activation", profile.runtime.activation);
+        self.record(
+            "Preflight Watch UpdateSequential",
+            profile.runtime.update_sequential,
+        );
+        self.record(
+            "Preflight Watch UpdateParallel",
+            profile.runtime.update_parallel,
+        );
+        self.record(
+            "Preflight report materialization",
+            profile.runtime.report_materialization,
+        );
+        self.record(
+            "Preflight event aggregation",
+            profile.runtime.stepper_event_aggregation,
+        );
+        self.record(
+            "Preflight callback VM construction",
+            profile.runtime.callback_vm_construction,
+        );
+        self.record(
+            "Preflight callback context setup",
+            profile.runtime.callback_context_setup,
+        );
+        self.record(
+            "Preflight callback memory setup",
+            profile.runtime.callback_memory_setup,
+        );
+        self.record(
+            "Preflight callback evaluator",
+            profile.runtime.callback_execute,
+        );
+        self.record("Preflight callback commit", profile.runtime.callback_commit);
+        self.record(
+            "Preflight runtime construction",
+            profile.runtime_construction,
+        );
+        self.preflight_runtime_frames += profile.runtime.frame_count;
+        self.preflight_watch_callbacks += profile.runtime.callbacks;
+        self.preflight_watch_evaluations += profile.runtime.evaluations;
+        self.preflight_function_dispatches += profile.runtime.function_dispatches;
+        self.preflight_memory_entries += profile.runtime.memory_entries_copied;
         if self.adapter.is_none() {
             self.adapter = profile.adapter.clone();
         }
@@ -166,8 +347,39 @@ impl ProfileCollector {
                 )
             }
         }
+        let watch_vm_total_ms = self
+            .timings
+            .get("Watch VM")
+            .map(|values| values.iter().map(|d| d.as_secs_f64() * 1000.0).sum::<f64>())
+            .unwrap_or_default();
+        eprintln!("\nWatch runtime phase shares (callback rows are nested within lifecycle stages; denominator is streamed Watch VM time):");
+        for name in [
+            "Watch preprocess",
+            "Watch update-spawn",
+            "Watch scheduling",
+            "Watch activation",
+            "Watch UpdateSequential",
+            "Watch UpdateParallel",
+            "Watch report materialization",
+            "Watch event aggregation",
+            "Callback VM construction",
+            "Callback context setup",
+            "Callback memory setup",
+            "Callback evaluator",
+            "Callback commit",
+        ] {
+            let total_ms = self
+                .timings
+                .get(name)
+                .map(|values| values.iter().map(|d| d.as_secs_f64() * 1000.0).sum::<f64>())
+                .unwrap_or_default();
+            eprintln!(
+                "{name:<34} {total_ms:>9.2}ms {:>6.1}%",
+                total_ms / watch_vm_total_ms.max(f64::MIN_POSITIVE) * 100.0
+            );
+        }
         let n = self.frame_count.max(1) as f64;
-        eprintln!("GPU execution timestamp: not collected (no additional query/readback added)\nEntities/frame: {:.1}\nSkin draws/frame: {:.1}\nParticle draws/frame: {:.1}\nGPU draws/frame: {:.1}\nAtlas uploads/cache misses: {}\nReadback/frame: {:.0} bytes",self.entities as f64/n,self.skin_draws as f64/n,self.particles as f64/n,self.gpu_draws as f64/n,self.atlas_uploads,self.readback_bytes as f64/n);
+        eprintln!("GPU execution timestamp: not collected (no additional query/readback added)\nEntities/frame: {:.1}\nSkin draws/frame: {:.1}\nParticle draws/frame: {:.1}\nGPU draws/frame: {:.1}\nAtlas uploads/cache misses: {}\nReadback/frame: {:.0} bytes\nWatch runtime frames/callbacks/evaluations: {}/{} / {}\nFunction dispatches (profile-only integer counter): {}\nCallback memory entries copied/overlaid: {}\nPreflight runtime frames/callbacks/evaluations: {}/{} / {}\nPreflight function dispatches: {}\nPreflight callback memory entries copied/overlaid: {}",self.entities as f64/n,self.skin_draws as f64/n,self.particles as f64/n,self.gpu_draws as f64/n,self.atlas_uploads,self.readback_bytes as f64/n,self.stream_runtime_frames,self.stream_watch_callbacks,self.stream_watch_evaluations,self.stream_function_dispatches,self.stream_memory_entries,self.preflight_runtime_frames,self.preflight_watch_callbacks,self.preflight_watch_evaluations,self.preflight_function_dispatches,self.preflight_memory_entries);
         let render = self
             .timings
             .get("Render phase")

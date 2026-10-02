@@ -48,6 +48,7 @@ pub struct FrameDiagnostic {
     pub runtime_update_after_callbacks: [f64; 4],
     pub timescale: f64,
     pub callback_count: usize,
+    pub vm_evaluations: u64,
     pub runtime_entity_count: usize,
     pub active_entity_count: usize,
     pub draw_count: usize,
@@ -237,6 +238,7 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
             request.duration,
             request.backend,
             request.profile,
+            request.trace_entity_id.is_some(),
         )
     };
     let initial_session = make_session()?;
@@ -675,6 +677,7 @@ fn frame_diagnostic(
         runtime_update_after_callbacks: frame.report.runtime_update_after_callbacks,
         timescale: frame.report.timescale,
         callback_count: frame.report.callbacks.len(),
+        vm_evaluations: frame.report.vm_evaluations,
         runtime_entity_count: frame.report.runtime_entity_count,
         active_entity_count: frame.report.active_entity_count,
         draw_count: frame.report.display_list.sprites.len(),
