@@ -228,12 +228,20 @@ mod tests {
     #[test]
     fn next_rush_shared_preview_initializes_baumkuchen_at_cli_options() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let package = formats::load_engine(&repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip")).unwrap();
+        let package =
+            formats::load_engine(&repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"))
+                .unwrap();
         let level = formats::load_level(&repo.join("TestingSuite/Next Sekai Engine/levels/Various Artists - Baumkuchen x Retry Now/Baumkuchen x Retry Now.json.gz")).unwrap();
         let options = [(1, 10.8), (22, 1.0)];
         let mut stepper = crate::offline::WatchFrameStepper::new_with_engine_options(
-            &package.watch, &package.rom, &package.configuration, &level, 12, &options,
-        ).unwrap();
+            &package.watch,
+            &package.rom,
+            &package.configuration,
+            &level,
+            12,
+            &options,
+        )
+        .unwrap();
 
         // Preview shares the same frame-zero initialization and monotonically advances
         // through the requested frame, just as video export does.
@@ -247,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn next_rush_armageddon_initialization_limit_is_shared_by_preview_host() {
+    fn next_rush_armageddon_shared_preview_initialization_succeeds() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let config: RenderConfig = serde_json::from_value(serde_json::json!({
             "engine": repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"),
@@ -262,11 +270,8 @@ mod tests {
             "layers": {"particles": false, "sfx": false, "bgm": false}
         })).unwrap();
 
-        let error = match config.render_frame(14.0) {
-            Ok(_) => panic!("ARMAGEDDON unexpectedly completed preview initialization"),
-            Err(error) => format!("{error:#}"),
-        };
-        assert!(error.contains("entity 0 (Initialization) Preprocess callback node 7862"), "{error}");
-        assert!(error.contains("Watch execution exceeded the evaluation limit"), "{error}");
+        let frame = config.render_frame(14.0).unwrap();
+        assert_eq!(frame.report.runtime_update[0], 14.0);
+        assert_eq!(frame.rgb.len(), 640 * 360 * 3);
     }
 }

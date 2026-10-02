@@ -1188,6 +1188,7 @@ pub struct WatchVm<'a> {
     pub rhs_forensic_events: Vec<String>,
     diagnostics: Option<VmDiagnostics>,
     loop_trace: Vec<LoopTraceFrame>,
+    max_evaluations: usize,
     trace_draws: bool,
     capture_draw_argument_values: bool,
     draw_argument_values: BTreeMap<usize, f64>,
@@ -1283,6 +1284,7 @@ impl<'a> WatchVm<'a> {
             rhs_forensic_events: Vec::new(),
             diagnostics: None,
             loop_trace: Vec::new(),
+            max_evaluations: MAX_EVALUATIONS,
             trace_draws: false,
             capture_draw_argument_values: false,
             draw_argument_values: BTreeMap::new(),
@@ -1307,7 +1309,11 @@ impl<'a> WatchVm<'a> {
     /// Capture only the tail of a potentially expensive execution. The
     /// evaluation cap and VM operation semantics remain unchanged.
     pub fn enable_limit_diagnostics(&mut self, capacity: usize) -> Result<()> {
-        self.enable_diagnostics_after(capacity, MAX_EVALUATIONS.saturating_sub(16_384))
+        self.enable_diagnostics_after(capacity, self.max_evaluations.saturating_sub(16_384))
+    }
+
+    pub(crate) fn set_evaluation_limit(&mut self, limit: usize) {
+        self.max_evaluations = limit.max(1);
     }
 
     fn enable_diagnostics_after(
@@ -1524,7 +1530,7 @@ impl<'a> WatchVm<'a> {
 
     fn eval(&mut self, index: usize) -> Result<f64> {
         self.evaluations += 1;
-        if self.evaluations > MAX_EVALUATIONS {
+        if self.evaluations > self.max_evaluations {
             bail!("Watch execution exceeded the evaluation limit");
         }
         if self.depth >= MAX_CALL_DEPTH {

@@ -24,6 +24,17 @@ const RUNTIME_PARTICLE_TRANSFORM: i64 = 1003;
 const RUNTIME_UI_CONFIGURATION: i64 = 1007;
 const RUNTIME_ENVIRONMENT: i64 = 1000;
 const LEVEL_OPTION: i64 = 2002;
+// The VM cap is host safety machinery. Keep its old floor, scale callbacks that
+// walk level data, and retain a hard ceiling for unusually large inputs.
+const MIN_CALLBACK_EVALUATIONS: usize = 5_000_000;
+const EVALUATIONS_PER_LEVEL_ENTITY: usize = 4_096;
+const MAX_CALLBACK_EVALUATIONS: usize = 50_000_000;
+
+fn callback_evaluation_limit(level_entity_count: usize) -> usize {
+    MIN_CALLBACK_EVALUATIONS
+        .max(level_entity_count.saturating_mul(EVALUATIONS_PER_LEVEL_ENTITY))
+        .min(MAX_CALLBACK_EVALUATIONS)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -106,6 +117,7 @@ pub struct WatchDiagnosticTarget {
 /// changes the order within a lifecycle system and ties preserve source order.
 pub struct WatchRuntime<'a> {
     watch: &'a WatchData,
+    level_entity_count: usize,
     archetype_defs: Vec<WatchArchetype>,
     archetypes: BTreeMap<String, usize>,
     pub entities: Vec<WatchEntity>,
@@ -175,9 +187,11 @@ impl<'a> WatchRuntime<'a> {
             }
         }
 
+        let level_entity_count = level.entities.len();
         let names = collect_entity_names(&level.entities)?;
         let mut runtime = Self {
             watch,
+            level_entity_count,
             archetype_defs,
             archetypes,
             entities: Vec::with_capacity(level.entities.len()),
@@ -829,6 +843,7 @@ impl<'a> WatchRuntime<'a> {
             node,
         };
         let mut vm = WatchVm::new(&self.watch.nodes);
+        vm.set_evaluation_limit(callback_evaluation_limit(self.level_entity_count));
         vm.context = self.context.clone();
         vm.context.entity_data_array_writable = stage == LifecycleStage::Preprocess;
         vm.context.lifecycle_stage = Some(stage as u8);
@@ -927,6 +942,7 @@ impl<'a> WatchRuntime<'a> {
 
     fn invoke_global(&mut self, stage: LifecycleStage, node: usize) -> Result<f64> {
         let mut vm = WatchVm::new(&self.watch.nodes);
+        vm.set_evaluation_limit(callback_evaluation_limit(self.level_entity_count));
         vm.context = self.context.clone();
         vm.context.callback_name = Some(format!("{stage:?}"));
         vm.context.callback_node = Some(node);
@@ -1189,6 +1205,17 @@ fn in_spawn_range(entity: &WatchEntity, timeline: f64) -> bool {
 #[cfg(test)]
 mod ui_configuration_tests {
     use super::*;
+
+    #[test]
+    fn callback_evaluation_budget_scales_with_level_size_and_has_a_ceiling() {
+        assert_eq!(callback_evaluation_limit(0), MIN_CALLBACK_EVALUATIONS);
+        assert_eq!(callback_evaluation_limit(1_131), MIN_CALLBACK_EVALUATIONS);
+        assert_eq!(callback_evaluation_limit(2_231), 9_138_176);
+        assert_eq!(
+            callback_evaluation_limit(usize::MAX),
+            MAX_CALLBACK_EVALUATIONS
+        );
+    }
 
     #[test]
     fn binds_five_engine_visibility_pairs_to_runtime_ui_block() {
