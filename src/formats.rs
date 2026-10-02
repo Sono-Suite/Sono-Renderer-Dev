@@ -129,6 +129,70 @@ pub struct SkinAssets {
     pub sprites: std::collections::BTreeMap<String, SkinSpriteAsset>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EffectAssets {
+    /// Decoded clip files keyed by the `name` in EffectData. `None` means the
+    /// EffectData entry was valid but its optional audio member was unavailable.
+    pub clips: std::collections::BTreeMap<String, Option<Vec<u8>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParticleAssets {
+    pub width: u32,
+    pub height: u32,
+    pub interpolation: bool,
+    pub rgba: Vec<u8>,
+    pub sprites: Vec<ParticleSpriteAsset>,
+    pub effects: std::collections::BTreeMap<String, ParticleEffectData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParticleSpriteAsset {
+    pub x: u32,
+    pub y: u32,
+    #[serde(rename = "w")]
+    pub width: u32,
+    #[serde(rename = "h")]
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParticleEffectData {
+    pub name: String,
+    pub transform: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>>,
+    pub groups: Vec<ParticleGroupData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParticleGroupData {
+    pub count: u32,
+    pub particles: Vec<ParticleDataEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParticleDataEntry {
+    pub sprite: usize,
+    pub color: String,
+    pub start: f64,
+    pub duration: f64,
+    pub x: ParticleProperty,
+    pub y: ParticleProperty,
+    pub w: ParticleProperty,
+    pub h: ParticleProperty,
+    pub r: ParticleProperty,
+    pub a: ParticleProperty,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ParticleProperty {
+    #[serde(default)]
+    pub from: std::collections::BTreeMap<String, f64>,
+    #[serde(default)]
+    pub to: std::collections::BTreeMap<String, f64>,
+    #[serde(default)]
+    pub ease: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundData {
     #[serde(default, rename = "aspectRatio")]
@@ -266,11 +330,7 @@ fn pick(root: &Path, candidates: &[&str]) -> Result<PathBuf> {
 }
 
 pub fn load_engine(path: &Path) -> Result<EnginePackage> {
-    if path.is_file()
-        && path
-            .extension()
-            .is_some_and(|x| x.to_string_lossy().eq_ignore_ascii_case("zip"))
-    {
+    if path.is_file() && is_zip_archive(path)? {
         let metadata: EngineMetadata =
             serde_json::from_slice(&zip_member(path, &["engine.json", "item.json"])?)?;
         let configuration = serde_json::from_slice(&zip_member(
@@ -316,6 +376,22 @@ pub fn load_engine(path: &Path) -> Result<EnginePackage> {
             .unwrap_or_default(),
         watch: serde_json::from_value(watch_value)?,
     })
+}
+
+fn is_zip_archive(path: &Path) -> Result<bool> {
+    let file =
+        fs::File::open(path).with_context(|| format!("opening engine {}", path.display()))?;
+    match ZipArchive::new(file) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if path.extension().is_some_and(|extension| {
+                extension.to_string_lossy().eq_ignore_ascii_case("zip")
+            }) =>
+        {
+            Err(error).context("engine archive is not a valid ZIP file")
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 pub fn load_level(path: &Path) -> Result<LevelData> {
@@ -460,10 +536,318 @@ pub fn load_effect_clip_names(path: &Path, name: &str) -> Result<BTreeSet<String
     load_named_resource_names(path, "effects", name, "clips")
 }
 
+/// Load names for an optional effect resource. A missing named resource yields
+/// `None`; malformed present resources and I/O failures remain errors.
+pub fn load_effect_clip_names_optional(
+    path: &Path,
+    name: &str,
+) -> Result<Option<BTreeSet<String>>> {
+    load_named_resource_names_optional(path, "effects", name, "clips")
+}
+
 /// Load the available effect names from a named Sonolus particle resource.
 /// The content-addressed data payload is verified before JSON decoding.
 pub fn load_particle_effect_names(path: &Path, name: &str) -> Result<BTreeSet<String>> {
     load_named_resource_names(path, "particles", name, "effects")
+}
+
+/// Load the selected effect's named audio clips from its content-addressed ZIP.
+pub fn load_effect_assets(path: &Path, name: &str) -> Result<EffectAssets> {
+    load_effect_assets_inner(path, name)?.context("selected effect resource is missing")
+}
+
+/// Load effect assets when present. A missing named effect resource is an
+/// unavailable optional SFX resource; archive, I/O, and parsing failures remain errors.
+pub fn load_effect_assets_optional(path: &Path, name: &str) -> Result<Option<EffectAssets>> {
+    load_effect_assets_inner(path, name)
+}
+
+fn load_effect_assets_inner(path: &Path, name: &str) -> Result<Option<EffectAssets>> {
+    let file = fs::File::open(path).with_context(|| format!("opening SCP {}", path.display()))?;
+    let mut zip = ZipArchive::new(file).context("SCP is not a valid ZIP archive")?;
+    let manifest_path = format!("sonolus/effects/{name}");
+    let mut manifest_bytes = Vec::new();
+    match zip.by_name(&manifest_path) {
+        Ok(mut entry) => {
+            entry.read_to_end(&mut manifest_bytes)?;
+        }
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {manifest_path}")),
+    }
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("decoding effect manifest {manifest_path}"))?;
+    let item = manifest.get("item").unwrap_or(&manifest);
+    let data = read_resource_blob(&mut zip, item, "data", "effect")?;
+    let audio = read_optional_resource_blob(&mut zip, item, "audio", "effect")?;
+    let data: Value =
+        serde_json::from_slice(&decode_payload(data)?).context("decoding EffectData JSON")?;
+    let clips = data
+        .get("clips")
+        .and_then(Value::as_array)
+        .context("EffectData has no clips array")?;
+    let mut archive = audio
+        .map(|bytes| ZipArchive::new(Cursor::new(bytes)).context("effect audio is not a ZIP"))
+        .transpose()?;
+    let mut result = std::collections::BTreeMap::new();
+    for (index, clip) in clips.iter().enumerate() {
+        let clip_name = clip
+            .get("name")
+            .and_then(Value::as_str)
+            .with_context(|| format!("EffectData clip {index} has no name"))?;
+        let filename = clip
+            .get("filename")
+            .and_then(Value::as_str)
+            .with_context(|| format!("EffectData clip {clip_name:?} has no filename"))?;
+        let mut bytes = Vec::new();
+        let payload = match archive.as_mut() {
+            Some(archive) => match archive.by_name(filename) {
+                Ok(mut entry) => {
+                    entry.read_to_end(&mut bytes)?;
+                    Some(bytes)
+                }
+                Err(zip::result::ZipError::FileNotFound) => None,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("reading effect audio archive member {filename:?}")
+                    })
+                }
+            },
+            None => None,
+        };
+        if result.insert(clip_name.to_owned(), payload).is_some() {
+            bail!("EffectData contains duplicate clip name {clip_name:?}");
+        }
+    }
+    Ok(Some(EffectAssets { clips: result }))
+}
+
+/// Load a particle atlas and the effect timelines that reference its sprites.
+pub fn load_particle_assets(path: &Path, name: &str) -> Result<ParticleAssets> {
+    let file = fs::File::open(path).with_context(|| format!("opening SCP {}", path.display()))?;
+    let mut zip = ZipArchive::new(file).context("SCP is not a valid ZIP archive")?;
+    let manifest_path = format!("sonolus/particles/{name}");
+    let mut manifest_bytes = Vec::new();
+    zip.by_name(&manifest_path)
+        .with_context(|| format!("particle resource {name:?} is missing"))?
+        .read_to_end(&mut manifest_bytes)?;
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("decoding particle manifest {manifest_path}"))?;
+    let item = manifest.get("item").unwrap_or(&manifest);
+    let data = read_resource_blob(&mut zip, item, "data", "particle")?;
+    let texture = read_resource_blob(&mut zip, item, "texture", "particle")?;
+    let data: Value =
+        serde_json::from_slice(&decode_payload(data)?).context("decoding ParticleData JSON")?;
+    let width = data
+        .get("width")
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .context("ParticleData has invalid width")?;
+    let height = data
+        .get("height")
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .context("ParticleData has invalid height")?;
+    let interpolation = data
+        .get("interpolation")
+        .and_then(Value::as_bool)
+        .context("ParticleData has invalid interpolation flag")?;
+    let sprites: Vec<ParticleSpriteAsset> = serde_json::from_value(
+        data.get("sprites")
+            .cloned()
+            .context("ParticleData has no sprites array")?,
+    )
+    .context("decoding ParticleData sprites")?;
+    for (index, sprite) in sprites.iter().enumerate() {
+        if sprite.width == 0
+            || sprite.height == 0
+            || sprite.x.checked_add(sprite.width).is_none_or(|x| x > width)
+            || sprite
+                .y
+                .checked_add(sprite.height)
+                .is_none_or(|y| y > height)
+        {
+            bail!("ParticleData sprite {index} is outside its declared atlas");
+        }
+    }
+    let raw_effects = data
+        .get("effects")
+        .and_then(Value::as_array)
+        .context("ParticleData has no effects array")?;
+    let mut effects = std::collections::BTreeMap::new();
+    for (index, value) in raw_effects.iter().enumerate() {
+        let effect: ParticleEffectData = serde_json::from_value(value.clone())
+            .with_context(|| format!("decoding ParticleData effect {index}"))?;
+        validate_particle_effect(&effect, sprites.len())?;
+        if effects.insert(effect.name.clone(), effect).is_some() {
+            bail!("ParticleData contains duplicate effect names");
+        }
+    }
+    let (texture_width, texture_height, rgba) = decode_png_rgba(&texture)?;
+    if texture_width != width || texture_height != height {
+        bail!("particle texture dimensions do not match ParticleData");
+    }
+    Ok(ParticleAssets {
+        width,
+        height,
+        interpolation,
+        rgba,
+        sprites,
+        effects,
+    })
+}
+
+fn validate_particle_effect(effect: &ParticleEffectData, sprite_count: usize) -> Result<()> {
+    if effect.name.is_empty() {
+        bail!("ParticleData effect name cannot be empty");
+    }
+    for output in ["x1", "x2", "x3", "x4", "y1", "y2", "y3", "y4"] {
+        if !effect.transform.contains_key(output) {
+            bail!(
+                "particle effect {:?} has no transform expression for {output}",
+                effect.name
+            );
+        }
+    }
+    for (output, expression) in &effect.transform {
+        if !matches!(
+            output.as_str(),
+            "x1" | "x2" | "x3" | "x4" | "y1" | "y2" | "y3" | "y4"
+        ) {
+            bail!(
+                "particle effect {:?} has unsupported transform output {output:?}",
+                effect.name
+            );
+        }
+        if expression
+            .values()
+            .any(|coefficient| !coefficient.is_finite())
+        {
+            bail!(
+                "particle effect {:?} has a non-finite transform coefficient",
+                effect.name
+            );
+        }
+        validate_particle_expression(effect, expression.keys())?;
+    }
+    for group in &effect.groups {
+        for particle in &group.particles {
+            if particle.sprite >= sprite_count {
+                bail!(
+                    "particle effect {:?} references missing sprite {}",
+                    effect.name,
+                    particle.sprite
+                );
+            }
+            if !particle.start.is_finite()
+                || !particle.duration.is_finite()
+                || !(0.0..=1.0).contains(&particle.start)
+                || particle.duration < 0.0
+            {
+                bail!(
+                    "particle effect {:?} has an invalid particle timeline",
+                    effect.name
+                );
+            }
+            parse_background_color(&particle.color, false)
+                .with_context(|| format!("particle effect {:?} has invalid color", effect.name))?;
+            for property in [
+                &particle.x,
+                &particle.y,
+                &particle.w,
+                &particle.h,
+                &particle.r,
+                &particle.a,
+            ] {
+                if property
+                    .from
+                    .values()
+                    .chain(property.to.values())
+                    .any(|v| !v.is_finite())
+                {
+                    bail!(
+                        "particle effect {:?} has a non-finite particle expression",
+                        effect.name
+                    );
+                }
+                validate_particle_expression(
+                    effect,
+                    property.from.keys().chain(property.to.keys()),
+                )?;
+                if let Some(ease) = &property.ease {
+                    if !matches!(
+                        ease.as_str(),
+                        "linear"
+                            | "none"
+                            | "inSine"
+                            | "outSine"
+                            | "inOutSine"
+                            | "outInSine"
+                            | "inQuad"
+                            | "outQuad"
+                            | "inOutQuad"
+                            | "outInQuad"
+                            | "inCubic"
+                            | "outCubic"
+                            | "inOutCubic"
+                            | "outInCubic"
+                            | "inQuart"
+                            | "outQuart"
+                            | "inOutQuart"
+                            | "outInQuart"
+                            | "inQuint"
+                            | "outQuint"
+                            | "inOutQuint"
+                            | "outInQuint"
+                            | "inExpo"
+                            | "outExpo"
+                            | "inOutExpo"
+                            | "outInExpo"
+                            | "inCirc"
+                            | "outCirc"
+                            | "inOutCirc"
+                            | "outInCirc"
+                            | "inBack"
+                            | "outBack"
+                            | "inOutBack"
+                            | "outInBack"
+                            | "inElastic"
+                            | "outElastic"
+                            | "inOutElastic"
+                            | "outInElastic"
+                    ) {
+                        bail!(
+                            "particle effect {:?} uses unsupported easing {ease:?}",
+                            effect.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_particle_expression<'a>(
+    effect: &ParticleEffectData,
+    mut variables: impl Iterator<Item = &'a String>,
+) -> Result<()> {
+    let supported = |name: &str| {
+        matches!(
+            name,
+            "c" | "x1" | "x2" | "x3" | "x4" | "y1" | "y2" | "y3" | "y4"
+        ) || (1..=8).any(|index| {
+            name == format!("r{index}")
+                || name == format!("sinr{index}")
+                || name == format!("cosr{index}")
+        })
+    };
+    if let Some(name) = variables.find(|name| !supported(name)) {
+        bail!(
+            "particle effect {:?} uses unsupported expression variable {name:?}",
+            effect.name
+        );
+    }
+    Ok(())
 }
 
 fn load_named_resource_names(
@@ -472,18 +856,27 @@ fn load_named_resource_names(
     name: &str,
     collection: &str,
 ) -> Result<BTreeSet<String>> {
+    load_named_resource_names_optional(path, category, name, collection)?
+        .with_context(|| format!("{category} resource {name:?} is missing"))
+}
+
+fn load_named_resource_names_optional(
+    path: &Path,
+    category: &str,
+    name: &str,
+    collection: &str,
+) -> Result<Option<BTreeSet<String>>> {
     let file = fs::File::open(path).with_context(|| format!("opening SCP {}", path.display()))?;
     let mut zip = ZipArchive::new(file).context("SCP is not a valid ZIP archive")?;
     let manifest_path = format!("sonolus/{category}/{name}");
     let mut manifest_bytes = Vec::new();
-    zip.by_name(&manifest_path)
-        .with_context(|| {
-            format!(
-                "{category} resource {name:?} is not present in {}",
-                path.display()
-            )
-        })?
-        .read_to_end(&mut manifest_bytes)?;
+    match zip.by_name(&manifest_path) {
+        Ok(mut entry) => {
+            entry.read_to_end(&mut manifest_bytes)?;
+        }
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {manifest_path}")),
+    }
     let manifest: Value = serde_json::from_slice(&manifest_bytes)
         .with_context(|| format!("decoding resource manifest {manifest_path}"))?;
     let item = manifest.get("item").unwrap_or(&manifest);
@@ -517,7 +910,7 @@ fn load_named_resource_names(
             bail!("{category} resource entry {index} has no string name");
         }
     }
-    Ok(names)
+    Ok(Some(names))
 }
 
 /// Load and verify the selected skin's data and texture from an SCP archive.
@@ -705,6 +1098,62 @@ pub(crate) fn parse_background_color(color: &str, allow_alpha: bool) -> Result<[
         _ => bail!("unsupported background color format {color:?}"),
     };
     Ok([r, g, b, a])
+}
+
+fn read_resource_blob(
+    zip: &mut ZipArchive<fs::File>,
+    item: &Value,
+    role: &str,
+    resource_kind: &str,
+) -> Result<Vec<u8>> {
+    let hash = item
+        .get(role)
+        .and_then(|value| value.get("hash"))
+        .and_then(Value::as_str)
+        .with_context(|| format!("{resource_kind} manifest has no {role} hash"))?;
+    let repository_path = format!("sonolus/repository/{hash}");
+    let mut payload = Vec::new();
+    zip.by_name(&repository_path)
+        .with_context(|| format!("{resource_kind} {role} payload {repository_path} is missing"))?
+        .read_to_end(&mut payload)?;
+    let actual = hex::encode(Sha1::digest(&payload));
+    if actual != hash {
+        bail!("{resource_kind} {role} payload digest {actual} does not match {hash}");
+    }
+    Ok(payload)
+}
+
+fn read_optional_resource_blob(
+    zip: &mut ZipArchive<fs::File>,
+    item: &Value,
+    role: &str,
+    resource_kind: &str,
+) -> Result<Option<Vec<u8>>> {
+    let Some(resource) = item.get(role) else {
+        return Ok(None);
+    };
+    let hash = resource
+        .get("hash")
+        .and_then(Value::as_str)
+        .with_context(|| format!("{resource_kind} manifest has invalid {role} reference"))?;
+    let repository_path = format!("sonolus/repository/{hash}");
+    let mut payload = Vec::new();
+    match zip.by_name(&repository_path) {
+        Ok(mut entry) => {
+            entry.read_to_end(&mut payload)?;
+        }
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("reading {resource_kind} {role} payload {repository_path}")
+            })
+        }
+    }
+    let actual = hex::encode(Sha1::digest(&payload));
+    if actual != hash {
+        bail!("resource {role} payload digest {actual} does not match {hash}");
+    }
+    Ok(Some(payload))
 }
 
 fn read_skin_blob(zip: &mut ZipArchive<fs::File>, item: &Value, role: &str) -> Result<Vec<u8>> {

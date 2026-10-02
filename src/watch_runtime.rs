@@ -20,6 +20,8 @@ const ENTITY_SHARED_MEMORY: i64 = 4002;
 const TEMPORARY_MEMORY: i64 = 10000;
 const RUNTIME_UPDATE: i64 = 1001;
 const RUNTIME_SKIN_TRANSFORM: i64 = 1002;
+const RUNTIME_PARTICLE_TRANSFORM: i64 = 1003;
+const RUNTIME_UI_CONFIGURATION: i64 = 1007;
 const RUNTIME_ENVIRONMENT: i64 = 1000;
 const LEVEL_OPTION: i64 = 2002;
 
@@ -89,6 +91,8 @@ pub struct FrameReport {
     pub runtime_background_quad: [f64; 8],
     /// Runtime Skin Transform matrix as seen after this frame's callbacks.
     pub runtime_skin_transform: [f64; 16],
+    /// Runtime Particle Transform matrix as seen after this frame's callbacks.
+    pub runtime_particle_transform: [f64; 16],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -204,6 +208,11 @@ impl<'a> WatchRuntime<'a> {
         for index in 0..16 {
             runtime.global_memory.set(
                 RUNTIME_SKIN_TRANSFORM,
+                index,
+                if index % 5 == 0 { 1.0 } else { 0.0 },
+            );
+            runtime.global_memory.set(
+                RUNTIME_PARTICLE_TRANSFORM,
                 index,
                 if index % 5 == 0 { 1.0 } else { 0.0 },
             );
@@ -506,6 +515,40 @@ impl<'a> WatchRuntime<'a> {
         Ok(())
     }
 
+    /// Bind EngineConfiguration UI visibility pairs into Runtime UI Configuration.
+    pub fn bind_engine_ui_configuration(&mut self, configuration: &Value) -> Result<()> {
+        let Some(ui) = configuration.get("ui") else {
+            return Ok(());
+        };
+        for (field, index) in [
+            ("menuVisibility", 0),
+            ("judgmentVisibility", 2),
+            ("comboVisibility", 4),
+            ("primaryMetricVisibility", 6),
+            ("secondaryMetricVisibility", 8),
+        ] {
+            let visibility = ui
+                .get(field)
+                .with_context(|| format!("EngineConfiguration ui has no {field}"))?;
+            let scale = visibility
+                .get("scale")
+                .and_then(Value::as_f64)
+                .with_context(|| format!("EngineConfiguration ui.{field}.scale is invalid"))?;
+            let alpha = visibility
+                .get("alpha")
+                .and_then(Value::as_f64)
+                .with_context(|| format!("EngineConfiguration ui.{field}.alpha is invalid"))?;
+            if !scale.is_finite() || !alpha.is_finite() {
+                bail!("EngineConfiguration ui.{field} values must be finite");
+            }
+            self.global_memory
+                .set(RUNTIME_UI_CONFIGURATION, index, scale);
+            self.global_memory
+                .set(RUNTIME_UI_CONFIGURATION, index + 1, alpha);
+        }
+        Ok(())
+    }
+
     /// Override selected Level Option slots after defaults are bound and before
     /// preprocessing. Indices are the EngineConfiguration option positions.
     pub fn bind_engine_option_overrides(
@@ -697,6 +740,9 @@ impl<'a> WatchRuntime<'a> {
                 .unwrap_or_default(),
             runtime_skin_transform: std::array::from_fn(|index| {
                 self.global_memory.get(RUNTIME_SKIN_TRANSFORM, index)
+            }),
+            runtime_particle_transform: std::array::from_fn(|index| {
+                self.global_memory.get(RUNTIME_PARTICLE_TRANSFORM, index)
             }),
         };
         Ok(report)
@@ -1138,4 +1184,37 @@ fn in_spawn_range(entity: &WatchEntity, timeline: f64) -> bool {
     entity
         .schedule
         .is_some_and(|(start, end)| timeline >= start && timeline < end)
+}
+
+#[cfg(test)]
+mod ui_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn binds_five_engine_visibility_pairs_to_runtime_ui_block() {
+        let watch: WatchData =
+            serde_json::from_value(serde_json::json!({"archetypes":[],"nodes":[]})).unwrap();
+        let level: LevelData = serde_json::from_value(serde_json::json!({"entities":[]})).unwrap();
+        let mut runtime = WatchRuntime::new(&watch, &level).unwrap();
+        runtime
+            .bind_engine_ui_configuration(&serde_json::json!({"ui":{
+                "menuVisibility":{"scale":0.5,"alpha":0.2},
+                "judgmentVisibility":{"scale":0.6,"alpha":0.3},
+                "comboVisibility":{"scale":0.7,"alpha":0.4},
+                "primaryMetricVisibility":{"scale":0.8,"alpha":0.5},
+                "secondaryMetricVisibility":{"scale":0.9,"alpha":0.6}
+            }}))
+            .unwrap();
+        assert_eq!(
+            (0..10)
+                .map(|i| runtime.global_memory.get(RUNTIME_UI_CONFIGURATION, i))
+                .collect::<Vec<_>>(),
+            [0.5, 0.2, 0.6, 0.3, 0.7, 0.4, 0.8, 0.5, 0.9, 0.6]
+        );
+        assert!(runtime
+            .bind_engine_ui_configuration(
+                &serde_json::json!({"ui":{"menuVisibility":{"scale":"bad","alpha":1}}})
+            )
+            .is_err());
+    }
 }

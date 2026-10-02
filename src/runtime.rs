@@ -14,6 +14,7 @@ const MAX_CALL_DEPTH: usize = 2048;
 const ENGINE_ROM_BLOCK: i64 = 3000;
 const RUNTIME_UPDATE_BLOCK: i64 = 1001;
 const RUNTIME_SKIN_TRANSFORM_BLOCK: i64 = 1002;
+pub(crate) const RUNTIME_PARTICLE_TRANSFORM_BLOCK: i64 = 1003;
 const ENTITY_DATA_ARRAY_BLOCK: i64 = 4101;
 const ENTITY_SHARED_MEMORY_ARRAY_BLOCK: i64 = 4102;
 const ENTITY_INFO_ARRAY_BLOCK: i64 = 4103;
@@ -703,6 +704,154 @@ impl DisplayList {
         ppm.extend_from_slice(&rgb);
         Ok(ppm)
     }
+
+    /// Composite particle atlas sprites above an already rendered RGB frame.
+    pub fn composite_particle_sprites(
+        rgb: &mut [u8],
+        width: u32,
+        height: u32,
+        aspect_ratio: f64,
+        assets: &crate::formats::ParticleAssets,
+        draws: &[crate::particles::ParticleSpriteDraw],
+        runtime_transform: &[f64; 16],
+    ) -> Result<()> {
+        if width == 0 || height == 0 || !aspect_ratio.is_finite() || aspect_ratio <= 0.0 {
+            bail!("particle render dimensions and aspect ratio must be positive");
+        }
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .context("particle target frame size overflows")?;
+        if rgb.len() != expected {
+            bail!("particle target frame has an invalid RGB buffer length");
+        }
+        if assets.width == 0
+            || assets.height == 0
+            || assets.rgba.len()
+                != (assets.width as usize)
+                    .checked_mul(assets.height as usize)
+                    .and_then(|pixels| pixels.checked_mul(4))
+                    .context("particle atlas size overflows")?
+        {
+            bail!("particle atlas dimensions do not match its pixel buffer");
+        }
+        for draw in draws {
+            let sprite = assets.sprites.get(draw.sprite_id).with_context(|| {
+                format!("particle references missing sprite {}", draw.sprite_id)
+            })?;
+            if draw.alpha <= 0.0
+                || !draw.alpha.is_finite()
+                || !draw.corners.iter().flatten().all(|value| value.is_finite())
+            {
+                continue;
+            }
+            let corners = transform_runtime_skin_corners(
+                &SpriteDraw {
+                    sprite_id: 0,
+                    corners: draw.corners,
+                    z: [0.0; 4],
+                    alpha: draw.alpha,
+                    provenance: None,
+                    trace: None,
+                },
+                runtime_transform,
+            );
+            let left = corners
+                .iter()
+                .map(|point| point[0])
+                .fold(f64::INFINITY, f64::min);
+            let right = corners
+                .iter()
+                .map(|point| point[0])
+                .fold(f64::NEG_INFINITY, f64::max);
+            let bottom = corners
+                .iter()
+                .map(|point| point[1])
+                .fold(f64::INFINITY, f64::min);
+            let top = corners
+                .iter()
+                .map(|point| point[1])
+                .fold(f64::NEG_INFINITY, f64::max);
+            let x0 = (((left / aspect_ratio + 1.0) * 0.5 * f64::from(width)).floor() as i64)
+                .clamp(0, i64::from(width));
+            let x1 = (((right / aspect_ratio + 1.0) * 0.5 * f64::from(width)).ceil() as i64)
+                .clamp(0, i64::from(width));
+            let y0 = (((1.0 - top) * 0.5 * f64::from(height)).floor() as i64)
+                .clamp(0, i64::from(height));
+            let y1 = (((1.0 - bottom) * 0.5 * f64::from(height)).ceil() as i64)
+                .clamp(0, i64::from(height));
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    let target = [
+                        (((px as f64 + 0.5) / f64::from(width)) * 2.0 - 1.0) * aspect_ratio,
+                        1.0 - ((py as f64 + 0.5) / f64::from(height)) * 2.0,
+                    ];
+                    let Some((u, v)) = inverse_bilinear(&corners, target) else {
+                        continue;
+                    };
+                    if !(-1e-7..=1.0000001).contains(&u) || !(-1e-7..=1.0000001).contains(&v) {
+                        continue;
+                    }
+                    let tex_x =
+                        f64::from(sprite.x) + u.clamp(0.0, 1.0) * f64::from(sprite.width) - 0.5;
+                    let tex_y = f64::from(sprite.y)
+                        + (1.0 - v.clamp(0.0, 1.0)) * f64::from(sprite.height)
+                        - 0.5;
+                    let sample = sample_particle_sprite(assets, sprite, tex_x, tex_y);
+                    let source_alpha = draw.alpha.clamp(0.0, 1.0) * f64::from(sample[3]) / 255.0;
+                    let offset = (py as usize * width as usize + px as usize) * 3;
+                    for channel in 0..3 {
+                        let tinted =
+                            f64::from(sample[channel]) * f64::from(draw.color[channel]) / 255.0;
+                        rgb[offset + channel] = (f64::from(rgb[offset + channel])
+                            * (1.0 - source_alpha)
+                            + tinted * source_alpha)
+                            .round() as u8;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn sample_particle_sprite(
+    assets: &crate::formats::ParticleAssets,
+    sprite: &crate::formats::ParticleSpriteAsset,
+    x: f64,
+    y: f64,
+) -> [u8; 4] {
+    let get = |x: i64, y: i64| {
+        let x = x.clamp(sprite.x as i64, (sprite.x + sprite.width - 1) as i64) as usize;
+        let y = y.clamp(sprite.y as i64, (sprite.y + sprite.height - 1) as i64) as usize;
+        let offset = (y * assets.width as usize + x) * 4;
+        assets.rgba[offset..offset + 4].try_into().unwrap_or([0; 4])
+    };
+    if !assets.interpolation {
+        return get((x + 0.5).floor() as i64, (y + 0.5).floor() as i64);
+    }
+    let x0 = x.floor();
+    let y0 = y.floor();
+    let fx = x - x0;
+    let fy = y - y0;
+    let samples = [
+        get(x0 as i64, y0 as i64),
+        get(x0 as i64 + 1, y0 as i64),
+        get(x0 as i64, y0 as i64 + 1),
+        get(x0 as i64 + 1, y0 as i64 + 1),
+    ];
+    let weights = [
+        (1.0 - fx) * (1.0 - fy),
+        fx * (1.0 - fy),
+        (1.0 - fx) * fy,
+        fx * fy,
+    ];
+    std::array::from_fn(|channel| {
+        (0..4)
+            .map(|index| f64::from(samples[index][channel]) * weights[index])
+            .sum::<f64>()
+            .round() as u8
+    })
 }
 
 fn render_background(
@@ -1558,6 +1707,28 @@ impl<'a> WatchVm<'a> {
             }
             if slot >= 16 {
                 bail!("Runtime Skin Transform index {slot} exceeds 15");
+            }
+            self.memory.set(block, slot, value);
+            self.last_memory_writes.insert((block, slot), (node, value));
+            return Ok(());
+        }
+        if block == RUNTIME_PARTICLE_TRANSFORM_BLOCK {
+            if !matches!(self.context.lifecycle_stage, Some(0 | 5)) {
+                bail!("Runtime Particle Transform is read-only in this lifecycle stage");
+            }
+            if slot >= 16 {
+                bail!("Runtime Particle Transform index {slot} exceeds 15");
+            }
+            self.memory.set(block, slot, value);
+            self.last_memory_writes.insert((block, slot), (node, value));
+            return Ok(());
+        }
+        if block == 1007 {
+            if self.context.lifecycle_stage != Some(0) {
+                bail!("Runtime UI Configuration is read-only outside preprocessing");
+            }
+            if slot >= 10 {
+                bail!("Runtime UI Configuration index {slot} exceeds 9");
             }
             self.memory.set(block, slot, value);
             self.last_memory_writes.insert((block, slot), (node, value));
@@ -2804,7 +2975,7 @@ impl<'a> WatchVm<'a> {
 
 /// Evaluate the documented Sonolus easing families. Compound curves compose
 /// the corresponding In/Out halves and preserve extrapolation outside [0, 1].
-fn ease_curve(family: &str, direction: &str, value: f64) -> f64 {
+pub(crate) fn ease_curve(family: &str, direction: &str, value: f64) -> f64 {
     fn ease_in(family: &str, x: f64) -> f64 {
         match family {
             "Sine" => 1.0 - (x * std::f64::consts::FRAC_PI_2).cos(),

@@ -3,6 +3,7 @@
 
 use crate::{
     formats,
+    runtime::DisplayList,
     watch::WatchData,
     watch_runtime::{FrameReport, WatchRuntime},
 };
@@ -90,6 +91,12 @@ pub struct FrameSession<'a> {
     skin: formats::SkinAssets,
     background: Option<formats::BackgroundAssets>,
     bindings: BTreeMap<u32, String>,
+    particles: Option<formats::ParticleAssets>,
+    particle_bindings: BTreeMap<i64, String>,
+    particles_enabled: bool,
+    ui: crate::render_ui::RendererUiConfig,
+    ui_segment_start: f64,
+    ui_segment_duration: f64,
     width: u32,
     height: u32,
 }
@@ -97,6 +104,50 @@ pub struct FrameSession<'a> {
 pub struct RenderedFrame {
     pub report: FrameReport,
     pub rgb: Vec<u8>,
+}
+
+pub fn effect_clip_bindings(watch: &WatchData) -> Result<BTreeMap<i64, String>> {
+    let values = watch
+        .effect
+        .get("clips")
+        .and_then(serde_json::Value::as_array)
+        .context("EngineWatchData effect bindings have no clips array")?;
+    values
+        .iter()
+        .map(|binding| {
+            let id = binding
+                .get("id")
+                .and_then(serde_json::Value::as_i64)
+                .context("effect clip binding has invalid ID")?;
+            let name = binding
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .context("effect clip binding has no name")?;
+            Ok((id, name.to_owned()))
+        })
+        .collect()
+}
+
+pub fn particle_effect_bindings(watch: &WatchData) -> Result<BTreeMap<i64, String>> {
+    let values = watch
+        .particle
+        .get("effects")
+        .and_then(serde_json::Value::as_array)
+        .context("EngineWatchData particle bindings have no effects array")?;
+    values
+        .iter()
+        .map(|binding| {
+            let id = binding
+                .get("id")
+                .and_then(serde_json::Value::as_i64)
+                .context("particle effect binding has invalid ID")?;
+            let name = binding
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .context("particle effect binding has no name")?;
+            Ok((id, name.to_owned()))
+        })
+        .collect()
 }
 
 /// A stateful, deterministic Watch timeline advanced at one configured rate.
@@ -131,6 +182,7 @@ impl<'a> WatchFrameStepper<'a> {
         let runtime = stepper.runtime_mut();
         runtime.bind_engine_rom(rom)?;
         runtime.bind_engine_option_defaults(configuration)?;
+        runtime.bind_engine_ui_configuration(configuration)?;
         runtime.bind_engine_option_overrides(configuration, overrides)?;
         Ok(stepper)
     }
@@ -151,11 +203,25 @@ impl<'a> WatchFrameStepper<'a> {
         }
         let start = self.last_frame_index.map_or(0, |previous| previous + 1);
         let mut final_report = None;
+        let mut audio_events = Vec::new();
+        let mut scheduled_effects = Vec::new();
+        let mut scheduled_looped_effects = Vec::new();
+        let mut scheduled_looped_effect_stops = Vec::new();
         for index in start..=frame_index {
             let time = index as f64 / f64::from(self.fps);
             let report = self.runtime.frame(time)?;
+            audio_events.extend(report.audio_events.iter().cloned());
+            scheduled_effects.extend(report.scheduled_effects.iter().cloned());
+            scheduled_looped_effects.extend(report.scheduled_looped_effects.iter().cloned());
+            scheduled_looped_effect_stops
+                .extend(report.scheduled_looped_effect_stops.iter().cloned());
             self.last_frame_index = Some(index);
             if index == frame_index {
+                let mut report = report;
+                report.audio_events = audio_events.clone();
+                report.scheduled_effects = scheduled_effects.clone();
+                report.scheduled_looped_effects = scheduled_looped_effects.clone();
+                report.scheduled_looped_effect_stops = scheduled_looped_effect_stops.clone();
                 final_report = Some(report);
             }
         }
@@ -179,6 +245,47 @@ impl<'a> FrameSession<'a> {
         fps: u32,
         level_option_overrides: &[(usize, f64)],
     ) -> Result<Self> {
+        Self::new_configured(
+            watch,
+            rom,
+            configuration,
+            level,
+            resources_path,
+            skin_name,
+            background_name,
+            effect_name,
+            particle_name,
+            width,
+            height,
+            fps,
+            level_option_overrides,
+            true,
+            crate::render_ui::RendererUiConfig::default(),
+            0.0,
+            1.0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_configured(
+        watch: &'a WatchData,
+        rom: &[u8],
+        configuration: &serde_json::Value,
+        level: &formats::LevelData,
+        resources_path: &std::path::Path,
+        skin_name: &str,
+        background_name: Option<&str>,
+        effect_name: Option<&str>,
+        particle_name: Option<&str>,
+        width: u32,
+        height: u32,
+        fps: u32,
+        level_option_overrides: &[(usize, f64)],
+        particles_enabled: bool,
+        ui: crate::render_ui::RendererUiConfig,
+        ui_segment_start: f64,
+        ui_segment_duration: f64,
+    ) -> Result<Self> {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             bail!("frame dimensions must be in 1..=8192");
         }
@@ -201,7 +308,7 @@ impl<'a> FrameSession<'a> {
         let sprite_names = skin.sprites.keys().cloned().collect();
         runtime.bind_skin_sprite_names(&sprite_names)?;
         if let Some(name) = effect_name {
-            let names = formats::load_effect_clip_names(resources_path, name)
+            let names = formats::load_effect_clip_names_optional(resources_path, name)
                 .with_context(|| format!("resolving selected effect resource {name:?}"))?;
             if watch
                 .effect
@@ -209,19 +316,24 @@ impl<'a> FrameSession<'a> {
                 .and_then(serde_json::Value::as_array)
                 .is_some()
             {
-                runtime.bind_effect_clip_names(&names)?;
+                runtime.bind_effect_clip_names(&names.unwrap_or_default())?;
             }
-        } else if watch
-            .effect
-            .get("clips")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|bindings| !bindings.is_empty())
-        {
-            bail!("engine declares effect clips but no effect resource was selected");
         }
+        let mut particles = None;
+        let mut particle_bindings = BTreeMap::new();
         if let Some(name) = particle_name {
             let names = formats::load_particle_effect_names(resources_path, name)
                 .with_context(|| format!("resolving selected particle resource {name:?}"))?;
+            if particles_enabled {
+                particles = Some(
+                    formats::load_particle_assets(resources_path, name)
+                        .with_context(|| format!("loading selected particle resource {name:?}"))?,
+                );
+            }
+            let effect_names: std::collections::BTreeSet<String> = particles
+                .as_ref()
+                .map(|assets| assets.effects.keys().cloned().collect())
+                .unwrap_or_default();
             if watch
                 .particle
                 .get("effects")
@@ -229,12 +341,17 @@ impl<'a> FrameSession<'a> {
                 .is_some()
             {
                 runtime.bind_particle_effect_names(&names)?;
+                particle_bindings = particle_effect_bindings(watch)?
+                    .into_iter()
+                    .filter(|(_, name)| effect_names.contains(name))
+                    .collect();
             }
-        } else if watch
-            .particle
-            .get("effects")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|bindings| !bindings.is_empty())
+        } else if particles_enabled
+            && watch
+                .particle
+                .get("effects")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|bindings| !bindings.is_empty())
         {
             bail!("engine declares particle effects but no particle resource was selected");
         }
@@ -256,6 +373,12 @@ impl<'a> FrameSession<'a> {
             skin,
             background,
             bindings,
+            particles,
+            particle_bindings,
+            particles_enabled,
+            ui,
+            ui_segment_start,
+            ui_segment_duration,
             width,
             height,
         })
@@ -273,7 +396,7 @@ impl<'a> FrameSession<'a> {
             .try_into()
             .map_err(|_| anyhow::anyhow!("Runtime Background quad has invalid length"))?;
         let background = self.background.as_ref().map(|assets| (assets, quad));
-        let ppm = report
+        let mut ppm = report
             .display_list
             .render_skin_ppm_with_runtime_transform_and_background(
                 self.width,
@@ -284,11 +407,91 @@ impl<'a> FrameSession<'a> {
                 &report.runtime_skin_transform,
                 background,
             )?;
+        if self.particles_enabled {
+            if let Some(assets) = &self.particles {
+                let draws = crate::particles::render_instances(
+                    assets,
+                    &self.particle_bindings,
+                    &self
+                        .stepper
+                        .runtime_mut()
+                        .context
+                        .particle_instances
+                        .read()
+                        .map_err(|_| anyhow::anyhow!("particle instance state lock was poisoned"))?
+                        .instances()
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    report.timeline.unwrap_or(0.0),
+                )?;
+                let mut rgb = ppm_rgb_payload(&ppm, self.width, self.height)?;
+                DisplayList::composite_particle_sprites(
+                    &mut rgb,
+                    self.width,
+                    self.height,
+                    f64::from(self.width) / f64::from(self.height),
+                    assets,
+                    &draws,
+                    &report.runtime_particle_transform,
+                )?;
+                ppm = rgb_to_ppm(&rgb, self.width, self.height);
+            }
+        }
+        if self.ui.enabled {
+            let mut rgb = ppm_rgb_payload(&ppm, self.width, self.height)?;
+            let timeline = report.timeline.unwrap_or(0.0);
+            let memory = &self.stepper.runtime_mut().global_memory;
+            crate::render_ui::render_overlay(
+                &mut rgb,
+                self.width,
+                self.height,
+                timeline,
+                self.ui_segment_start,
+                self.ui_segment_duration,
+                &self.ui,
+                |provider| match provider {
+                    crate::render_ui::UiValueProvider::Fixed { value }
+                    | crate::render_ui::UiValueProvider::External { value } => Ok(*value),
+                    crate::render_ui::UiValueProvider::Memory { block_id, index } => {
+                        Ok(memory.get(*block_id, *index))
+                    }
+                    crate::render_ui::UiValueProvider::Progress => {
+                        Ok(if self.ui_segment_duration > 0.0 {
+                            ((timeline - self.ui_segment_start) / self.ui_segment_duration)
+                                .clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        })
+                    }
+                    crate::render_ui::UiValueProvider::EngineMetric { key } => {
+                        anyhow::bail!(
+                            "engine metric provider {key:?} has no authoritative Watch source"
+                        )
+                    }
+                    crate::render_ui::UiValueProvider::Accuracy => {
+                        anyhow::bail!(
+                            "accuracy provider is unsupported without a verified Watch source"
+                        )
+                    }
+                    crate::render_ui::UiValueProvider::JudgmentDerived { mapping } => {
+                        anyhow::bail!("judgment-derived provider {mapping:?} requires a caller-supplied implementation")
+                    }
+                },
+            )?;
+            ppm = rgb_to_ppm(&rgb, self.width, self.height);
+        }
         Ok(RenderedFrame {
             report,
             rgb: ppm_rgb_payload(&ppm, self.width, self.height)?,
         })
     }
+}
+
+fn rgb_to_ppm(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+    ppm.extend_from_slice(rgb);
+    ppm
 }
 
 fn skin_bindings(watch: &WatchData) -> Result<BTreeMap<u32, String>> {

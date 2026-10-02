@@ -1,8 +1,13 @@
+pub mod audio;
 pub mod compatibility;
 pub mod ffmpeg;
 pub mod formats;
+pub mod gui;
 pub mod offline;
+pub mod particles;
 pub mod project;
+pub mod render;
+pub mod render_ui;
 pub mod runtime;
 pub mod video_export;
 pub mod watch;

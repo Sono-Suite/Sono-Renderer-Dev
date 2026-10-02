@@ -447,10 +447,137 @@ fn supplied_scp_resolves_next_sekai_effect_and_particle_names() {
     let scp = repo.join("ProSeka Faithful 0.8.3.scp");
     let clips = renderer::formats::load_effect_clip_names(&scp, "sekai_q").unwrap();
     let particles = renderer::formats::load_particle_effect_names(&scp, "NexintWaterMark").unwrap();
+    let effect_assets = renderer::formats::load_effect_assets(&scp, "sekai_q").unwrap();
+    let particle_assets = renderer::formats::load_particle_assets(&scp, "NexintWaterMark").unwrap();
     assert!(clips.contains("#PERFECT"));
     assert!(clips.contains("Sekai Trace"));
     assert!(particles.contains("#NOTE_LINEAR_TAP_GREEN"));
     assert!(particles.contains("Sekai Note Lane Linear"));
+    assert!(effect_assets.clips["#PERFECT"]
+        .as_ref()
+        .unwrap()
+        .starts_with(b"RIFF"));
+    let effect_bindings = [(3, "#PERFECT".to_owned())].into();
+    let mixed = renderer::audio::mix_effects_wav(
+        &effect_assets,
+        &effect_bindings,
+        &[renderer::runtime::AudioEffectEvent::Play {
+            clip_id: 3,
+            minimum_distance: 0.0,
+            requested_at: 0.0,
+        }],
+        &[],
+        &[],
+        &[],
+        0.0,
+        0.1,
+    )
+    .unwrap()
+    .wav
+    .unwrap();
+    assert_eq!(&mixed[..4], b"RIFF");
+    assert_eq!(particle_assets.effects.len(), 22);
+    assert!(!particle_assets.rgba.is_empty());
+    let effect = particle_assets.effects.values().next().unwrap();
+    let particle = effect
+        .groups
+        .iter()
+        .flat_map(|group| &group.particles)
+        .find(|particle| particle.duration > 0.0)
+        .unwrap();
+    let instance = renderer::runtime::ParticleEffectInstance {
+        instance_id: 0,
+        effect_id: 91,
+        corners: [[-1.0, -1.0], [-1.0, 1.0], [1.0, 1.0], [1.0, -1.0]],
+        duration: 1.0,
+        is_looped: false,
+        spawned_at: 0.0,
+    };
+    let bindings = [(91, effect.name.clone())].into();
+    let particle_time = particle.start + particle.duration * 0.5;
+    let draws = renderer::particles::render_instances(
+        &particle_assets,
+        &bindings,
+        &[instance],
+        particle_time,
+    )
+    .unwrap();
+    assert!(
+        !draws.is_empty(),
+        "real ParticleData effect should produce a live sprite"
+    );
+    let mut frame = vec![0; 32 * 32 * 3];
+    renderer::runtime::DisplayList::composite_particle_sprites(
+        &mut frame,
+        32,
+        32,
+        1.0,
+        &particle_assets,
+        &draws,
+        &[
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ],
+    )
+    .unwrap();
+    assert!(
+        frame.iter().any(|byte| *byte != 0),
+        "real particle sprite should affect the RGB frame"
+    );
+}
+
+#[test]
+fn effect_data_missing_clip_payload_is_optional_but_malformed_data_fails() {
+    use sha1::Digest;
+
+    fn make_scp(path: &std::path::Path, effect_data: &[u8]) {
+        let hash = hex::encode(sha1::Sha1::digest(effect_data));
+        let manifest = serde_json::json!({
+            "item": {"data": {"hash": hash}}
+        });
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("sonolus/effects/demo", options).unwrap();
+        zip.write_all(manifest.to_string().as_bytes()).unwrap();
+        zip.start_file(format!("sonolus/repository/{hash}"), options)
+            .unwrap();
+        zip.write_all(effect_data).unwrap();
+        zip.finish().unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let no_payload_path = dir.path().join("no-payload.scp");
+    make_scp(
+        &no_payload_path,
+        br#"{"clips":[{"name":"Sekai Skill","filename":"sekai-skill.wav"}]}"#,
+    );
+    let assets = renderer::formats::load_effect_assets_optional(&no_payload_path, "demo")
+        .unwrap()
+        .unwrap();
+    assert!(assets.clips["Sekai Skill"].is_none());
+    let mixed = renderer::audio::mix_effects_wav(
+        &assets,
+        &[(8, "Sekai Skill".to_owned())].into(),
+        &[renderer::runtime::AudioEffectEvent::Play {
+            clip_id: 8,
+            minimum_distance: 0.0,
+            requested_at: 0.0,
+        }],
+        &[],
+        &[],
+        &[],
+        0.0,
+        0.1,
+    )
+    .unwrap();
+    assert!(mixed.wav.is_none());
+    assert_eq!(mixed.warnings.len(), 1);
+    assert!(mixed.warnings[0].contains("Sekai Skill"));
+
+    let malformed_path = dir.path().join("malformed.scp");
+    make_scp(&malformed_path, br#"{"notClips":[]}"#);
+    let error =
+        renderer::formats::load_effect_assets_optional(&malformed_path, "demo").unwrap_err();
+    assert!(error.to_string().contains("EffectData has no clips array"));
 }
 
 #[test]
@@ -585,6 +712,11 @@ fn supplied_fixture_trace_reaches_a_real_entity_preprocess_callback() {
     runtime
         .bind_engine_option_defaults(&engine.configuration)
         .unwrap();
+    runtime
+        .bind_engine_ui_configuration(&engine.configuration)
+        .unwrap();
+    assert_eq!(runtime.global_memory.get(1007, 0), 1.0);
+    assert_eq!(runtime.global_memory.get(1007, 1), 1.0);
     let resources = repo.join("ProSeka Faithful 0.8.3.scp");
     let skin_name = engine.metadata.skin_name.as_deref().unwrap();
     let skin = renderer::formats::load_skin_assets(&resources, skin_name).unwrap();

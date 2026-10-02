@@ -1,8 +1,12 @@
 //! FFmpeg-backed media export. Deterministic frames come from `offline`.
 
+use crate::runtime::{
+    AudioEffectEvent, ScheduledEffect, ScheduledLoopedEffect, ScheduledLoopedEffectStop,
+};
 use crate::{
     ffmpeg,
     offline::{hash_draw_commands, hash_rgb, AudioWindow, FrameRange, FrameSession, RenderedFrame},
+    render::RenderConfig,
 };
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -49,6 +53,14 @@ pub struct FrameDiagnostic {
     pub raw_draw_sha1: String,
     pub rgb_sha1: String,
     pub target_entity_draws: Vec<EntityDrawDiagnostic>,
+    #[serde(skip)]
+    audio_events: Vec<AudioEffectEvent>,
+    #[serde(skip)]
+    scheduled_effects: Vec<ScheduledEffect>,
+    #[serde(skip)]
+    scheduled_looped_effects: Vec<ScheduledLoopedEffect>,
+    #[serde(skip)]
+    scheduled_looped_effect_stops: Vec<ScheduledLoopedEffectStop>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,6 +93,45 @@ pub struct ExportRequest<'a> {
     pub height: u32,
     pub trace_entity_id: Option<usize>,
     pub level_option_overrides: &'a [(usize, f64)],
+    pub skin_name: Option<&'a str>,
+    pub particles_enabled: bool,
+    pub sfx_enabled: bool,
+    pub bgm_enabled: bool,
+    pub ui: &'a crate::render_ui::RendererUiConfig,
+}
+
+pub fn export_config(config: &RenderConfig) -> Result<ExportReport> {
+    let output = config
+        .output
+        .as_deref()
+        .context("video output path is required")?;
+    if config.layers.bgm && config.music.is_none() {
+        bail!("BGM is enabled but no music file is selected");
+    }
+    let options: Vec<_> = config
+        .level_options
+        .iter()
+        .map(|item| (item.index, item.value))
+        .collect();
+    export(ExportRequest {
+        engine: &config.engine,
+        resources: &config.resources,
+        level: &config.level,
+        music: config.music.as_deref().unwrap_or(&config.resources),
+        output,
+        start_time: config.start_time,
+        duration: config.duration,
+        fps: config.fps,
+        width: config.width,
+        height: config.height,
+        trace_entity_id: config.trace_entity_id,
+        level_option_overrides: &options,
+        skin_name: config.skin.as_deref(),
+        particles_enabled: config.layers.particles,
+        sfx_enabled: config.layers.sfx,
+        bgm_enabled: config.layers.bgm,
+        ui: &config.ui,
+    })
 }
 
 pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
@@ -88,7 +139,6 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         ("engine", request.engine),
         ("resources", request.resources),
         ("level data", request.level),
-        ("music", request.music),
     ] {
         if !path.is_file() {
             bail!(
@@ -96,6 +146,12 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
                 path.display()
             );
         }
+    }
+    if request.bgm_enabled && !request.music.is_file() {
+        bail!(
+            "BGM input is not an accessible file: {}",
+            request.music.display()
+        );
     }
     if let Some(parent) = request
         .output
@@ -111,11 +167,29 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
     let range = FrameRange::new(request.start_time, request.duration, request.fps)?;
     let package = crate::formats::load_engine(request.engine)?;
     let level = crate::formats::load_level(request.level)?;
-    let skin_name = package
-        .metadata
+    let resource_defaults: std::collections::BTreeMap<_, _> =
+        package.metadata.resource_defaults().into_iter().collect();
+    let skin_name = request
         .skin_name
-        .as_deref()
+        .or_else(|| {
+            resource_defaults
+                .get("skins")
+                .map(String::as_str)
+                .or(package.metadata.skin_name.as_deref())
+        })
         .context("engine has no default skin name")?;
+    let effect_name = resource_defaults
+        .get("effects")
+        .map(String::as_str)
+        .or(package.metadata.effect_name.as_deref());
+    let particle_name = resource_defaults
+        .get("particles")
+        .map(String::as_str)
+        .or(package.metadata.particle_name.as_deref());
+    let background_name = resource_defaults
+        .get("backgrounds")
+        .map(String::as_str)
+        .or(package.metadata.background_name.as_deref());
     let bgm_offset = level.bgm_offset.unwrap_or(0.0);
     if !bgm_offset.is_finite() {
         bail!("level bgmOffset must be finite");
@@ -123,20 +197,24 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
     let audio = crate::offline::audio_window(range.start_time(), bgm_offset)?;
 
     let make_session = || {
-        FrameSession::new(
+        FrameSession::new_configured(
             &package.watch,
             &package.rom,
             &package.configuration,
             &level,
             request.resources,
             skin_name,
-            package.metadata.background_name.as_deref(),
-            package.metadata.effect_name.as_deref(),
-            package.metadata.particle_name.as_deref(),
+            background_name,
+            effect_name,
+            particle_name,
             request.width,
             request.height,
             request.fps,
             request.level_option_overrides,
+            request.particles_enabled,
+            request.ui.clone(),
+            request.start_time,
+            request.duration,
         )
     };
     let expected_frames = render_diagnostic_pass(
@@ -145,6 +223,43 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         &package.watch,
         request.trace_entity_id,
     )?;
+    let effect_assets = request
+        .sfx_enabled
+        .then_some(effect_name)
+        .flatten()
+        .map(|name| crate::formats::load_effect_assets_optional(request.resources, name))
+        .transpose()?
+        .flatten()
+        .unwrap_or_else(|| crate::formats::EffectAssets {
+            clips: std::collections::BTreeMap::new(),
+        });
+    let bindings = if request.sfx_enabled {
+        crate::offline::effect_clip_bindings(&package.watch)?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    let (events, scheduled, loop_starts, loop_stops) = collect_audio_requests(&expected_frames);
+    let effect_mix = if request.sfx_enabled {
+        crate::audio::mix_effects_wav(
+            &effect_assets,
+            &bindings,
+            &events,
+            &scheduled,
+            &loop_starts,
+            &loop_stops,
+            range.start_time(),
+            range.frame_count as f64 / f64::from(range.fps),
+        )?
+    } else {
+        crate::audio::SfxMixResult {
+            wav: None,
+            warnings: vec![],
+        }
+    };
+    for warning in &effect_mix.warnings {
+        eprintln!("warning: {warning}");
+    }
+    let effect_audio = effect_mix.wav;
     let first_pass_hash = hash_sequence(
         &expected_frames
             .iter()
@@ -153,52 +268,68 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
     );
 
     let installation = ffmpeg::resolve()?;
-    let mut child = Command::new(&installation.ffmpeg)
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            "rgb24",
-            "-video_size",
-            &format!("{}x{}", request.width, request.height),
-            "-framerate",
-            &request.fps.to_string(),
-            "-i",
-            "pipe:0",
-            "-i",
-            &request.music.to_string_lossy(),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-vf",
-            "format=yuv420p",
-            "-af",
-            &audio_filter(audio),
-            "-frames:v",
-            &range.frame_count.to_string(),
-            "-t",
-            &format!("{:.12}", range.frame_count as f64 / f64::from(range.fps)),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-movflags",
-            "+faststart",
-            &request.output.to_string_lossy(),
-        ])
+    let mut command = Command::new(&installation.ffmpeg);
+    command.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pixel_format",
+        "rgb24",
+        "-video_size",
+        &format!("{}x{}", request.width, request.height),
+        "-framerate",
+        &request.fps.to_string(),
+        "-i",
+        "pipe:0",
+    ]);
+    if request.bgm_enabled {
+        command.arg("-i").arg(request.music);
+    }
+    let sfx_file = effect_audio
+        .as_ref()
+        .map(|bytes| {
+            let mut file = tempfile::Builder::new()
+                .suffix(".wav")
+                .tempfile()
+                .context("creating temporary SFX mix")?;
+            file.write_all(bytes).context("writing temporary SFX mix")?;
+            Ok::<_, anyhow::Error>(file)
+        })
+        .transpose()?;
+    if let Some(file) = &sfx_file {
+        command.arg("-i").arg(file.path());
+    }
+    command.args(audio_map_args(
+        request.bgm_enabled,
+        sfx_file.is_some(),
+        audio,
+    ));
+    command.args([
+        "-vf",
+        "format=yuv420p",
+        "-frames:v",
+        &range.frame_count.to_string(),
+        "-t",
+        &format!("{:.12}", range.frame_count as f64 / f64::from(range.fps)),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+    ]);
+    if request.bgm_enabled || sfx_file.is_some() {
+        command.args(["-c:a", "aac", "-b:a", "192k"]);
+    }
+    command.arg(&request.output);
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -262,6 +393,7 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         request.height,
         request.fps,
         range.frame_count as f64 / f64::from(range.fps),
+        request.bgm_enabled || sfx_file.is_some(),
     )?;
     let second_pass_hash = hash_sequence(
         &actual_frames
@@ -435,7 +567,32 @@ fn frame_diagnostic(
         raw_draw_sha1: hash_draw_commands(&frame.report.display_list),
         rgb_sha1: hash_rgb(&frame.rgb),
         target_entity_draws,
+        audio_events: frame.report.audio_events.clone(),
+        scheduled_effects: frame.report.scheduled_effects.clone(),
+        scheduled_looped_effects: frame.report.scheduled_looped_effects.clone(),
+        scheduled_looped_effect_stops: frame.report.scheduled_looped_effect_stops.clone(),
     }
+}
+
+fn collect_audio_requests(
+    frames: &[FrameDiagnostic],
+) -> (
+    Vec<AudioEffectEvent>,
+    Vec<ScheduledEffect>,
+    Vec<ScheduledLoopedEffect>,
+    Vec<ScheduledLoopedEffectStop>,
+) {
+    let mut events = Vec::new();
+    let mut scheduled = Vec::new();
+    let mut loop_starts = Vec::new();
+    let mut loop_stops = Vec::new();
+    for frame in frames {
+        events.extend(frame.audio_events.iter().cloned());
+        scheduled.extend(frame.scheduled_effects.iter().cloned());
+        loop_starts.extend(frame.scheduled_looped_effects.iter().cloned());
+        loop_stops.extend(frame.scheduled_looped_effect_stops.iter().cloned());
+    }
+    (events, scheduled, loop_starts, loop_stops)
 }
 
 fn hash_sequence(hashes: &[String]) -> String {
@@ -444,6 +601,32 @@ fn hash_sequence(hashes: &[String]) -> String {
         digest.update(hash.as_bytes());
     }
     hex::encode(digest.finalize())
+}
+
+fn audio_map_args(has_bgm: bool, has_sfx: bool, audio: AudioWindow) -> Vec<String> {
+    match (has_bgm, has_sfx) {
+        (true, true) => vec![
+            "-map".into(),
+            "0:v:0".into(),
+            "-map".into(),
+            "[aout]".into(),
+            "-filter_complex".into(),
+            format!(
+                "[1:a]{}[bgm];[bgm][2:a]amix=inputs=2:duration=first:normalize=0[aout]",
+                audio_filter(audio)
+            ),
+        ],
+        (true, false) => vec![
+            "-map".into(),
+            "0:v:0".into(),
+            "-map".into(),
+            "1:a:0".into(),
+            "-af".into(),
+            audio_filter(audio),
+        ],
+        (false, true) => vec!["-map".into(), "0:v:0".into(), "-map".into(), "1:a:0".into()],
+        (false, false) => vec!["-map".into(), "0:v:0".into()],
+    }
 }
 
 fn audio_filter(window: AudioWindow) -> String {
@@ -460,6 +643,7 @@ fn validate_probe(
     height: u32,
     fps: u32,
     expected_duration: f64,
+    has_audio: bool,
 ) -> Result<()> {
     let streams = probe
         .get("streams")
@@ -468,7 +652,9 @@ fn validate_probe(
     let video = streams.iter().find(|s| s["codec_type"] == "video");
     let audio = streams.iter().find(|s| s["codec_type"] == "audio");
     let video = video.context("export has no video stream")?;
-    let audio = audio.context("export has no audio stream")?;
+    if has_audio && audio.is_none() {
+        bail!("export has no audio stream");
+    }
     if video["width"].as_u64() != Some(u64::from(width))
         || video["height"].as_u64() != Some(u64::from(height))
     {
@@ -481,7 +667,7 @@ fn validate_probe(
     if actual_frames != frames {
         bail!("FFprobe video frame count does not match submitted frame count");
     }
-    if streams.len() != 2 {
+    if streams.len() != if has_audio { 2 } else { 1 } {
         bail!(
             "expected exactly one video and one audio stream, got {}",
             streams.len()
@@ -495,16 +681,14 @@ fn validate_probe(
     {
         bail!("FFprobe video frame rate does not match requested FPS");
     }
-    if video["codec_name"].as_str().is_none_or(str::is_empty)
-        || audio["codec_name"].as_str().is_none_or(str::is_empty)
-    {
-        bail!("FFprobe did not report both output codecs");
+    if video["codec_name"].as_str().is_none_or(str::is_empty) {
+        bail!("FFprobe did not report video codec");
     }
-    if video["codec_name"] != "h264"
-        || video["pix_fmt"] != "yuv420p"
-        || audio["codec_name"] != "aac"
-    {
+    if video["codec_name"] != "h264" || video["pix_fmt"] != "yuv420p" {
         bail!("FFprobe codecs or pixel format differ from the configured MP4 output");
+    }
+    if has_audio && audio.is_some_and(|stream| stream["codec_name"] != "aac") {
+        bail!("FFprobe audio codec differs from the configured MP4 output");
     }
     let duration = probe["format"]["duration"]
         .as_str()
@@ -513,7 +697,7 @@ fn validate_probe(
     if (duration - expected_duration).abs() > 1.0 / f64::from(fps) {
         bail!("FFprobe output duration differs from the requested frame sequence");
     }
-    for stream in [video, audio] {
+    for stream in std::iter::once(video).chain(audio.into_iter()) {
         let stream_duration = stream["duration"]
             .as_str()
             .and_then(|value| value.parse::<f64>().ok())
@@ -557,5 +741,27 @@ mod tests {
             leading_silence: 0.05
         })
         .contains("+0.050000000000/TB"));
+    }
+
+    #[test]
+    fn bgm_is_mapped_alone_without_sfx_and_mixed_when_sfx_exists() {
+        let window = AudioWindow {
+            source_start: 1.25,
+            leading_silence: 0.0,
+        };
+        let without_sfx = audio_map_args(true, false, window).join(" ");
+        assert!(without_sfx.contains("1:a:0"));
+        assert!(without_sfx.contains("atrim=start=1.250000000000"));
+
+        let with_sfx = audio_map_args(true, true, window).join(" ");
+        assert!(with_sfx.contains("[1:a]"));
+        assert!(with_sfx.contains("[2:a]"));
+        assert!(with_sfx.contains("amix=inputs=2"));
+        assert!(with_sfx.contains("atrim=start=1.250000000000"));
+
+        let sfx_only = audio_map_args(false, true, window).join(" ");
+        assert!(sfx_only.contains("1:a:0"));
+        assert!(!sfx_only.contains("atrim"));
+        assert_eq!(audio_map_args(false, false, window), ["-map", "0:v:0"]);
     }
 }

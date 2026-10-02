@@ -66,16 +66,14 @@ fn report(path: &Path) -> Result<(formats::EnginePackage, EngineReport)> {
         currently_unsupported_runtime_features: vec![
             "Watch operations and host semantics outside the implemented subset".into(),
             "Complete Sonolus engine lifecycle and scheduling semantics".into(),
-            "Rendering".into(),
-            "Particle simulation".into(),
-            "Audio scheduling and mixing".into(),
+            "Built-in score/judgment UI state is not provided by this headless host".into(),
         ],
         support: LayerSupport {
             parse: "supported for recognized package envelopes; unknown fields retained".into(),
             vm_runtime: "partial Watch VM and entity lifecycle execution; operation and host semantics remain incomplete".into(),
-            rendering: "diagnostic PPM rasterizer only; Sonolus skin/resource rendering is not implemented".into(),
-            particles: "not implemented (M0)".into(),
-            audio: "not implemented (M0)".into(),
+            rendering: "partial SkinData, background, and engine Watch Draw rendering".into(),
+            particles: "partial ParticleData effects and atlas rendering; seeded randomness is deterministic host policy".into(),
+            audio: "partial offline PCM16 mono/stereo effect mixing; real-time audio device playback is not implemented".into(),
         },
     };
     Ok((pkg, report))

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use renderer::{compatibility, formats};
 use std::path::PathBuf;
 
@@ -8,6 +8,229 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+struct RenderLayerArgs {
+    #[arg(long, conflicts_with = "no_ui")]
+    ui: bool,
+    #[arg(long)]
+    no_ui: bool,
+    #[arg(long, conflicts_with = "no_ui_primary_metric")]
+    ui_primary_metric: bool,
+    #[arg(long)]
+    no_ui_primary_metric: bool,
+    #[arg(long, conflicts_with = "no_ui_secondary_metric")]
+    ui_secondary_metric: bool,
+    #[arg(long)]
+    no_ui_secondary_metric: bool,
+    #[arg(long, conflicts_with = "no_ui_combo")]
+    ui_combo: bool,
+    #[arg(long)]
+    no_ui_combo: bool,
+    #[arg(long, conflicts_with = "no_ui_judgment")]
+    ui_judgment: bool,
+    #[arg(long)]
+    no_ui_judgment: bool,
+    #[arg(long, conflicts_with = "no_ui_progress")]
+    ui_progress: bool,
+    #[arg(long)]
+    no_ui_progress: bool,
+    #[arg(long)]
+    primary_metric_provider: Option<String>,
+    #[arg(long)]
+    primary_metric_max: Option<f64>,
+    #[arg(long)]
+    primary_metric_label: Option<String>,
+    #[arg(long)]
+    secondary_metric_provider: Option<String>,
+    #[arg(long)]
+    secondary_metric_max: Option<f64>,
+    #[arg(long)]
+    secondary_metric_label: Option<String>,
+    #[arg(long)]
+    combo_provider: Option<String>,
+    #[arg(long)]
+    combo_label: Option<String>,
+    #[arg(long)]
+    judgment_provider: Option<String>,
+    #[arg(long)]
+    judgment_label: Option<String>,
+    #[arg(long, conflicts_with = "no_particles")]
+    particles: bool,
+    #[arg(long)]
+    no_particles: bool,
+    #[arg(long, conflicts_with = "no_sfx")]
+    sfx: bool,
+    #[arg(long)]
+    no_sfx: bool,
+    #[arg(long, conflicts_with = "no_bgm")]
+    bgm: bool,
+    #[arg(long)]
+    no_bgm: bool,
+}
+
+#[cfg(test)]
+mod render_argument_tests {
+    use super::*;
+
+    #[test]
+    fn cli_layer_and_ui_controls_build_independent_render_configuration() {
+        let args = RenderLayerArgs {
+            ui: false,
+            no_ui: false,
+            ui_primary_metric: false,
+            no_ui_primary_metric: true,
+            ui_secondary_metric: true,
+            no_ui_secondary_metric: false,
+            ui_combo: false,
+            no_ui_combo: false,
+            ui_judgment: false,
+            no_ui_judgment: false,
+            ui_progress: false,
+            no_ui_progress: true,
+            primary_metric_provider: None,
+            primary_metric_max: None,
+            primary_metric_label: None,
+            secondary_metric_provider: Some("memory:2000:7".into()),
+            secondary_metric_max: Some(100.0),
+            secondary_metric_label: Some("ALT".into()),
+            combo_provider: None,
+            combo_label: None,
+            judgment_provider: None,
+            judgment_label: None,
+            particles: false,
+            no_particles: true,
+            sfx: false,
+            no_sfx: true,
+            bgm: false,
+            no_bgm: false,
+        };
+        let ui = args.ui_config().unwrap();
+        assert!(!ui.enabled || ui.secondary_metric.enabled);
+        assert!(ui.secondary_metric.enabled);
+        assert!(!ui.primary_metric.enabled);
+        assert!(!ui.progress);
+        assert_eq!(
+            ui.secondary_metric.provider,
+            renderer::render_ui::UiValueProvider::Memory {
+                block_id: 2000,
+                index: 7
+            }
+        );
+        let layers = args.layers();
+        assert!(!layers.particles && !layers.sfx && layers.bgm);
+    }
+}
+
+impl RenderLayerArgs {
+    fn ui_config(&self) -> Result<renderer::render_ui::RendererUiConfig> {
+        use renderer::render_ui::RendererUiConfig;
+        let mut ui = RendererUiConfig::default();
+        ui.enabled = !self.no_ui
+            && (self.ui
+                || self.ui_primary_metric
+                || self.ui_secondary_metric
+                || self.ui_combo
+                || self.ui_judgment
+                || self.ui_progress
+                || self.primary_metric_provider.is_some()
+                || self.secondary_metric_provider.is_some());
+        ui.primary_metric.enabled = !self.no_ui_primary_metric;
+        ui.secondary_metric.enabled = self.ui_secondary_metric && !self.no_ui_secondary_metric;
+        ui.combo.enabled = self.ui_combo && !self.no_ui_combo;
+        ui.judgment.enabled = self.ui_judgment && !self.no_ui_judgment;
+        ui.progress = !self.no_ui_progress && (self.ui || self.ui_progress);
+        if self.no_ui {
+            ui.enabled = false;
+        }
+        if let Some(provider) = &self.primary_metric_provider {
+            ui.primary_metric.provider = parse_ui_provider(provider)?;
+            ui.primary_metric.enabled = !self.no_ui_primary_metric;
+            ui.enabled = !self.no_ui;
+        }
+        if let Some(provider) = &self.secondary_metric_provider {
+            ui.secondary_metric.provider = parse_ui_provider(provider)?;
+            ui.secondary_metric.enabled = !self.no_ui_secondary_metric;
+            ui.enabled = !self.no_ui;
+        }
+        if let Some(maximum) = self.primary_metric_max {
+            ui.primary_metric.maximum = Some(maximum);
+        }
+        if let Some(maximum) = self.secondary_metric_max {
+            ui.secondary_metric.maximum = Some(maximum);
+        }
+        if let Some(label) = &self.primary_metric_label {
+            ui.primary_metric.label = label.clone();
+        }
+        if let Some(label) = &self.secondary_metric_label {
+            ui.secondary_metric.label = label.clone();
+        }
+        if let Some(label) = &self.combo_label {
+            ui.combo.label = label.clone();
+        }
+        if let Some(label) = &self.judgment_label {
+            ui.judgment.label = label.clone();
+        }
+        if let Some(provider) = &self.combo_provider {
+            ui.combo.provider = parse_ui_provider(provider)?;
+            ui.combo.enabled = !self.no_ui_combo;
+            ui.enabled = !self.no_ui;
+        }
+        if let Some(provider) = &self.judgment_provider {
+            ui.judgment.provider = parse_ui_provider(provider)?;
+            ui.judgment.enabled = !self.no_ui_judgment;
+            ui.enabled = !self.no_ui;
+        }
+        ui.validate()?;
+        Ok(ui)
+    }
+
+    fn layers(&self) -> renderer::render::RenderLayers {
+        renderer::render::RenderLayers {
+            particles: !self.no_particles,
+            sfx: !self.no_sfx,
+            bgm: !self.no_bgm,
+        }
+    }
+}
+
+fn parse_ui_provider(value: &str) -> Result<renderer::render_ui::UiValueProvider> {
+    use renderer::render_ui::UiValueProvider;
+    if let Some(raw) = value.strip_prefix("fixed:") {
+        return Ok(UiValueProvider::Fixed {
+            value: raw.parse()?,
+        });
+    }
+    if let Some(raw) = value.strip_prefix("external:") {
+        return Ok(UiValueProvider::External {
+            value: raw.parse()?,
+        });
+    }
+    if value == "progress" {
+        return Ok(UiValueProvider::Progress);
+    }
+    if value == "accuracy" {
+        return Ok(UiValueProvider::Accuracy);
+    }
+    if let Some(key) = value.strip_prefix("engine:") {
+        return Ok(UiValueProvider::EngineMetric { key: key.into() });
+    }
+    if let Some(mapping) = value.strip_prefix("judgment:") {
+        return Ok(UiValueProvider::JudgmentDerived {
+            mapping: mapping.into(),
+        });
+    }
+    if let Some(pair) = value.strip_prefix("memory:") {
+        let (block, index) = pair
+            .split_once(':')
+            .context("memory provider must be memory:BLOCK:INDEX")?;
+        return Ok(UiValueProvider::Memory {
+            block_id: block.parse()?,
+            index: index.parse()?,
+        });
+    }
+    anyhow::bail!("unknown metric provider {value:?}; use fixed:N, external:N, memory:BLOCK:INDEX, progress, engine:KEY, accuracy, or judgment:MAP")
 }
 
 #[derive(Subcommand)]
@@ -57,6 +280,8 @@ enum Command {
         width: u32,
         #[arg(long, default_value_t = 720)]
         height: u32,
+        #[command(flatten)]
+        render_layers: RenderLayerArgs,
         /// Write a skin-textured PPM frame after Watch execution (requires --resources).
         #[arg(long)]
         output: Option<PathBuf>,
@@ -116,7 +341,11 @@ enum Command {
         /// Override a Level Option after EngineConfiguration defaults are bound (repeatable: INDEX=VALUE).
         #[arg(long = "level-option", value_name = "INDEX=VALUE", action = clap::ArgAction::Append)]
         level_options: Vec<String>,
+        #[command(flatten)]
+        render_layers: RenderLayerArgs,
     },
+    /// Open the local browser based preview and video export frontend.
+    Gui,
 }
 
 fn main() -> Result<()> {
@@ -195,6 +424,7 @@ fn main() -> Result<()> {
             level_options,
             width,
             height,
+            render_layers,
             output,
             display_list_output,
             trace_draws,
@@ -266,6 +496,7 @@ fn main() -> Result<()> {
             }
             runtime.bind_engine_rom(&package.rom)?;
             runtime.bind_engine_option_defaults(&package.configuration)?;
+            runtime.bind_engine_ui_configuration(&package.configuration)?;
             let option_overrides = level_options
                 .iter()
                 .map(|value| parse_level_option_override(value))
@@ -278,6 +509,8 @@ fn main() -> Result<()> {
                 anyhow::bail!("Watch frame dimensions must be positive");
             }
             runtime.set_screen_aspect_ratio(f64::from(width) / f64::from(height))?;
+            let mut particle_assets_for_render = None;
+            let mut particle_bindings_for_render = std::collections::BTreeMap::new();
             let skin_assets = if let Some(resource_path) = resource_path {
                 let skin_name = defaults
                     .get("skins")
@@ -355,6 +588,16 @@ fn main() -> Result<()> {
                         .is_some()
                     {
                         runtime.bind_particle_effect_names(&names)?;
+                    }
+                    if output.is_some() && render_layers.layers().particles {
+                        let particle_assets =
+                            formats::load_particle_assets(resource_path, particle_name)?;
+                        let bindings = renderer::offline::particle_effect_bindings(&package.watch)?;
+                        particle_bindings_for_render = bindings
+                            .into_iter()
+                            .filter(|(_, name)| particle_assets.effects.contains_key(name))
+                            .collect();
+                        particle_assets_for_render = Some(particle_assets);
                     }
                     println!(
                         "selected particle resource: {particle_name} ({} effects)",
@@ -583,7 +826,7 @@ fn main() -> Result<()> {
                 let background = background_assets
                     .as_ref()
                     .map(|assets| (assets, runtime_background));
-                let ppm = report
+                let mut ppm = report
                     .display_list
                     .render_skin_ppm_with_runtime_transform_and_background(
                         width,
@@ -594,6 +837,83 @@ fn main() -> Result<()> {
                         &report.runtime_skin_transform,
                         background,
                     )?;
+                if render_layers.layers().particles {
+                    if let Some(assets) = particle_assets_for_render.as_ref() {
+                        let instances = runtime
+                            .context
+                            .particle_instances
+                            .read()
+                            .map_err(|_| {
+                                anyhow::anyhow!("particle instance state lock was poisoned")
+                            })?
+                            .instances()
+                            .values()
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let draws = renderer::particles::render_instances(
+                            assets,
+                            &particle_bindings_for_render,
+                            &instances,
+                            time,
+                        )?;
+                        let mut rgb = renderer::offline::ppm_rgb_payload(&ppm, width, height)?;
+                        renderer::runtime::DisplayList::composite_particle_sprites(
+                            &mut rgb,
+                            width,
+                            height,
+                            f64::from(width) / f64::from(height),
+                            assets,
+                            &draws,
+                            &report.runtime_particle_transform,
+                        )?;
+                        ppm = {
+                            let mut bytes = format!("P6\n{width} {height}\n255\n").into_bytes();
+                            bytes.extend_from_slice(&rgb);
+                            bytes
+                        };
+                    }
+                }
+                let ui = render_layers.ui_config()?;
+                if ui.enabled {
+                    let mut rgb = renderer::offline::ppm_rgb_payload(&ppm, width, height)?;
+                    renderer::render_ui::render_overlay(
+                        &mut rgb,
+                        width,
+                        height,
+                        report.timeline.unwrap_or(time),
+                        0.0,
+                        1.0,
+                        &ui,
+                        |provider| match provider {
+                            renderer::render_ui::UiValueProvider::Fixed { value }
+                            | renderer::render_ui::UiValueProvider::External { value } => {
+                                Ok(*value)
+                            }
+                            renderer::render_ui::UiValueProvider::Memory { block_id, index } => {
+                                Ok(runtime.global_memory.get(*block_id, *index))
+                            }
+                            renderer::render_ui::UiValueProvider::Progress => Ok(time),
+                            renderer::render_ui::UiValueProvider::EngineMetric { key } => {
+                                anyhow::bail!(
+                                "engine metric provider {key:?} has no authoritative Watch source"
+                            )
+                            }
+                            renderer::render_ui::UiValueProvider::Accuracy => anyhow::bail!(
+                                "accuracy provider is unsupported without a verified Watch source"
+                            ),
+                            renderer::render_ui::UiValueProvider::JudgmentDerived { mapping } => {
+                                anyhow::bail!(
+                                    "judgment-derived provider {mapping:?} requires caller logic"
+                                )
+                            }
+                        },
+                    )?;
+                    ppm = {
+                        let mut bytes = format!("P6\n{width} {height}\n255\n").into_bytes();
+                        bytes.extend_from_slice(&rgb);
+                        bytes
+                    };
+                }
                 println!(
                     "pre-encode RGB SHA-1: {}",
                     renderer::offline::hash_rgb(&renderer::offline::ppm_rgb_payload(
@@ -654,6 +974,7 @@ fn main() -> Result<()> {
             height,
             trace_entity,
             level_options,
+            render_layers,
         } => {
             if custom_mv.is_some() {
                 anyhow::bail!("custom MV compositing is not implemented");
@@ -663,20 +984,27 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|value| parse_level_option_override(value))
                 .collect::<Result<Vec<_>>>()?;
-            let report = renderer::video_export::export(renderer::video_export::ExportRequest {
-                engine: &engine,
-                resources: &resources,
-                level: &level,
-                music: &music,
-                output: &output,
+            let config = renderer::render::RenderConfig {
+                engine,
+                resources,
+                level,
+                skin: None,
+                music: Some(music),
+                output: Some(output.clone()),
                 start_time,
                 duration,
                 fps,
                 width,
                 height,
+                level_options: option_overrides
+                    .into_iter()
+                    .map(|(index, value)| renderer::render::LevelOptionValue { index, value })
+                    .collect(),
+                layers: render_layers.layers(),
+                ui: render_layers.ui_config()?,
                 trace_entity_id: trace_entity,
-                level_option_overrides: &option_overrides,
-            })?;
+            };
+            let report = config.render_video()?;
             println!("wrote MP4 to {}", output.display());
             println!(
                 "submitted deterministic frames: {}",
@@ -691,10 +1019,12 @@ fn main() -> Result<()> {
             );
             println!("FPS: {}", report.fps);
             println!("Level bgmOffset: {}s", report.bgm_offset);
-            println!(
-                "Audio mapping: music source {:.6}s, leading silence {:.6}s",
-                report.audio_window.source_start, report.audio_window.leading_silence
-            );
+            if render_layers.layers().bgm {
+                println!(
+                    "Audio mapping: music source {:.6}s, leading silence {:.6}s",
+                    report.audio_window.source_start, report.audio_window.leading_silence
+                );
+            }
             println!(
                 "pre-encode deterministic frame hashes match: {} ({})",
                 report.deterministic_frame_hashes_match, report.first_pass_hash
@@ -704,8 +1034,9 @@ fn main() -> Result<()> {
                 "per-frame Watch/render diagnostics:\n{}",
                 serde_json::to_string_pretty(&report.frame_diagnostics)?
             );
-            println!("Scheduled SFX events are not mixed into the main music track.");
+            println!("SFX mixed: {}", render_layers.layers().sfx);
         }
+        Command::Gui => renderer::gui::launch()?,
     }
     Ok(())
 }
