@@ -350,6 +350,22 @@ enum Command {
         /// Print a detailed line for each profiled frame.
         #[arg(long, requires = "profile")]
         profile_frames: bool,
+        /// Render a full preflight and compare draw/RGB hashes against streaming.
+        #[arg(long)]
+        validate_determinism: bool,
+        /// Force sequential SFX collection for --sequential-frames (production default).
+        #[arg(long, conflicts_with = "concurrent_sfx_prepass")]
+        sequential_sfx_prepass: bool,
+        /// Compare the legacy concurrent SFX prepass when --sequential-frames is selected.
+        #[arg(
+            long,
+            requires = "sequential_frames",
+            conflicts_with = "sequential_sfx_prepass"
+        )]
+        concurrent_sfx_prepass: bool,
+        /// Disable bounded Watch-to-render frame overlap for A/B benchmarking.
+        #[arg(long)]
+        sequential_frames: bool,
         /// Include Draw geometry/Unlerp values for a runtime entity in frame diagnostics.
         #[arg(long)]
         trace_entity: Option<usize>,
@@ -993,6 +1009,10 @@ fn main() -> Result<()> {
             backend,
             profile,
             profile_frames,
+            validate_determinism,
+            sequential_sfx_prepass,
+            concurrent_sfx_prepass,
+            sequential_frames,
         } => {
             if custom_mv.is_some() {
                 anyhow::bail!("custom MV compositing is not implemented");
@@ -1027,6 +1047,11 @@ fn main() -> Result<()> {
                 },
                 profile,
                 profile_frames,
+                validate_determinism,
+                concurrent_sfx_prepass: sequential_frames
+                    && concurrent_sfx_prepass
+                    && !sequential_sfx_prepass,
+                frame_pipeline: !sequential_frames,
             };
             let report = config.render_video()?;
             println!("wrote MP4 to {}", output.display());
@@ -1049,10 +1074,48 @@ fn main() -> Result<()> {
                     report.audio_window.source_start, report.audio_window.leading_silence
                 );
             }
+            if report.deterministic_frame_hashes_match == Some(true) {
+                println!(
+                    "pre-encode deterministic frame hashes match: {} ({})",
+                    true,
+                    report.first_pass_hash.as_deref().unwrap_or("")
+                );
+            } else {
+                println!(
+                    "full draw/RGB determinism validation: not run (use --validate-determinism)"
+                );
+            }
+            println!("rendered RGB sequence SHA-1: {}", report.second_pass_hash);
             println!(
-                "pre-encode deterministic frame hashes match: {} ({})",
-                report.deterministic_frame_hashes_match, report.first_pass_hash
+                "SFX event sequence SHA-1: {} ({:?})",
+                report.sfx_event_sha1, report.sfx_event_counts
             );
+            println!(
+                "SFX event pass workload: {} runtime frames, {} callbacks, {} evaluations",
+                report.event_pass_runtime_frames,
+                report.event_pass_callbacks,
+                report.event_pass_evaluations
+            );
+            println!(
+                "stream workload: {} runtime frames, {} callbacks, {} evaluations",
+                report.stream_runtime_frames, report.stream_callbacks, report.stream_evaluations
+            );
+            if let Some(pipeline) = &report.frame_pipeline {
+                println!(
+                    "frame pipeline: queue {}/{}, producer Watch {:.1}ms + snapshot {:.1}ms, blocked {:.1}ms; queue residence {:.1}ms, consumer waiting {:.1}ms, render {:.1}ms, FFmpeg output {:.1}ms; first frame {:.1}ms, render phase {:.1}ms",
+                    pipeline.queue_high_water,
+                    pipeline.queue_capacity,
+                    pipeline.producer_watch_ms,
+                    pipeline.producer_snapshot_ms,
+                    pipeline.producer_blocked_ms,
+                    pipeline.queue_residence_ms,
+                    pipeline.consumer_waiting_ms,
+                    pipeline.render_ms,
+                    pipeline.output_ms,
+                    pipeline.first_frame_latency_ms,
+                    pipeline.render_phase_ms,
+                );
+            }
             println!("FFprobe:\n{}", serde_json::to_string_pretty(&report.probe)?);
             println!(
                 "per-frame Watch/render diagnostics:\n{}",
@@ -1200,6 +1263,84 @@ mod cli_tests {
             "out.mp4",
         ];
         assert!(super::Cli::try_parse_from(base).is_ok());
+        let validation = super::Cli::try_parse_from([
+            "renderer",
+            "render-video",
+            "engine.zip",
+            "resources.scp",
+            "level.json",
+            "music.mp3",
+            "out.mp4",
+            "--validate-determinism",
+        ])
+        .unwrap();
+        assert!(matches!(
+            validation.command,
+            super::Command::RenderVideo {
+                validate_determinism: true,
+                ..
+            }
+        ));
+        let sequential = super::Cli::try_parse_from([
+            "renderer",
+            "render-video",
+            "engine.zip",
+            "resources.scp",
+            "level.json",
+            "music.mp3",
+            "out.mp4",
+            "--sequential-sfx-prepass",
+        ])
+        .unwrap();
+        assert!(matches!(
+            sequential.command,
+            super::Command::RenderVideo {
+                sequential_sfx_prepass: true,
+                ..
+            }
+        ));
+        let sequential_frames = super::Cli::try_parse_from([
+            "renderer",
+            "render-video",
+            "engine.zip",
+            "resources.scp",
+            "level.json",
+            "music.mp3",
+            "out.mp4",
+            "--sequential-frames",
+        ])
+        .unwrap();
+        assert!(matches!(
+            sequential_frames.command,
+            super::Command::RenderVideo {
+                sequential_frames: true,
+                ..
+            }
+        ));
+        assert!(super::Cli::try_parse_from([
+            "renderer",
+            "render-video",
+            "engine.zip",
+            "resources.scp",
+            "level.json",
+            "music.mp3",
+            "out.mp4",
+            "--sequential-frames",
+            "--concurrent-sfx-prepass",
+        ])
+        .is_ok());
+        assert!(super::Cli::try_parse_from([
+            "renderer",
+            "render-video",
+            "engine.zip",
+            "resources.scp",
+            "level.json",
+            "music.mp3",
+            "out.mp4",
+            "--concurrent-sfx-prepass",
+            "--sequential-sfx-prepass",
+        ])
+        .is_err());
         let profiled = super::Cli::try_parse_from([
             "renderer",
             "render-video",

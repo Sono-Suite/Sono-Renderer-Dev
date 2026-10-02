@@ -88,10 +88,22 @@ pub fn audio_window(level_start: f64, bgm_offset: f64) -> Result<AudioWindow> {
 
 pub struct FrameSession<'a> {
     stepper: WatchFrameStepper<'a>,
+    render: std::sync::Arc<FrameRenderResources>,
+    profile: bool,
+    runtime_construction: std::time::Duration,
+    atlas_identity_preparation: std::time::Duration,
+}
+
+/// Immutable renderer inputs shared with the render worker. Watch state is
+/// intentionally absent: only per-frame snapshots cross the pipeline boundary.
+pub(crate) struct FrameRenderResources {
     skin: formats::SkinAssets,
+    skin_atlas_identity: Option<crate::gpu_render::AtlasIdentity>,
     background: Option<formats::BackgroundAssets>,
+    background_atlas_identity: Option<crate::gpu_render::AtlasIdentity>,
     bindings: BTreeMap<u32, String>,
     particles: Option<formats::ParticleAssets>,
+    particle_atlas_identity: Option<crate::gpu_render::AtlasIdentity>,
     particle_bindings: BTreeMap<i64, String>,
     particles_enabled: bool,
     ui: crate::render_ui::RendererUiConfig,
@@ -101,8 +113,25 @@ pub struct FrameSession<'a> {
     height: u32,
     backend: crate::render::RenderBackend,
     gpu: Option<&'static crate::gpu_render::GpuRenderer>,
-    profile: bool,
+}
+
+/// Owned frame snapshot. It can be rasterized after the producer advances the
+/// Watch runtime to later frames.
+pub(crate) struct PreparedFrame {
+    report: FrameReport,
+    particle_draws: Option<Vec<crate::particles::ParticleSpriteDraw>>,
+    ui_values: Vec<f64>,
+    vm: std::time::Duration,
+    preparation: std::time::Duration,
+    total_start: Option<std::time::Instant>,
     runtime_construction: std::time::Duration,
+    atlas_identity_preparation: std::time::Duration,
+}
+
+impl PreparedFrame {
+    pub(crate) fn producer_timings(&self) -> (std::time::Duration, std::time::Duration) {
+        (self.vm, self.preparation)
+    }
 }
 
 pub struct RenderedFrame {
@@ -116,6 +145,7 @@ pub struct FrameStageProfile {
     pub vm: std::time::Duration,
     pub preparation: std::time::Duration,
     pub cpu_render: std::time::Duration,
+    pub backend_wall: std::time::Duration,
     pub runtime_ui: std::time::Duration,
     pub total: std::time::Duration,
     pub entities: usize,
@@ -123,8 +153,15 @@ pub struct FrameStageProfile {
     pub particle_draws: usize,
     pub gpu_encode_submit: std::time::Duration,
     pub gpu_draw_preparation: std::time::Duration,
+    pub gpu_render_target_setup: std::time::Duration,
+    pub gpu_initial_rgba_conversion: std::time::Duration,
+    pub gpu_initial_framebuffer_upload: std::time::Duration,
+    pub gpu_atlas_hashing: std::time::Duration,
+    pub gpu_atlas_cache_upload: std::time::Duration,
+    pub gpu_readback_buffer_setup: std::time::Duration,
     pub gpu_wait_map: std::time::Duration,
     pub framebuffer_unpack: std::time::Duration,
+    pub framebuffer_packaging: std::time::Duration,
     pub framebuffer_copy: std::time::Duration,
     pub gpu_draw_calls: usize,
     pub atlas_uploads: usize,
@@ -132,6 +169,7 @@ pub struct FrameStageProfile {
     pub adapter: Option<String>,
     pub runtime: crate::watch_runtime::FrameRuntimeProfile,
     pub runtime_construction: std::time::Duration,
+    pub atlas_identity_preparation: std::time::Duration,
 }
 
 pub fn effect_clip_bindings(watch: &WatchData) -> Result<BTreeMap<i64, String>> {
@@ -263,6 +301,102 @@ impl<'a> WatchFrameStepper<'a> {
             }
         }
         final_report.context("requested Watch frame was not evaluated")
+    }
+}
+
+/// Watch-only session used when export needs SFX events before FFmpeg starts.
+/// It applies the same runtime inputs as `FrameSession` but does not rasterize
+/// the Watch-produced display list, prepare particle draws, or create a GPU
+/// renderer/framebuffer.
+pub struct EventSession<'a> {
+    stepper: WatchFrameStepper<'a>,
+}
+
+impl<'a> EventSession<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_configured(
+        watch: &'a WatchData,
+        rom: &[u8],
+        configuration: &serde_json::Value,
+        level: &formats::LevelData,
+        resources_path: &std::path::Path,
+        skin_name: &str,
+        background_name: Option<&str>,
+        effect_name: Option<&str>,
+        particle_name: Option<&str>,
+        width: u32,
+        height: u32,
+        fps: u32,
+        level_option_overrides: &[(usize, f64)],
+        particles_enabled: bool,
+        profile: bool,
+        draw_tracing: bool,
+    ) -> Result<Self> {
+        if width == 0 || height == 0 || width > 8192 || height > 8192 {
+            bail!("frame dimensions must be in 1..=8192");
+        }
+        let mut stepper = WatchFrameStepper::new_with_engine_options(
+            watch,
+            rom,
+            configuration,
+            level,
+            fps,
+            level_option_overrides,
+        )?;
+        let runtime = stepper.runtime_mut();
+        runtime.set_draw_tracing(draw_tracing);
+        runtime.set_profiling(profile);
+        runtime.set_vm_accounting(false);
+        runtime.set_screen_aspect_ratio(f64::from(width) / f64::from(height))?;
+
+        let sprite_names = formats::load_skin_sprite_names(resources_path, skin_name)?;
+        runtime.bind_skin_sprite_names(&sprite_names)?;
+        if let Some(name) = effect_name {
+            let names = formats::load_effect_clip_names_optional(resources_path, name)
+                .with_context(|| format!("resolving selected effect resource {name:?}"))?;
+            if watch
+                .effect
+                .get("clips")
+                .and_then(serde_json::Value::as_array)
+                .is_some()
+            {
+                runtime.bind_effect_clip_names(&names.unwrap_or_default())?;
+            }
+        }
+        if let Some(name) = particle_name {
+            let names = formats::load_particle_effect_names(resources_path, name)
+                .with_context(|| format!("resolving selected particle resource {name:?}"))?;
+            if watch
+                .particle
+                .get("effects")
+                .and_then(serde_json::Value::as_array)
+                .is_some()
+            {
+                runtime.bind_particle_effect_names(&names)?;
+            }
+        } else if particles_enabled
+            && watch
+                .particle
+                .get("effects")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|bindings| !bindings.is_empty())
+        {
+            bail!("engine declares particle effects but no particle resource was selected");
+        }
+        if let Some(name) = background_name {
+            let quad = formats::load_background_runtime_quad(
+                resources_path,
+                name,
+                f64::from(width) / f64::from(height),
+            )
+            .with_context(|| format!("resolving selected background resource {name:?}"))?;
+            runtime.set_runtime_background_quad(quad)?;
+        }
+        Ok(Self { stepper })
+    }
+
+    pub fn advance_global_frame(&mut self, frame_index: u64) -> Result<FrameReport> {
+        self.stepper.advance_to(frame_index)
     }
 }
 
@@ -417,12 +551,36 @@ impl<'a> FrameSession<'a> {
             )?;
             runtime.set_runtime_background_quad(quad)?;
         }
-        Ok(Self {
-            stepper,
+        let atlas_identity_start = profile.then(std::time::Instant::now);
+        let (skin_atlas_identity, background_atlas_identity, particle_atlas_identity) =
+            if backend == crate::render::RenderBackend::Wgpu {
+                (
+                    Some(crate::gpu_render::atlas_identity(
+                        &skin.rgba,
+                        skin.width,
+                        skin.height,
+                    )),
+                    background.as_ref().map(|assets| {
+                        crate::gpu_render::atlas_identity(&assets.rgba, assets.width, assets.height)
+                    }),
+                    particles.as_ref().map(|assets| {
+                        crate::gpu_render::atlas_identity(&assets.rgba, assets.width, assets.height)
+                    }),
+                )
+            } else {
+                (None, None, None)
+            };
+        let atlas_identity_preparation = atlas_identity_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
+        let render = std::sync::Arc::new(FrameRenderResources {
             skin,
+            skin_atlas_identity,
             background,
+            background_atlas_identity,
             bindings,
             particles,
+            particle_atlas_identity,
             particle_bindings,
             particles_enabled,
             ui,
@@ -436,32 +594,38 @@ impl<'a> FrameSession<'a> {
             } else {
                 None
             },
+        });
+        Ok(Self {
+            stepper,
+            render,
             profile,
             runtime_construction,
+            atlas_identity_preparation,
         })
+    }
+
+    pub(crate) fn render_resources(&self) -> std::sync::Arc<FrameRenderResources> {
+        self.render.clone()
     }
 
     /// Advance the deterministic host at every frame from level time zero.
     /// The returned buffer is tightly packed top-to-bottom RGB24.
     pub fn render_global_frame(&mut self, frame_index: u64) -> Result<RenderedFrame> {
+        let prepared = self.prepare_global_frame(frame_index)?;
+        render_prepared_frame(self.render.clone(), self.profile, prepared)
+    }
+
+    pub(crate) fn prepare_global_frame(&mut self, frame_index: u64) -> Result<PreparedFrame> {
         let total_start = self.profile.then(std::time::Instant::now);
         let vm_start = self.profile.then(std::time::Instant::now);
         let report = self.stepper.advance_to(frame_index)?;
         let vm = vm_start.map(|t| t.elapsed()).unwrap_or_default();
         let preparation_start = self.profile.then(std::time::Instant::now);
-        let quad: [[f64; 2]; 4] = report
-            .runtime_background_quad
-            .chunks_exact(2)
-            .map(|xy| [xy[0], xy[1]])
-            .collect::<Vec<_>>()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Runtime Background quad has invalid length"))?;
-        let background = self.background.as_ref().map(|assets| (assets, quad));
-        let particle_draws = if self.particles_enabled {
-            if let Some(assets) = &self.particles {
+        let particle_draws = if self.render.particles_enabled {
+            if let Some(assets) = &self.render.particles {
                 Some(crate::particles::render_instances(
                     assets,
-                    &self.particle_bindings,
+                    &self.render.particle_bindings,
                     &self
                         .stepper
                         .runtime_mut()
@@ -481,144 +645,242 @@ impl<'a> FrameSession<'a> {
         } else {
             None
         };
+        let timeline = report.timeline.unwrap_or(0.0);
+        let ui_values = resolve_ui_values(
+            &self.render,
+            timeline,
+            &self.stepper.runtime_mut().global_memory,
+        )?;
         let preparation = preparation_start.map(|t| t.elapsed()).unwrap_or_default();
-        let render_start = self.profile.then(std::time::Instant::now);
-        let mut gpu_profile = self
-            .profile
-            .then(crate::gpu_render::GpuFrameProfile::default);
-        let mut ppm = match self.backend {
-            crate::render::RenderBackend::Cpu => report
-                .display_list
-                .render_skin_ppm_with_runtime_transform_and_background(
-                    self.width,
-                    self.height,
-                    f64::from(self.width) / f64::from(self.height),
-                    &self.skin,
-                    &self.bindings,
-                    &report.runtime_skin_transform,
-                    background,
-                )?,
-            crate::render::RenderBackend::Wgpu => crate::gpu_render::render_display_list(
-                self.gpu
-                    .as_ref()
-                    .context("wgpu backend was not initialized")?,
-                &report.display_list,
-                self.width,
-                self.height,
-                f64::from(self.width) / f64::from(self.height),
-                &self.skin,
-                &self.bindings,
-                &report.runtime_skin_transform,
-                background,
-                self.particles
-                    .as_ref()
-                    .zip(particle_draws.as_deref())
-                    .map(|(assets, draws)| (assets, draws, &report.runtime_particle_transform)),
-                gpu_profile.as_mut(),
-            )?,
-        };
-        if self.backend == crate::render::RenderBackend::Cpu {
-            if let (Some(assets), Some(draws)) = (&self.particles, particle_draws.as_deref()) {
-                let mut rgb = ppm_rgb_payload(&ppm, self.width, self.height)?;
-                DisplayList::composite_particle_sprites(
-                    &mut rgb,
-                    self.width,
-                    self.height,
-                    f64::from(self.width) / f64::from(self.height),
-                    assets,
-                    draws,
-                    &report.runtime_particle_transform,
-                )?;
-                ppm = rgb_to_ppm(&rgb, self.width, self.height);
-            }
-        }
-        let cpu_render = render_start.map(|t| t.elapsed()).unwrap_or_default();
-        let ui_start = self.profile.then(std::time::Instant::now);
-        if self.ui.enabled {
-            let mut rgb = ppm_rgb_payload(&ppm, self.width, self.height)?;
-            let timeline = report.timeline.unwrap_or(0.0);
-            let memory = &self.stepper.runtime_mut().global_memory;
-            crate::render_ui::render_overlay(
-                &mut rgb,
-                self.width,
-                self.height,
-                timeline,
-                self.ui_segment_start,
-                self.ui_segment_duration,
-                &self.ui,
-                |provider| match provider {
-                    crate::render_ui::UiValueProvider::Fixed { value }
-                    | crate::render_ui::UiValueProvider::External { value } => Ok(*value),
-                    crate::render_ui::UiValueProvider::Memory { block_id, index } => {
-                        Ok(memory.get(*block_id, *index))
-                    }
-                    crate::render_ui::UiValueProvider::Progress => {
-                        Ok(if self.ui_segment_duration > 0.0 {
-                            ((timeline - self.ui_segment_start) / self.ui_segment_duration)
-                                .clamp(0.0, 1.0)
-                        } else {
-                            0.0
-                        })
-                    }
-                    crate::render_ui::UiValueProvider::EngineMetric { key } => {
-                        anyhow::bail!(
-                            "engine metric provider {key:?} has no authoritative Watch source"
-                        )
-                    }
-                    crate::render_ui::UiValueProvider::Accuracy => {
-                        anyhow::bail!(
-                            "accuracy provider is unsupported without a verified Watch source"
-                        )
-                    }
-                    crate::render_ui::UiValueProvider::JudgmentDerived { mapping } => {
-                        anyhow::bail!("judgment-derived provider {mapping:?} requires a caller-supplied implementation")
-                    }
-                },
-            )?;
-            ppm = rgb_to_ppm(&rgb, self.width, self.height);
-        }
-        let runtime_ui = ui_start.map(|t| t.elapsed()).unwrap_or_default();
-        let framebuffer_copy_start = self.profile.then(std::time::Instant::now);
-        let rgb = ppm_rgb_payload(&ppm, self.width, self.height)?;
-        let framebuffer_copy = framebuffer_copy_start
-            .map(|t| t.elapsed())
-            .unwrap_or_default();
-        let runtime_construction = std::mem::take(&mut self.runtime_construction);
-        let profile = total_start.map(|t| FrameStageProfile {
+        Ok(PreparedFrame {
+            report,
+            particle_draws,
+            ui_values,
             vm,
             preparation,
-            cpu_render,
-            runtime_ui,
-            total: t.elapsed(),
-            entities: report.runtime_entity_count,
-            skin_draws: report.display_list.sprites.len(),
-            particle_draws: particle_draws.as_ref().map_or(0, Vec::len),
-            gpu_encode_submit: gpu_profile
-                .as_ref()
-                .map_or(std::time::Duration::ZERO, |p| p.encode_submit),
-            gpu_draw_preparation: gpu_profile
-                .as_ref()
-                .map_or(std::time::Duration::ZERO, |p| p.draw_preparation),
-            gpu_wait_map: gpu_profile
-                .as_ref()
-                .map_or(std::time::Duration::ZERO, |p| p.wait_map),
-            framebuffer_unpack: gpu_profile
-                .as_ref()
-                .map_or(std::time::Duration::ZERO, |p| p.unpack),
-            framebuffer_copy,
-            gpu_draw_calls: gpu_profile.as_ref().map_or(0, |p| p.draw_calls),
-            atlas_uploads: gpu_profile.as_ref().map_or(0, |p| p.atlas_uploads),
-            readback_bytes: gpu_profile.as_ref().map_or(0, |p| p.readback_bytes),
-            adapter: gpu_profile.and_then(|p| p.adapter),
-            runtime: report.runtime_profile.clone(),
-            runtime_construction,
-        });
-        Ok(RenderedFrame {
-            report,
-            rgb,
-            profile,
+            total_start,
+            runtime_construction: std::mem::take(&mut self.runtime_construction),
+            atlas_identity_preparation: std::mem::take(&mut self.atlas_identity_preparation),
         })
     }
+}
+
+fn resolve_ui_values(
+    resources: &FrameRenderResources,
+    timeline: f64,
+    memory: &crate::runtime::Memory,
+) -> Result<Vec<f64>> {
+    let ui = &resources.ui;
+    if !ui.enabled {
+        return Ok(Vec::new());
+    }
+    ui.validate()?;
+    let mut values = Vec::with_capacity(4);
+    for (enabled, provider) in [
+        (ui.primary_metric.enabled, &ui.primary_metric.provider),
+        (ui.secondary_metric.enabled, &ui.secondary_metric.provider),
+        (ui.combo.enabled, &ui.combo.provider),
+        (ui.judgment.enabled, &ui.judgment.provider),
+    ] {
+        if !enabled {
+            continue;
+        }
+        let value = match provider {
+            crate::render_ui::UiValueProvider::Fixed { value }
+            | crate::render_ui::UiValueProvider::External { value } => *value,
+            crate::render_ui::UiValueProvider::Memory { block_id, index } => {
+                memory.get(*block_id, *index)
+            }
+            crate::render_ui::UiValueProvider::Progress => {
+                if resources.ui_segment_duration > 0.0 {
+                    ((timeline - resources.ui_segment_start) / resources.ui_segment_duration)
+                        .clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            }
+            crate::render_ui::UiValueProvider::EngineMetric { key } => {
+                anyhow::bail!("engine metric provider {key:?} has no authoritative Watch source")
+            }
+            crate::render_ui::UiValueProvider::Accuracy => {
+                anyhow::bail!("accuracy provider is unsupported without a verified Watch source")
+            }
+            crate::render_ui::UiValueProvider::JudgmentDerived { mapping } => anyhow::bail!(
+                "judgment-derived provider {mapping:?} requires a caller-supplied implementation"
+            ),
+        };
+        values.push(value);
+    }
+    Ok(values)
+}
+
+pub(crate) fn render_prepared_frame(
+    resources: std::sync::Arc<FrameRenderResources>,
+    profile_enabled: bool,
+    prepared: PreparedFrame,
+) -> Result<RenderedFrame> {
+    let PreparedFrame {
+        report,
+        particle_draws,
+        ui_values,
+        vm,
+        preparation,
+        total_start,
+        runtime_construction,
+        atlas_identity_preparation,
+    } = prepared;
+    let render_start = profile_enabled.then(std::time::Instant::now);
+    let mut gpu_profile = profile_enabled.then(crate::gpu_render::GpuFrameProfile::default);
+    let backend_start = profile_enabled.then(std::time::Instant::now);
+    let quad = report
+        .runtime_background_quad
+        .chunks_exact(2)
+        .map(|xy| [xy[0], xy[1]])
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Runtime Background quad has invalid length"))?;
+    let background = resources.background.as_ref().map(|assets| (assets, quad));
+    let mut ppm = match resources.backend {
+        crate::render::RenderBackend::Cpu => report
+            .display_list
+            .render_skin_ppm_with_runtime_transform_and_background(
+                resources.width,
+                resources.height,
+                f64::from(resources.width) / f64::from(resources.height),
+                &resources.skin,
+                &resources.bindings,
+                &report.runtime_skin_transform,
+                background,
+            )?,
+        crate::render::RenderBackend::Wgpu => crate::gpu_render::render_display_list(
+            resources
+                .gpu
+                .as_ref()
+                .context("wgpu backend was not initialized")?,
+            &report.display_list,
+            resources.width,
+            resources.height,
+            f64::from(resources.width) / f64::from(resources.height),
+            &resources.skin,
+            resources
+                .skin_atlas_identity
+                .context("wgpu skin atlas identity was not initialized")?,
+            &resources.bindings,
+            &report.runtime_skin_transform,
+            background.map(|(assets, quad)| {
+                (
+                    assets,
+                    quad,
+                    resources
+                        .background_atlas_identity
+                        .expect("background identity follows loaded background"),
+                )
+            }),
+            resources
+                .particles
+                .as_ref()
+                .zip(particle_draws.as_deref())
+                .map(|(assets, draws)| {
+                    (
+                        assets,
+                        draws,
+                        &report.runtime_particle_transform,
+                        resources
+                            .particle_atlas_identity
+                            .expect("particle identity follows loaded particles"),
+                    )
+                }),
+            gpu_profile.as_mut(),
+        )?,
+    };
+    if resources.backend == crate::render::RenderBackend::Cpu {
+        if let (Some(assets), Some(draws)) = (&resources.particles, particle_draws.as_deref()) {
+            let mut rgb = ppm_rgb_payload(&ppm, resources.width, resources.height)?;
+            DisplayList::composite_particle_sprites(
+                &mut rgb,
+                resources.width,
+                resources.height,
+                f64::from(resources.width) / f64::from(resources.height),
+                assets,
+                draws,
+                &report.runtime_particle_transform,
+            )?;
+            ppm = rgb_to_ppm(&rgb, resources.width, resources.height);
+        }
+    }
+    let cpu_render = render_start.map(|t| t.elapsed()).unwrap_or_default();
+    let backend_wall = backend_start.map(|t| t.elapsed()).unwrap_or_default();
+    let ui_start = profile_enabled.then(std::time::Instant::now);
+    if resources.ui.enabled {
+        let mut rgb = ppm_rgb_payload(&ppm, resources.width, resources.height)?;
+        let mut values = ui_values.into_iter();
+        crate::render_ui::render_overlay(
+            &mut rgb,
+            resources.width,
+            resources.height,
+            report.timeline.unwrap_or(0.0),
+            resources.ui_segment_start,
+            resources.ui_segment_duration,
+            &resources.ui,
+            |_| Ok(values.next().unwrap_or(0.0)),
+        )?;
+        ppm = rgb_to_ppm(&rgb, resources.width, resources.height);
+    }
+    let runtime_ui = ui_start.map(|t| t.elapsed()).unwrap_or_default();
+    let framebuffer_copy_start = profile_enabled.then(std::time::Instant::now);
+    let rgb = ppm_rgb_payload(&ppm, resources.width, resources.height)?;
+    let framebuffer_copy = framebuffer_copy_start
+        .map(|t| t.elapsed())
+        .unwrap_or_default();
+    let profile = total_start.map(|_| FrameStageProfile {
+        vm,
+        preparation,
+        cpu_render,
+        backend_wall,
+        runtime_ui,
+        total: std::time::Duration::ZERO,
+        entities: report.runtime_entity_count,
+        skin_draws: report.display_list.sprites.len(),
+        particle_draws: particle_draws.as_ref().map_or(0, Vec::len),
+        gpu_encode_submit: gpu_profile.as_ref().map_or_default(|p| p.encode_submit),
+        gpu_draw_preparation: gpu_profile.as_ref().map_or_default(|p| p.draw_preparation),
+        gpu_render_target_setup: gpu_profile
+            .as_ref()
+            .map_or_default(|p| p.render_target_setup),
+        gpu_initial_rgba_conversion: gpu_profile
+            .as_ref()
+            .map_or_default(|p| p.initial_rgba_conversion),
+        gpu_initial_framebuffer_upload: gpu_profile
+            .as_ref()
+            .map_or_default(|p| p.initial_framebuffer_upload),
+        gpu_atlas_hashing: gpu_profile.as_ref().map_or_default(|p| p.atlas_hashing),
+        gpu_atlas_cache_upload: gpu_profile
+            .as_ref()
+            .map_or_default(|p| p.atlas_cache_upload),
+        gpu_readback_buffer_setup: gpu_profile
+            .as_ref()
+            .map_or_default(|p| p.readback_buffer_setup),
+        gpu_wait_map: gpu_profile.as_ref().map_or_default(|p| p.wait_map),
+        framebuffer_unpack: gpu_profile.as_ref().map_or_default(|p| p.unpack),
+        framebuffer_packaging: gpu_profile.as_ref().map_or_default(|p| p.ppm_packaging),
+        framebuffer_copy,
+        gpu_draw_calls: gpu_profile.as_ref().map_or(0, |p| p.draw_calls),
+        atlas_uploads: gpu_profile.as_ref().map_or(0, |p| p.atlas_uploads),
+        readback_bytes: gpu_profile.as_ref().map_or(0, |p| p.readback_bytes),
+        adapter: gpu_profile.and_then(|p| p.adapter),
+        runtime: report.runtime_profile.clone(),
+        runtime_construction,
+        atlas_identity_preparation,
+    });
+    let mut rendered = RenderedFrame {
+        report,
+        rgb,
+        profile,
+    };
+    if let (Some(start), Some(profile)) = (total_start, rendered.profile.as_mut()) {
+        profile.total = start.elapsed();
+    }
+    Ok(rendered)
 }
 
 fn rgb_to_ppm(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
@@ -707,6 +969,69 @@ pub fn hash_rgb(rgb: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_frame_keeps_particle_and_ui_snapshots_after_runtime_advances() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let package =
+            formats::load_engine(&repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"))
+                .unwrap();
+        let level = formats::load_level(&repo.join("TestingSuite/Next Sekai Engine/levels/Various Artists - Baumkuchen x Retry Now/Baumkuchen x Retry Now.json.gz")).unwrap();
+        let resources = repo.join("TestingSuite/Next Sekai Engine/skin/ProSeka Faithful 0.8.3.scp");
+        let defaults: BTreeMap<_, _> = package.metadata.resource_defaults().into_iter().collect();
+        let mut ui = crate::render_ui::RendererUiConfig::default();
+        ui.enabled = true;
+        ui.primary_metric.provider = crate::render_ui::UiValueProvider::Memory {
+            block_id: 0,
+            index: 0,
+        };
+        let make_session = || {
+            FrameSession::new_configured(
+                &package.watch,
+                &package.rom,
+                &package.configuration,
+                &level,
+                &resources,
+                defaults.get("skins").unwrap(),
+                defaults.get("backgrounds").map(String::as_str),
+                defaults.get("effects").map(String::as_str),
+                defaults.get("particles").map(String::as_str),
+                96,
+                54,
+                12,
+                &[(1, 10.8), (22, 1.0)],
+                true,
+                ui.clone(),
+                0.0,
+                10.0,
+                crate::render::RenderBackend::Cpu,
+                false,
+                false,
+            )
+            .unwrap()
+        };
+
+        let mut delayed = make_session();
+        delayed.stepper.runtime_mut().global_memory.set(0, 0, 0.25);
+        let prepared = delayed.prepare_global_frame(0).unwrap();
+        delayed.stepper.runtime_mut().global_memory.set(0, 0, 0.95);
+        let resources_snapshot = delayed.render_resources();
+        delayed.prepare_global_frame(1).unwrap();
+        let delayed_frame = render_prepared_frame(resources_snapshot, false, prepared).unwrap();
+
+        let mut reference = make_session();
+        reference
+            .stepper
+            .runtime_mut()
+            .global_memory
+            .set(0, 0, 0.25);
+        let reference_frame = reference.render_global_frame(0).unwrap();
+        assert_eq!(hash_rgb(&delayed_frame.rgb), hash_rgb(&reference_frame.rgb));
+        assert_eq!(
+            hash_draw_commands(&delayed_frame.report.display_list),
+            hash_draw_commands(&reference_frame.report.display_list)
+        );
+    }
 
     #[test]
     fn frame_range_uses_global_indices_and_exact_rational_times() {

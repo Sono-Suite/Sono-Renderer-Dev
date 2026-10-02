@@ -5,7 +5,10 @@ use crate::runtime::{
 };
 use crate::{
     ffmpeg,
-    offline::{hash_draw_commands, hash_rgb, AudioWindow, FrameRange, FrameSession, RenderedFrame},
+    offline::{
+        hash_draw_commands, hash_rgb, AudioWindow, EventSession, FrameRange, FrameSession,
+        PreparedFrame, RenderedFrame,
+    },
     render::RenderConfig,
 };
 use anyhow::{bail, Context, Result};
@@ -14,9 +17,10 @@ use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -31,11 +35,45 @@ pub struct ExportReport {
     pub timeline_end: f64,
     pub bgm_offset: f64,
     pub audio_window: AudioWindow,
-    pub deterministic_frame_hashes_match: bool,
-    pub first_pass_hash: String,
+    pub sfx_event_sha1: String,
+    pub sfx_event_counts: SfxEventCounts,
+    pub event_pass_runtime_frames: u64,
+    pub event_pass_callbacks: u64,
+    pub event_pass_evaluations: u64,
+    pub stream_runtime_frames: u64,
+    pub stream_callbacks: u64,
+    pub stream_evaluations: u64,
+    pub concurrent_sfx_prepass_used: bool,
+    pub rgb_spool_bytes: u64,
+    pub frame_pipeline: Option<FramePipelineStats>,
+    pub deterministic_frame_hashes_match: Option<bool>,
+    pub first_pass_hash: Option<String>,
     pub second_pass_hash: String,
     pub frame_diagnostics: Vec<FrameDiagnostic>,
     pub probe: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FramePipelineStats {
+    pub queue_capacity: usize,
+    pub queue_high_water: usize,
+    pub producer_watch_ms: f64,
+    pub producer_snapshot_ms: f64,
+    pub producer_blocked_ms: f64,
+    pub queue_residence_ms: f64,
+    pub consumer_waiting_ms: f64,
+    pub render_ms: f64,
+    pub output_ms: f64,
+    pub first_frame_latency_ms: f64,
+    pub render_phase_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct SfxEventCounts {
+    pub audio_events: u64,
+    pub scheduled_effects: u64,
+    pub loop_starts: u64,
+    pub loop_stops: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,6 +87,7 @@ pub struct FrameDiagnostic {
     pub timescale: f64,
     pub callback_count: usize,
     pub vm_evaluations: u64,
+    pub runtime_frame_count: u64,
     pub runtime_entity_count: usize,
     pub active_entity_count: usize,
     pub draw_count: usize,
@@ -103,7 +142,29 @@ pub struct ExportRequest<'a> {
     pub backend: crate::render::RenderBackend,
     pub profile: bool,
     pub profile_frames: bool,
+    pub validate_determinism: bool,
+    pub concurrent_sfx_prepass: bool,
+    pub frame_pipeline: bool,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrepassPlan {
+    None,
+    EventsOnly,
+    FullValidation,
+}
+
+fn prepass_plan(sfx_enabled: bool, validate_determinism: bool) -> PrepassPlan {
+    if validate_determinism {
+        PrepassPlan::FullValidation
+    } else if sfx_enabled {
+        PrepassPlan::EventsOnly
+    } else {
+        PrepassPlan::None
+    }
+}
+
+const MAX_CONCURRENT_RGB_SPOOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 pub fn export_config(config: &RenderConfig) -> Result<ExportReport> {
     let output = config
@@ -139,6 +200,9 @@ pub fn export_config(config: &RenderConfig) -> Result<ExportReport> {
         backend: config.backend,
         profile: config.profile,
         profile_frames: config.profile_frames,
+        validate_determinism: config.validate_determinism,
+        concurrent_sfx_prepass: config.concurrent_sfx_prepass,
+        frame_pipeline: config.frame_pipeline,
     })
 }
 
@@ -241,26 +305,141 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
             request.trace_entity_id.is_some(),
         )
     };
-    let initial_session = make_session()?;
-    if let Some(p) = profile.as_mut() {
+    let plan = prepass_plan(request.sfx_enabled, request.validate_determinism);
+    let rgb_spool_bytes = range
+        .frame_count
+        .checked_mul(u64::from(request.width))
+        .and_then(|bytes| bytes.checked_mul(u64::from(request.height)))
+        .and_then(|bytes| bytes.checked_mul(3))
+        .context("concurrent RGB spool size overflows")?;
+    let concurrent_sfx_prepass_used = plan == PrepassPlan::EventsOnly
+        && request.concurrent_sfx_prepass
+        && !request.frame_pipeline
+        && rgb_spool_bytes <= MAX_CONCURRENT_RGB_SPOOL_BYTES;
+    if plan == PrepassPlan::EventsOnly
+        && request.concurrent_sfx_prepass
+        && !request.frame_pipeline
+        && !concurrent_sfx_prepass_used
+    {
+        eprintln!(
+            "warning: concurrent SFX export needs {rgb_spool_bytes} bytes of temporary RGB storage (limit {MAX_CONCURRENT_RGB_SPOOL_BYTES}); using sequential SFX event collection"
+        );
+    }
+    let mut expected_frames = None;
+    let mut concurrent_output: Option<(Vec<FrameDiagnostic>, tempfile::NamedTempFile)> = None;
+    let mut audio_requests = empty_audio_requests();
+    let mut event_pass_runtime_frames = 0;
+    let mut event_pass_callbacks = 0;
+    let mut event_pass_evaluations = 0;
+    if plan == PrepassPlan::FullValidation {
+        let initialization = make_session()?;
+        if let Some(p) = profile.as_mut() {
+            p.record(
+                "Validation session initialization",
+                startup_start.map_or(Duration::ZERO, |t| t.elapsed()),
+            );
+        }
+        let preflight_start = request.profile.then(Instant::now);
+        let frames = render_diagnostic_pass(
+            initialization,
+            range,
+            &package.watch,
+            request.trace_entity_id,
+            profile.as_mut(),
+        )?;
+        if let Some(p) = profile.as_mut() {
+            let elapsed = preflight_start.map_or(Duration::ZERO, |t| t.elapsed());
+            p.record("Full determinism validation preflight", elapsed);
+            p.record_preflight_wrapper(elapsed);
+        }
+        audio_requests = collect_audio_requests(&frames);
+        expected_frames = Some(frames);
+    } else if let Some(p) = profile.as_mut() {
         p.record(
             "Initialization/startup",
             startup_start.map_or(Duration::ZERO, |t| t.elapsed()),
         );
     }
-    let preflight_start = request.profile.then(Instant::now);
-    let expected_frames = render_diagnostic_pass(
-        initial_session,
-        range,
-        &package.watch,
-        request.trace_entity_id,
-        profile.as_mut(),
-    )?;
-    if let Some(p) = profile.as_mut() {
-        p.record(
-            "Determinism preflight",
-            preflight_start.map_or(Duration::ZERO, |t| t.elapsed()),
-        );
+    if plan == PrepassPlan::EventsOnly {
+        let prepass_start = request.profile.then(Instant::now);
+        let event_session = EventSession::new_configured(
+            &package.watch,
+            &package.rom,
+            &package.configuration,
+            &level,
+            request.resources,
+            skin_name,
+            background_name,
+            effect_name,
+            particle_name,
+            request.width,
+            request.height,
+            request.fps,
+            request.level_option_overrides,
+            request.particles_enabled,
+            request.profile,
+            request.trace_entity_id.is_some(),
+        )?;
+        if concurrent_sfx_prepass_used {
+            let session_start = request.profile.then(Instant::now);
+            let stream_session = make_session()?;
+            if let Some(p) = profile.as_mut() {
+                p.record(
+                    "Concurrent session initialization",
+                    session_start.map_or(Duration::ZERO, |start| start.elapsed()),
+                );
+            }
+            let ConcurrentStreamOutput {
+                events,
+                frames,
+                spool,
+                profile: stream_profile,
+            } = concurrent_event_and_render(
+                event_session,
+                stream_session,
+                range,
+                &package.watch,
+                request.trace_entity_id,
+                profile.take(),
+                request.profile,
+            )?;
+            audio_requests = events.requests;
+            event_pass_runtime_frames = events.runtime_frames;
+            event_pass_callbacks = events.callbacks;
+            event_pass_evaluations = events.evaluations;
+            profile = stream_profile;
+            if let Some(p) = profile.as_mut() {
+                for (runtime, wall) in &events.profiles {
+                    p.record_event_only(runtime, *wall);
+                }
+                p.record("SFX event-only worker wall", events.elapsed);
+                p.record(
+                    "Concurrent SFX/render wall",
+                    prepass_start.map_or(Duration::ZERO, |s| s.elapsed()),
+                );
+            }
+            concurrent_output = Some((frames, spool));
+        } else {
+            let output = collect_event_only_requests(
+                event_session,
+                range,
+                request.profile,
+                &AtomicU8::new(0),
+            )?;
+            audio_requests = output.requests;
+            event_pass_runtime_frames = output.runtime_frames;
+            event_pass_callbacks = output.callbacks;
+            event_pass_evaluations = output.evaluations;
+            if let Some(p) = profile.as_mut() {
+                for (runtime, wall) in &output.profiles {
+                    p.record_event_only(runtime, *wall);
+                }
+                p.record(
+                    "SFX runtime/event-only prepass",
+                    prepass_start.map_or(Duration::ZERO, |s| s.elapsed()),
+                );
+            }
+        }
     }
     let audio_start = request.profile.then(Instant::now);
     let effect_assets = request
@@ -278,7 +457,9 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
     } else {
         std::collections::BTreeMap::new()
     };
-    let (events, scheduled, loop_starts, loop_stops) = collect_audio_requests(&expected_frames);
+    let sfx_event_sha1 = hash_audio_requests(&audio_requests)?;
+    let sfx_event_counts = count_audio_requests(&audio_requests);
+    let (events, scheduled, loop_starts, loop_stops) = audio_requests;
     let effect_mix = if request.sfx_enabled {
         crate::audio::mix_effects_wav(
             &effect_assets,
@@ -300,12 +481,14 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         eprintln!("warning: {warning}");
     }
     let effect_audio = effect_mix.wav;
-    let first_pass_hash = hash_sequence(
-        &expected_frames
-            .iter()
-            .map(|frame| frame.rgb_sha1.clone())
-            .collect::<Vec<_>>(),
-    );
+    let first_pass_hash = expected_frames.as_ref().map(|frames| {
+        hash_sequence(
+            &frames
+                .iter()
+                .map(|frame| frame.rgb_sha1.clone())
+                .collect::<Vec<_>>(),
+        )
+    });
     if let Some(p) = profile.as_mut() {
         p.record(
             "Audio/SFX preparation",
@@ -329,9 +512,12 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         &format!("{}x{}", request.width, request.height),
         "-framerate",
         &request.fps.to_string(),
-        "-i",
-        "pipe:0",
     ]);
+    if let Some((_, spool)) = concurrent_output.as_ref() {
+        command.arg("-i").arg(spool.path());
+    } else {
+        command.args(["-i", "pipe:0"]);
+    }
     if request.bgm_enabled {
         command.arg("-i").arg(request.music);
     }
@@ -376,10 +562,21 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         command.args(["-c:a", "aac", "-b:a", "192k"]);
     }
     command.arg(&request.output);
+    // Drain FFmpeg diagnostics to a file so a noisy failure cannot fill a
+    // stderr pipe while the render worker is blocked writing video frames.
+    let mut ffmpeg_stderr_capture =
+        tempfile::tempfile().context("creating temporary FFmpeg diagnostic capture")?;
+    let ffmpeg_stderr_writer = ffmpeg_stderr_capture
+        .try_clone()
+        .context("cloning FFmpeg diagnostic capture handle")?;
     let mut child = command
-        .stdin(Stdio::piped())
+        .stdin(if concurrent_output.is_some() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(ffmpeg_stderr_writer))
         .spawn()
         .with_context(|| format!("launching FFmpeg at {}", installation.ffmpeg.display()))?;
     if let Some(p) = profile.as_mut() {
@@ -389,43 +586,126 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         );
     }
 
-    let streaming_session_start = request.profile.then(Instant::now);
-    let streaming_session = make_session()?;
-    if let Some(p) = profile.as_mut() {
-        p.record(
-            "Streaming session initialization",
-            streaming_session_start.map_or(Duration::ZERO, |t| t.elapsed()),
-        );
-        p.begin_render();
-    }
-
-    let stdin = child
-        .stdin
-        .take()
-        .context("FFmpeg process did not expose its raw-video input")?;
-    let actual_frames = match stream_frames(
-        streaming_session,
-        range,
-        stdin,
-        &expected_frames,
-        &package.watch,
-        request.trace_entity_id,
-        profile.as_mut(),
-    ) {
-        Ok(frames) => frames,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error).context("streaming deterministic RGB frames to FFmpeg");
+    let mut frame_pipeline_stats = None;
+    let (actual_frames, _spool_guard) = if let Some((frames, spool)) = concurrent_output.take() {
+        (frames, Some(spool))
+    } else {
+        let streaming_session_start = request.profile.then(Instant::now);
+        let streaming_session = make_session()?;
+        if let Some(p) = profile.as_mut() {
+            p.record(
+                "Streaming session initialization",
+                streaming_session_start.map_or(Duration::ZERO, |t| t.elapsed()),
+            );
+            p.begin_render();
         }
+        let stdin = child
+            .stdin
+            .take()
+            .context("FFmpeg process did not expose its raw-video input")?;
+        let frames = if request.frame_pipeline {
+            match stream_frames_pipelined(
+                streaming_session,
+                range,
+                stdin,
+                expected_frames.as_deref(),
+                &package.watch,
+                request.trace_entity_id,
+                request.profile,
+            ) {
+                Ok(result) => {
+                    frame_pipeline_stats = Some(result.stats.clone());
+                    if let Some(p) = profile.as_mut() {
+                        p.set_pipeline_steady_window(
+                            range.frame_count.saturating_sub(1),
+                            Duration::from_secs_f64(
+                                (result.stats.render_phase_ms
+                                    - result.stats.first_frame_latency_ms)
+                                    .max(0.0)
+                                    / 1000.0,
+                            ),
+                        );
+                        eprintln!("Pipeline stage totals overlap across frames; render includes nested raster/GPU wait/readback/unpack/UI. Producer blocked time and queue residence are correlated and must not be summed.");
+                        for record in &result.records {
+                            if let Some(frame_profile) = record.profile.as_ref() {
+                                p.record_frame(
+                                    "stream",
+                                    record.global_index,
+                                    record.timeline,
+                                    frame_profile,
+                                    record.diagnostics,
+                                    record.output,
+                                    record.wall,
+                                    "FFmpeg handoff",
+                                );
+                                p.finish_stream_frame_profile(
+                                    record.wall,
+                                    Duration::ZERO,
+                                    frame_profile.total,
+                                    record.diagnostics,
+                                    record.output,
+                                );
+                            }
+                        }
+                        eprintln!(
+                            "Frame pipeline: queue capacity {}/{}, Watch {:.1}ms, snapshot {:.1}ms, producer blocked {:.1}ms, queue residence {:.1}ms, consumer waiting {:.1}ms, render {:.1}ms, FFmpeg output {:.1}ms, first-frame latency {:.1}ms",
+                            result.stats.queue_high_water,
+                            result.stats.queue_capacity,
+                            result.stats.producer_watch_ms,
+                            result.stats.producer_snapshot_ms,
+                            result.stats.producer_blocked_ms,
+                            result.stats.queue_residence_ms,
+                            result.stats.consumer_waiting_ms,
+                            result.stats.render_ms,
+                            result.stats.output_ms,
+                            result.stats.first_frame_latency_ms,
+                        );
+                    }
+                    result.diagnostics
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error).context("streaming pipelined RGB frames to FFmpeg");
+                }
+            }
+        } else {
+            match stream_frames(
+                streaming_session,
+                range,
+                stdin,
+                expected_frames.as_deref(),
+                &package.watch,
+                request.trace_entity_id,
+                profile.as_mut(),
+                "FFmpeg handoff",
+                "FFmpeg final input flush/close",
+                None,
+            ) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error).context("streaming deterministic RGB frames to FFmpeg");
+                }
+            }
+        };
+        if let Some(p) = profile.as_mut() {
+            p.finish_render();
+        }
+        (frames, None)
     };
-    if let Some(p) = profile.as_mut() {
-        p.finish_render();
-    }
     let finalize_start = request.profile.then(Instant::now);
     let output = child
         .wait_with_output()
         .context("waiting for FFmpeg export")?;
+    ffmpeg_stderr_capture
+        .seek(SeekFrom::Start(0))
+        .context("rewinding FFmpeg diagnostic capture")?;
+    let mut ffmpeg_stderr = String::new();
+    ffmpeg_stderr_capture
+        .read_to_string(&mut ffmpeg_stderr)
+        .context("reading FFmpeg diagnostic capture")?;
     if let Some(p) = profile.as_mut() {
         p.record(
             "FFmpeg finalization",
@@ -436,7 +716,7 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         bail!(
             "FFmpeg failed with status {:?}: {}",
             output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            ffmpeg_stderr.trim()
         );
     }
     let probe_start = request.profile.then(Instant::now);
@@ -485,13 +765,18 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
             .map(|frame| frame.rgb_sha1.clone())
             .collect::<Vec<_>>(),
     );
-    let deterministic_frame_hashes_match =
-        expected_frames
-            .iter()
-            .zip(&actual_frames)
-            .all(|(first, second)| {
-                first.raw_draw_sha1 == second.raw_draw_sha1 && first.rgb_sha1 == second.rgb_sha1
-            });
+    let stream_runtime_frames = actual_frames
+        .iter()
+        .map(|frame| frame.runtime_frame_count)
+        .sum();
+    let stream_callbacks = actual_frames
+        .iter()
+        .map(|frame| frame.callback_count as u64)
+        .sum();
+    let stream_evaluations = actual_frames.iter().map(|frame| frame.vm_evaluations).sum();
+    let deterministic_frame_hashes_match = expected_frames
+        .as_ref()
+        .map(|expected| compare_frame_diagnostics(expected, &actual_frames));
     if let (Some(p), Some(start)) = (profile.as_mut(), export_start) {
         p.record("Total export", start.elapsed());
         p.print(start.elapsed());
@@ -509,6 +794,21 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         timeline_end: range.time(range.first_index + range.frame_count),
         bgm_offset,
         audio_window: audio,
+        sfx_event_sha1,
+        sfx_event_counts,
+        event_pass_runtime_frames,
+        event_pass_callbacks,
+        event_pass_evaluations,
+        stream_runtime_frames,
+        stream_callbacks,
+        stream_evaluations,
+        concurrent_sfx_prepass_used,
+        rgb_spool_bytes: if concurrent_sfx_prepass_used {
+            rgb_spool_bytes
+        } else {
+            0
+        },
+        frame_pipeline: frame_pipeline_stats,
         deterministic_frame_hashes_match,
         first_pass_hash,
         second_pass_hash,
@@ -526,20 +826,25 @@ fn render_diagnostic_pass(
 ) -> Result<Vec<FrameDiagnostic>> {
     (0..range.frame_count)
         .map(|segment_index| {
+            let loop_start = profile.as_ref().map(|_| Instant::now());
             let frame_index = range.index(segment_index)?;
             let frame = session.render_global_frame(frame_index)?;
-            if let (Some(p), Some(frame_profile)) = (profile.as_deref_mut(), frame.profile.as_ref())
-            {
-                p.record_preflight(frame_profile);
-            }
-            Ok(frame_diagnostic(
+            let diagnostic_start = profile.as_ref().map(|_| Instant::now());
+            let diagnostic = frame_diagnostic(
                 segment_index,
                 frame_index,
                 range.time(frame_index),
                 &frame,
                 watch,
                 target_entity_id,
-            ))
+            );
+            let diagnostic_time = diagnostic_start.map_or(Duration::ZERO, |start| start.elapsed());
+            if let (Some(p), Some(frame_profile), Some(start)) =
+                (profile.as_deref_mut(), frame.profile.as_ref(), loop_start)
+            {
+                p.record_preflight(frame_profile, diagnostic_time, start.elapsed());
+            }
+            Ok(diagnostic)
         })
         .collect()
 }
@@ -548,17 +853,23 @@ fn stream_frames(
     mut session: FrameSession<'_>,
     range: FrameRange,
     mut stdin: impl Write,
-    expected_frames: &[FrameDiagnostic],
+    expected_frames: Option<&[FrameDiagnostic]>,
     watch: &crate::watch::WatchData,
     target_entity_id: Option<usize>,
     profile: Option<&mut crate::profiling::ProfileCollector>,
+    handoff_label: &'static str,
+    flush_label: &'static str,
+    cancellation: Option<&AtomicU8>,
 ) -> Result<Vec<FrameDiagnostic>> {
-    if expected_frames.len() != range.frame_count as usize {
-        bail!("determinism preflight returned an unexpected number of frames");
+    if expected_frames.is_some_and(|frames| frames.len() != range.frame_count as usize) {
+        bail!("determinism validation returned an unexpected number of frames");
     }
-    let mut actual_frames = Vec::with_capacity(expected_frames.len());
+    let mut actual_frames = Vec::with_capacity(range.frame_count as usize);
     let mut profile = profile;
-    for (segment_index, expected) in expected_frames.iter().enumerate() {
+    for segment_index in 0..range.frame_count as usize {
+        if cancellation.is_some_and(|token| token.load(Ordering::Acquire) != 0) {
+            bail!("stream rendering cancelled after concurrent SFX prepass failure");
+        }
         let frame_wall = profile.as_ref().map(|_| Instant::now());
         let global_index = range.index(segment_index as u64)?;
         let frame = session.render_global_frame(global_index)?;
@@ -572,37 +883,311 @@ fn stream_frames(
             watch,
             target_entity_id,
         );
-        if diagnostic.raw_draw_sha1 != expected.raw_draw_sha1
-            || diagnostic.rgb_sha1 != expected.rgb_sha1
-        {
-            bail!("frame {global_index} changed between deterministic passes");
+        if let Some(expected) = expected_frames.map(|frames| &frames[segment_index]) {
+            if !frame_hashes_match(expected, &diagnostic) {
+                bail!("frame {global_index} changed between deterministic passes");
+            }
         }
-        if let (Some(start), Some(p)) = (diagnostic_start, profile.as_deref_mut()) {
-            p.record("Frame diagnostics/hash", start.elapsed());
-        }
+        let diagnostic_time = diagnostic_start.map_or(Duration::ZERO, |start| start.elapsed());
         let handoff_start = profile.as_ref().map(|_| Instant::now());
         stdin
             .write_all(&frame.rgb)
-            .with_context(|| format!("writing raw RGB frame {global_index} to FFmpeg"))?;
-        if let (Some(start), Some(p), Some(frame_profile)) = (
-            handoff_start,
-            profile.as_deref_mut(),
-            frame_profile.as_ref(),
-        ) {
+            .with_context(|| format!("writing raw RGB frame {global_index} to export output"))?;
+        let handoff_time = handoff_start.map_or(Duration::ZERO, |start| start.elapsed());
+        actual_frames.push(diagnostic);
+        if let (Some(start), Some(p), Some(frame_profile)) =
+            (frame_wall, profile.as_deref_mut(), frame_profile.as_ref())
+        {
+            let bookkeeping_start = Instant::now();
             p.record_frame(
                 "stream",
                 global_index,
                 range.time(global_index),
                 frame_profile,
+                diagnostic_time,
+                handoff_time,
                 start.elapsed(),
-                frame_wall.map_or(frame_profile.total, |t| t.elapsed()),
+                handoff_label,
+            );
+            let bookkeeping = bookkeeping_start.elapsed();
+            p.finish_stream_frame_profile(
+                start.elapsed(),
+                bookkeeping,
+                frame_profile.total,
+                diagnostic_time,
+                handoff_time,
             );
         }
-        actual_frames.push(diagnostic);
     }
+    let flush_start = profile.as_ref().map(|_| Instant::now());
     stdin.flush().context("flushing raw RGB frames to FFmpeg")?;
     drop(stdin);
+    if let (Some(start), Some(p)) = (flush_start, profile.as_deref_mut()) {
+        p.record(flush_label, start.elapsed());
+    }
     Ok(actual_frames)
+}
+
+fn frame_hashes_match(first: &FrameDiagnostic, second: &FrameDiagnostic) -> bool {
+    first.raw_draw_sha1 == second.raw_draw_sha1 && first.rgb_sha1 == second.rgb_sha1
+}
+
+const FRAME_QUEUE_CAPACITY: usize = 2;
+
+struct PreparedJob {
+    local_index: u64,
+    global_index: u64,
+    timeline: f64,
+    ready_at: Instant,
+    frame: PreparedFrame,
+}
+
+struct PipelineFrameRecord {
+    global_index: u64,
+    timeline: f64,
+    profile: Option<crate::offline::FrameStageProfile>,
+    diagnostics: Duration,
+    output: Duration,
+    wall: Duration,
+}
+
+struct PipelineWorkerResult {
+    diagnostics: Vec<FrameDiagnostic>,
+    records: Vec<PipelineFrameRecord>,
+    consumer_waiting: Duration,
+    queue_residence: Duration,
+    render: Duration,
+    output: Duration,
+    first_frame_latency: Duration,
+}
+
+struct PipelineResult {
+    diagnostics: Vec<FrameDiagnostic>,
+    stats: FramePipelineStats,
+    records: Vec<PipelineFrameRecord>,
+}
+
+fn stream_frames_pipelined(
+    mut session: FrameSession<'_>,
+    range: FrameRange,
+    mut stdin: impl Write + Send,
+    expected_frames: Option<&[FrameDiagnostic]>,
+    watch: &crate::watch::WatchData,
+    target_entity_id: Option<usize>,
+    profile_enabled: bool,
+) -> Result<PipelineResult> {
+    if expected_frames.is_some_and(|frames| frames.len() != range.frame_count as usize) {
+        bail!("determinism validation returned an unexpected number of frames");
+    }
+    let resources = session.render_resources();
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<PreparedJob>(FRAME_QUEUE_CAPACITY);
+    let outstanding = AtomicUsize::new(0);
+    let high_water = AtomicUsize::new(0);
+    let cancelled = AtomicBool::new(false);
+    let pipeline_start = Instant::now();
+    let worker_watch = watch;
+    let worker_cancelled = &cancelled;
+    let worker_outstanding = &outstanding;
+
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut records = Vec::with_capacity(range.frame_count as usize);
+                let mut diagnostics = Vec::with_capacity(range.frame_count as usize);
+                let mut consumer_waiting = Duration::ZERO;
+                let mut queue_residence = Duration::ZERO;
+                let mut render_total = Duration::ZERO;
+                let mut output_total = Duration::ZERO;
+                let mut first_frame_latency = Duration::ZERO;
+                loop {
+                    let wait_start = Instant::now();
+                    let job = match receiver.recv() {
+                        Ok(job) => job,
+                        Err(_) => break,
+                    };
+                    consumer_waiting += wait_start.elapsed();
+                    worker_outstanding.fetch_sub(1, Ordering::AcqRel);
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let wall_start = job.ready_at;
+                    let render_start = Instant::now();
+                    let mut rendered = crate::offline::render_prepared_frame(
+                        resources.clone(),
+                        profile_enabled,
+                        job.frame,
+                    )?;
+                    let render_time = render_start.elapsed();
+                    render_total += render_time;
+                    queue_residence += render_start.duration_since(job.ready_at);
+                    if let Some(frame_profile) = rendered.profile.as_mut() {
+                        frame_profile.total = frame_profile.vm
+                            + frame_profile.preparation
+                            + frame_profile.backend_wall
+                            + frame_profile.runtime_ui
+                            + frame_profile.framebuffer_copy;
+                    }
+                    let diagnostic_start = Instant::now();
+                    let diagnostic = frame_diagnostic(
+                        job.local_index,
+                        job.global_index,
+                        job.timeline,
+                        &rendered,
+                        worker_watch,
+                        target_entity_id,
+                    );
+                    let diagnostics_time = diagnostic_start.elapsed();
+                    if let Some(expected) =
+                        expected_frames.map(|frames| &frames[job.local_index as usize])
+                    {
+                        if !frame_hashes_match(expected, &diagnostic) {
+                            bail!(
+                                "frame {} changed between deterministic passes",
+                                job.global_index
+                            );
+                        }
+                    }
+                    let output_start = Instant::now();
+                    stdin.write_all(&rendered.rgb).with_context(|| {
+                        format!("writing raw RGB frame {} to FFmpeg", job.global_index)
+                    })?;
+                    let output_time = output_start.elapsed();
+                    output_total += output_time;
+                    if records.is_empty() {
+                        first_frame_latency = pipeline_start.elapsed();
+                    }
+                    records.push(PipelineFrameRecord {
+                        global_index: job.global_index,
+                        timeline: job.timeline,
+                        profile: rendered.profile,
+                        diagnostics: diagnostics_time,
+                        output: output_time,
+                        wall: wall_start.elapsed(),
+                    });
+                    diagnostics.push(diagnostic);
+                }
+                stdin
+                    .flush()
+                    .context("flushing pipelined RGB frames to FFmpeg")?;
+                drop(stdin);
+                Ok(PipelineWorkerResult {
+                    diagnostics,
+                    records,
+                    consumer_waiting,
+                    queue_residence,
+                    render: render_total,
+                    output: output_total,
+                    first_frame_latency,
+                })
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("frame render/output worker panicked")));
+            if result.is_err() {
+                worker_cancelled.store(true, Ordering::Release);
+            }
+            result
+        });
+
+        let mut producer_result: Result<(Duration, Duration, Duration)> =
+            Ok((Duration::ZERO, Duration::ZERO, Duration::ZERO));
+        for local_index in 0..range.frame_count {
+            if cancelled.load(Ordering::Acquire) {
+                producer_result = Err(anyhow::anyhow!(
+                    "frame pipeline cancelled after worker failure"
+                ));
+                break;
+            }
+            let global_index = match range.index(local_index) {
+                Ok(index) => index,
+                Err(error) => {
+                    producer_result = Err(error);
+                    break;
+                }
+            };
+            let prepared = match session.prepare_global_frame(global_index) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    producer_result =
+                        Err(error).context("preparing Watch frame for render pipeline");
+                    break;
+                }
+            };
+            let (watch_time, snapshot_time) = prepared.producer_timings();
+            let current = producer_result.as_mut().unwrap();
+            current.0 += watch_time;
+            current.1 += snapshot_time;
+            let ready_at = Instant::now();
+            let was_full = outstanding.load(Ordering::Acquire) >= FRAME_QUEUE_CAPACITY;
+            let send_start = Instant::now();
+            outstanding.fetch_add(1, Ordering::AcqRel);
+            let send_result = sender.send(PreparedJob {
+                local_index,
+                global_index,
+                timeline: range.time(global_index),
+                ready_at,
+                frame: prepared,
+            });
+            let send_time = send_start.elapsed();
+            if send_result.is_err() {
+                outstanding.fetch_sub(1, Ordering::AcqRel);
+                producer_result = Err(anyhow::anyhow!(
+                    "frame render/output worker closed the queue"
+                ));
+                break;
+            }
+            if was_full {
+                producer_result.as_mut().unwrap().2 += send_time;
+            }
+            high_water.fetch_max(
+                outstanding
+                    .load(Ordering::Acquire)
+                    .min(FRAME_QUEUE_CAPACITY),
+                Ordering::AcqRel,
+            );
+        }
+        drop(sender);
+        if producer_result.is_err() {
+            cancelled.store(true, Ordering::Release);
+        }
+        let worker_result = worker
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("frame render/output worker panicked")));
+        match worker_result {
+            Err(error) => Err(error),
+            Ok(worker_result) => {
+                let (watch_time, snapshot_time, blocked_time) = producer_result?;
+                if worker_result.records.len() != range.frame_count as usize {
+                    bail!("frame pipeline stopped before all frames were rendered");
+                }
+                let render_phase = pipeline_start.elapsed();
+                Ok(PipelineResult {
+                    diagnostics: worker_result.diagnostics,
+                    stats: FramePipelineStats {
+                        queue_capacity: FRAME_QUEUE_CAPACITY,
+                        queue_high_water: high_water.load(Ordering::Acquire),
+                        producer_watch_ms: watch_time.as_secs_f64() * 1000.0,
+                        producer_snapshot_ms: snapshot_time.as_secs_f64() * 1000.0,
+                        producer_blocked_ms: blocked_time.as_secs_f64() * 1000.0,
+                        queue_residence_ms: worker_result.queue_residence.as_secs_f64() * 1000.0,
+                        consumer_waiting_ms: worker_result.consumer_waiting.as_secs_f64() * 1000.0,
+                        render_ms: worker_result.render.as_secs_f64() * 1000.0,
+                        output_ms: worker_result.output.as_secs_f64() * 1000.0,
+                        first_frame_latency_ms: worker_result.first_frame_latency.as_secs_f64()
+                            * 1000.0,
+                        render_phase_ms: render_phase.as_secs_f64() * 1000.0,
+                    },
+                    records: worker_result.records,
+                })
+            }
+        }
+    })
+}
+
+fn compare_frame_diagnostics(first: &[FrameDiagnostic], second: &[FrameDiagnostic]) -> bool {
+    first.len() == second.len()
+        && first
+            .iter()
+            .zip(second)
+            .all(|(a, b)| frame_hashes_match(a, b))
 }
 
 fn frame_diagnostic(
@@ -678,6 +1263,7 @@ fn frame_diagnostic(
         timescale: frame.report.timescale,
         callback_count: frame.report.callbacks.len(),
         vm_evaluations: frame.report.vm_evaluations,
+        runtime_frame_count: frame.report.runtime_profile.frame_count,
         runtime_entity_count: frame.report.runtime_entity_count,
         active_entity_count: frame.report.active_entity_count,
         draw_count: frame.report.display_list.sprites.len(),
@@ -691,25 +1277,198 @@ fn frame_diagnostic(
     }
 }
 
-fn collect_audio_requests(
-    frames: &[FrameDiagnostic],
-) -> (
+type AudioRequests = (
     Vec<AudioEffectEvent>,
     Vec<ScheduledEffect>,
     Vec<ScheduledLoopedEffect>,
     Vec<ScheduledLoopedEffectStop>,
-) {
-    let mut events = Vec::new();
-    let mut scheduled = Vec::new();
-    let mut loop_starts = Vec::new();
-    let mut loop_stops = Vec::new();
-    for frame in frames {
-        events.extend(frame.audio_events.iter().cloned());
-        scheduled.extend(frame.scheduled_effects.iter().cloned());
-        loop_starts.extend(frame.scheduled_looped_effects.iter().cloned());
-        loop_stops.extend(frame.scheduled_looped_effect_stops.iter().cloned());
+);
+
+fn empty_audio_requests() -> AudioRequests {
+    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+}
+
+fn hash_audio_requests(requests: &AudioRequests) -> Result<String> {
+    let bytes = serde_json::to_vec(requests).context("serializing collected SFX event sequence")?;
+    Ok(hex::encode(Sha1::digest(bytes)))
+}
+
+fn count_audio_requests(requests: &AudioRequests) -> SfxEventCounts {
+    SfxEventCounts {
+        audio_events: requests.0.len() as u64,
+        scheduled_effects: requests.1.len() as u64,
+        loop_starts: requests.2.len() as u64,
+        loop_stops: requests.3.len() as u64,
     }
-    (events, scheduled, loop_starts, loop_stops)
+}
+
+fn append_report_events(requests: &mut AudioRequests, report: &crate::watch_runtime::FrameReport) {
+    requests.0.extend(report.audio_events.iter().cloned());
+    requests.1.extend(report.scheduled_effects.iter().cloned());
+    requests
+        .2
+        .extend(report.scheduled_looped_effects.iter().cloned());
+    requests
+        .3
+        .extend(report.scheduled_looped_effect_stops.iter().cloned());
+}
+
+fn collect_audio_requests(frames: &[FrameDiagnostic]) -> AudioRequests {
+    let mut requests = empty_audio_requests();
+    for frame in frames {
+        requests.0.extend(frame.audio_events.iter().cloned());
+        requests.1.extend(frame.scheduled_effects.iter().cloned());
+        requests
+            .2
+            .extend(frame.scheduled_looped_effects.iter().cloned());
+        requests
+            .3
+            .extend(frame.scheduled_looped_effect_stops.iter().cloned());
+    }
+    requests
+}
+
+fn collect_event_only_requests(
+    mut session: EventSession<'_>,
+    range: FrameRange,
+    profile_enabled: bool,
+    cancellation: &AtomicU8,
+) -> Result<EventPassOutput> {
+    let pass_start = Instant::now();
+    let mut requests = empty_audio_requests();
+    let mut profiles = Vec::new();
+    let (mut runtime_frames, mut callbacks, mut evaluations) = (0, 0, 0);
+    for segment_index in 0..range.frame_count {
+        if cancellation.load(Ordering::Acquire) != 0 {
+            bail!("SFX event pass cancelled after concurrent render failure");
+        }
+        let loop_start = Instant::now();
+        let frame_index = range.index(segment_index)?;
+        let report = session.advance_global_frame(frame_index)?;
+        append_report_events(&mut requests, &report);
+        runtime_frames += report.runtime_profile.frame_count;
+        callbacks += report.callbacks.len() as u64;
+        evaluations += report.vm_evaluations;
+        if profile_enabled {
+            profiles.push((report.runtime_profile.clone(), loop_start.elapsed()));
+        }
+    }
+    Ok(EventPassOutput {
+        requests,
+        profiles,
+        elapsed: pass_start.elapsed(),
+        runtime_frames,
+        callbacks,
+        evaluations,
+    })
+}
+
+struct EventPassOutput {
+    requests: AudioRequests,
+    profiles: Vec<(crate::watch_runtime::FrameRuntimeProfile, Duration)>,
+    elapsed: Duration,
+    runtime_frames: u64,
+    callbacks: u64,
+    evaluations: u64,
+}
+
+struct ConcurrentStreamOutput {
+    events: EventPassOutput,
+    frames: Vec<FrameDiagnostic>,
+    spool: tempfile::NamedTempFile,
+    profile: Option<crate::profiling::ProfileCollector>,
+}
+
+fn mark_first_failure(cancellation: &AtomicU8, source: u8) {
+    let _ = cancellation.compare_exchange(0, source, Ordering::AcqRel, Ordering::Acquire);
+}
+
+fn concurrent_event_and_render(
+    event_session: EventSession<'_>,
+    stream_session: FrameSession<'_>,
+    range: FrameRange,
+    watch: &crate::watch::WatchData,
+    target_entity_id: Option<usize>,
+    profile: Option<crate::profiling::ProfileCollector>,
+    profile_enabled: bool,
+) -> Result<ConcurrentStreamOutput> {
+    const EVENT_FAILURE: u8 = 1;
+    const RENDER_FAILURE: u8 = 2;
+    let cancellation = AtomicU8::new(0);
+    std::thread::scope(|scope| {
+        let event_worker = scope.spawn(|| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                collect_event_only_requests(event_session, range, profile_enabled, &cancellation)
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("SFX event worker panicked")));
+            if result.is_err() {
+                mark_first_failure(&cancellation, EVENT_FAILURE);
+            }
+            result
+        });
+        let render_worker = scope.spawn(|| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut spool = tempfile::Builder::new()
+                    .suffix(".rgb")
+                    .tempfile()
+                    .context("creating bounded-memory RGB spool for concurrent SFX export")?;
+                let mut profile = profile;
+                if let Some(profile) = profile.as_mut() {
+                    profile.begin_render();
+                }
+                let frames = stream_frames(
+                    stream_session,
+                    range,
+                    &mut spool,
+                    None,
+                    watch,
+                    target_entity_id,
+                    profile.as_mut(),
+                    "RGB spool buffer",
+                    "RGB spool flush",
+                    Some(&cancellation),
+                )?;
+                if let Some(profile) = profile.as_mut() {
+                    profile.finish_render();
+                }
+                spool
+                    .as_file_mut()
+                    .seek(SeekFrom::Start(0))
+                    .context("rewinding concurrent RGB spool")?;
+                Ok((frames, spool, profile))
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("stream render worker panicked")));
+            if result.is_err() {
+                mark_first_failure(&cancellation, RENDER_FAILURE);
+            }
+            result
+        });
+
+        let events = event_worker
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("SFX event worker panicked")));
+        let rendered = render_worker
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("stream render worker panicked")));
+        match cancellation.load(Ordering::Acquire) {
+            EVENT_FAILURE => Err(events
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("SFX event worker failed without an error"))),
+            RENDER_FAILURE => Err(rendered.err().unwrap_or_else(|| {
+                anyhow::anyhow!("stream render worker failed without an error")
+            })),
+            _ => {
+                let events = events?;
+                let (frames, spool, profile) = rendered?;
+                Ok(ConcurrentStreamOutput {
+                    events,
+                    frames,
+                    spool,
+                    profile,
+                })
+            }
+        }
+    })
 }
 
 fn hash_sequence(hashes: &[String]) -> String {
@@ -843,6 +1602,565 @@ fn parse_rational(value: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SlowSink(Duration);
+
+    impl Write for SlowSink {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.0);
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BrokenSink;
+
+    impl Write for BrokenSink {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "simulated FFmpeg stdin closure",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PanickingSink;
+
+    impl Write for PanickingSink {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            panic!("simulated output worker panic")
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct DiscardSink;
+
+    impl Write for DiscardSink {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn no_sfx_production_export_has_no_prepass() {
+        assert_eq!(prepass_plan(false, false), PrepassPlan::None);
+        assert_eq!(prepass_plan(true, false), PrepassPlan::EventsOnly);
+        assert_eq!(prepass_plan(false, true), PrepassPlan::FullValidation);
+        assert_eq!(prepass_plan(true, true), PrepassPlan::FullValidation);
+    }
+
+    #[test]
+    fn explicit_determinism_validation_compares_draw_and_rgb_hashes() {
+        let diagnostic = |draw: &str, rgb: &str| FrameDiagnostic {
+            output_local_frame_index: 0,
+            global_frame_index: 0,
+            requested_timeline_time: 0.0,
+            runtime_timeline: None,
+            runtime_update: [0.0; 4],
+            runtime_update_after_callbacks: [0.0; 4],
+            timescale: 1.0,
+            callback_count: 0,
+            vm_evaluations: 0,
+            runtime_frame_count: 0,
+            runtime_entity_count: 0,
+            active_entity_count: 0,
+            draw_count: 0,
+            raw_draw_sha1: draw.to_owned(),
+            rgb_sha1: rgb.to_owned(),
+            target_entity_draws: Vec::new(),
+            audio_events: Vec::new(),
+            scheduled_effects: Vec::new(),
+            scheduled_looped_effects: Vec::new(),
+            scheduled_looped_effect_stops: Vec::new(),
+        };
+        let first = [diagnostic("draw-a", "rgb-a")];
+        assert!(compare_frame_diagnostics(
+            &first,
+            &[diagnostic("draw-a", "rgb-a")]
+        ));
+        assert!(!compare_frame_diagnostics(
+            &first,
+            &[diagnostic("draw-b", "rgb-a")]
+        ));
+        assert!(!compare_frame_diagnostics(
+            &first,
+            &[diagnostic("draw-a", "rgb-b")]
+        ));
+        assert!(!compare_frame_diagnostics(&first, &[]));
+    }
+
+    #[test]
+    fn streaming_without_preflight_keeps_known_baumkuchen_frame_hash() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let package =
+            crate::formats::load_engine(&repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"))
+                .unwrap();
+        let level = crate::formats::load_level(&repo.join("TestingSuite/Next Sekai Engine/levels/Various Artists - Baumkuchen x Retry Now/Baumkuchen x Retry Now.json.gz")).unwrap();
+        let resources = repo.join("TestingSuite/Next Sekai Engine/skin/ProSeka Faithful 0.8.3.scp");
+        let defaults: std::collections::BTreeMap<_, _> =
+            package.metadata.resource_defaults().into_iter().collect();
+        let session = FrameSession::new_configured(
+            &package.watch,
+            &package.rom,
+            &package.configuration,
+            &level,
+            &resources,
+            defaults.get("skins").unwrap(),
+            defaults.get("backgrounds").map(String::as_str),
+            defaults.get("effects").map(String::as_str),
+            defaults.get("particles").map(String::as_str),
+            320,
+            180,
+            12,
+            &[(1, 10.8), (22, 1.0)],
+            false,
+            crate::render_ui::RendererUiConfig::default(),
+            0.0,
+            0.25,
+            crate::render::RenderBackend::Wgpu,
+            true,
+            false,
+        )
+        .unwrap();
+        let range = FrameRange {
+            first_index: 0,
+            frame_count: 1,
+            fps: 12,
+        };
+        let mut output = Vec::new();
+        let frames = stream_frames(
+            session,
+            range,
+            &mut output,
+            None,
+            &package.watch,
+            None,
+            None,
+            "FFmpeg handoff",
+            "FFmpeg final input flush/close",
+            None,
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].rgb_sha1,
+            "d45f286a15fac6be9b51ded7d0015356b8b92a72"
+        );
+        assert_eq!(output.len(), 320 * 180 * 3);
+    }
+
+    #[test]
+    fn bounded_pipeline_matches_sequential_hashes_and_preserves_fifo() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let package =
+            crate::formats::load_engine(&repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"))
+                .unwrap();
+        let level = crate::formats::load_level(&repo.join("TestingSuite/Next Sekai Engine/levels/Various Artists - Baumkuchen x Retry Now/Baumkuchen x Retry Now.json.gz")).unwrap();
+        let resources = repo.join("TestingSuite/Next Sekai Engine/skin/ProSeka Faithful 0.8.3.scp");
+        let defaults: std::collections::BTreeMap<_, _> =
+            package.metadata.resource_defaults().into_iter().collect();
+        let skin = defaults.get("skins").unwrap();
+        let background = defaults.get("backgrounds").map(String::as_str);
+        let effects = defaults.get("effects").map(String::as_str);
+        let particles = defaults.get("particles").map(String::as_str);
+        let options = [(1, 10.8), (22, 1.0)];
+        let make_session = |ui| {
+            FrameSession::new_configured(
+                &package.watch,
+                &package.rom,
+                &package.configuration,
+                &level,
+                &resources,
+                skin,
+                background,
+                effects,
+                particles,
+                64,
+                36,
+                12,
+                &options,
+                true,
+                ui,
+                0.0,
+                10.0,
+                crate::render::RenderBackend::Cpu,
+                false,
+                false,
+            )
+            .unwrap()
+        };
+        let range = FrameRange {
+            first_index: 0,
+            frame_count: 24,
+            fps: 12,
+        };
+        let mut sequential = make_session(crate::render_ui::RendererUiConfig::default());
+        let sequential_frames: Vec<_> = (0..range.frame_count)
+            .map(|local| {
+                let global = range.index(local).unwrap();
+                let frame = sequential.render_global_frame(global).unwrap();
+                (global, hash_rgb(&frame.rgb), frame.report.vm_evaluations)
+            })
+            .collect();
+        let mut output = Vec::new();
+        let pipelined = stream_frames_pipelined(
+            make_session(crate::render_ui::RendererUiConfig::default()),
+            range,
+            &mut output,
+            None,
+            &package.watch,
+            None,
+            false,
+        )
+        .unwrap();
+        let pipelined_frames: Vec<_> = pipelined
+            .diagnostics
+            .iter()
+            .map(|frame| {
+                (
+                    frame.global_frame_index,
+                    frame.rgb_sha1.clone(),
+                    frame.vm_evaluations,
+                )
+            })
+            .collect();
+        assert_eq!(sequential_frames, pipelined_frames);
+        assert_eq!(
+            pipelined
+                .diagnostics
+                .iter()
+                .map(|frame| frame.output_local_frame_index)
+                .collect::<Vec<_>>(),
+            (0..range.frame_count).collect::<Vec<_>>()
+        );
+        assert!(pipelined.stats.queue_high_water > 0);
+        assert!(pipelined.stats.queue_high_water <= pipelined.stats.queue_capacity);
+        assert_eq!(output.len(), 64 * 36 * 3 * range.frame_count as usize);
+
+        let short_range = FrameRange {
+            frame_count: 8,
+            ..range
+        };
+        let slowed = stream_frames_pipelined(
+            make_session(crate::render_ui::RendererUiConfig::default()),
+            short_range,
+            SlowSink(Duration::from_millis(20)),
+            None,
+            &package.watch,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(slowed.stats.queue_high_water, FRAME_QUEUE_CAPACITY);
+        assert!(slowed.stats.producer_blocked_ms > 0.0);
+
+        let broken = stream_frames_pipelined(
+            make_session(crate::render_ui::RendererUiConfig::default()),
+            short_range,
+            BrokenSink,
+            None,
+            &package.watch,
+            None,
+            false,
+        );
+        assert!(format!("{:#}", broken.err().unwrap()).contains("simulated FFmpeg stdin closure"));
+
+        let panicked = stream_frames_pipelined(
+            make_session(crate::render_ui::RendererUiConfig::default()),
+            short_range,
+            PanickingSink,
+            None,
+            &package.watch,
+            None,
+            false,
+        );
+        assert!(panicked
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("worker panicked"));
+
+        let mut failing_ui = crate::render_ui::RendererUiConfig::default();
+        failing_ui.enabled = true;
+        failing_ui.primary_metric.provider = crate::render_ui::UiValueProvider::EngineMetric {
+            key: "missing".to_owned(),
+        };
+        let producer_failure = stream_frames_pipelined(
+            make_session(failing_ui),
+            FrameRange {
+                frame_count: 1,
+                ..range
+            },
+            Vec::new(),
+            None,
+            &package.watch,
+            None,
+            false,
+        );
+        assert!(format!("{:#}", producer_failure.err().unwrap())
+            .contains("no authoritative Watch source"));
+    }
+
+    #[test]
+    fn baumkuchen_1080p_pipeline_preserves_known_rgb_sfx_and_workload_hashes() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let package =
+            crate::formats::load_engine(&repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"))
+                .unwrap();
+        let level = crate::formats::load_level(&repo.join("TestingSuite/Next Sekai Engine/levels/Various Artists - Baumkuchen x Retry Now/Baumkuchen x Retry Now.json.gz")).unwrap();
+        let resources = repo.join("TestingSuite/Next Sekai Engine/skin/ProSeka Faithful 0.8.3.scp");
+        let defaults: std::collections::BTreeMap<_, _> =
+            package.metadata.resource_defaults().into_iter().collect();
+        let skin = defaults.get("skins").unwrap();
+        let background = defaults.get("backgrounds").map(String::as_str);
+        let effects = defaults.get("effects").map(String::as_str);
+        let particles = defaults.get("particles").map(String::as_str);
+        let options = [(1, 10.8), (22, 1.0)];
+        let range = FrameRange {
+            first_index: 0,
+            frame_count: 120,
+            fps: 60,
+        };
+        let session = FrameSession::new_configured(
+            &package.watch,
+            &package.rom,
+            &package.configuration,
+            &level,
+            &resources,
+            skin,
+            background,
+            effects,
+            particles,
+            1920,
+            1080,
+            60,
+            &options,
+            true,
+            crate::render_ui::RendererUiConfig::default(),
+            0.0,
+            2.0,
+            crate::render::RenderBackend::Wgpu,
+            true,
+            false,
+        )
+        .unwrap();
+        let output = stream_frames_pipelined(
+            session,
+            range,
+            DiscardSink,
+            None,
+            &package.watch,
+            None,
+            false,
+        )
+        .unwrap();
+        let rgb_sequence = hash_sequence(
+            &output
+                .diagnostics
+                .iter()
+                .map(|frame| frame.rgb_sha1.clone())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(rgb_sequence, "6e8363f683b1bae0bc8b8f568633699fad668286");
+        assert_eq!(
+            output
+                .diagnostics
+                .iter()
+                .map(|frame| frame.runtime_frame_count)
+                .sum::<u64>(),
+            120
+        );
+        assert_eq!(
+            output
+                .diagnostics
+                .iter()
+                .map(|frame| frame.callback_count as u64)
+                .sum::<u64>(),
+            10_898
+        );
+        assert_eq!(
+            output
+                .diagnostics
+                .iter()
+                .map(|frame| frame.vm_evaluations)
+                .sum::<u64>(),
+            12_783_093
+        );
+
+        let event_session = EventSession::new_configured(
+            &package.watch,
+            &package.rom,
+            &package.configuration,
+            &level,
+            &resources,
+            skin,
+            background,
+            effects,
+            particles,
+            1920,
+            1080,
+            60,
+            &options,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        let events =
+            collect_event_only_requests(event_session, range, false, &AtomicU8::new(0)).unwrap();
+        assert_eq!(
+            hash_audio_requests(&events.requests).unwrap(),
+            "be53125a6dd38ad4b59dc7fc15b2ca3ca99c1808"
+        );
+        assert_eq!(
+            count_audio_requests(&events.requests),
+            SfxEventCounts {
+                audio_events: 0,
+                scheduled_effects: 615,
+                loop_starts: 89,
+                loop_stops: 89,
+            }
+        );
+        assert_eq!(events.runtime_frames, 120);
+        assert_eq!(events.callbacks, 10_898);
+        assert_eq!(events.evaluations, 12_783_093);
+    }
+
+    #[test]
+    fn concurrent_and_sequential_baumkuchen_event_and_frame_sequences_match() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let package =
+            crate::formats::load_engine(&repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"))
+                .unwrap();
+        let level = crate::formats::load_level(&repo.join("TestingSuite/Next Sekai Engine/levels/Various Artists - Baumkuchen x Retry Now/Baumkuchen x Retry Now.json.gz")).unwrap();
+        let resources = repo.join("TestingSuite/Next Sekai Engine/skin/ProSeka Faithful 0.8.3.scp");
+        let defaults: std::collections::BTreeMap<_, _> =
+            package.metadata.resource_defaults().into_iter().collect();
+        let skin = defaults.get("skins").unwrap();
+        let background = defaults.get("backgrounds").map(String::as_str);
+        let effects = defaults.get("effects").map(String::as_str);
+        let particles = defaults.get("particles").map(String::as_str);
+        let options = [(1, 10.8), (22, 1.0)];
+        let make_event_session = || {
+            EventSession::new_configured(
+                &package.watch,
+                &package.rom,
+                &package.configuration,
+                &level,
+                &resources,
+                skin,
+                background,
+                effects,
+                particles,
+                64,
+                36,
+                12,
+                &options,
+                true,
+                false,
+                false,
+            )
+            .unwrap()
+        };
+        let make_frame_session = || {
+            FrameSession::new_configured(
+                &package.watch,
+                &package.rom,
+                &package.configuration,
+                &level,
+                &resources,
+                skin,
+                background,
+                effects,
+                particles,
+                64,
+                36,
+                12,
+                &options,
+                true,
+                crate::render_ui::RendererUiConfig::default(),
+                0.0,
+                10.0,
+                crate::render::RenderBackend::Cpu,
+                false,
+                false,
+            )
+            .unwrap()
+        };
+        let range = FrameRange {
+            first_index: 0,
+            frame_count: 120,
+            fps: 12,
+        };
+        let sequential_events =
+            collect_event_only_requests(make_event_session(), range, false, &AtomicU8::new(0))
+                .unwrap();
+        let mut sequential_session = make_frame_session();
+        let sequential_hashes: Vec<_> = (0..range.frame_count)
+            .map(|index| {
+                let frame = sequential_session
+                    .render_global_frame(range.index(index).unwrap())
+                    .unwrap();
+                hash_rgb(&frame.rgb)
+            })
+            .collect();
+
+        let concurrent = concurrent_event_and_render(
+            make_event_session(),
+            make_frame_session(),
+            range,
+            &package.watch,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            hash_audio_requests(&sequential_events.requests).unwrap(),
+            hash_audio_requests(&concurrent.events.requests).unwrap()
+        );
+        assert_eq!(
+            count_audio_requests(&sequential_events.requests),
+            count_audio_requests(&concurrent.events.requests)
+        );
+        assert!(
+            count_audio_requests(&concurrent.events.requests).audio_events
+                + count_audio_requests(&concurrent.events.requests).scheduled_effects
+                + count_audio_requests(&concurrent.events.requests).loop_starts
+                + count_audio_requests(&concurrent.events.requests).loop_stops
+                > 0
+        );
+        assert_eq!(
+            sequential_events.runtime_frames,
+            concurrent.events.runtime_frames
+        );
+        assert_eq!(sequential_events.callbacks, concurrent.events.callbacks);
+        assert_eq!(sequential_events.evaluations, concurrent.events.evaluations);
+        let concurrent_hashes: Vec<_> = concurrent
+            .frames
+            .iter()
+            .map(|frame| frame.rgb_sha1.clone())
+            .collect();
+        assert_eq!(sequential_hashes, concurrent_hashes);
+        assert_eq!(
+            hash_sequence(&sequential_hashes),
+            hash_sequence(&concurrent_hashes)
+        );
+        assert_eq!(
+            fs::metadata(concurrent.spool.path()).unwrap().len(),
+            64 * 36 * 3 * 120
+        );
+    }
 
     #[test]
     fn audio_filter_trims_to_timeline_position_and_applies_leading_silence() {

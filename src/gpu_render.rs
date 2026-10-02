@@ -121,12 +121,33 @@ pub(crate) struct GpuRenderer {
     adapter: String,
 }
 
+pub(crate) type AtlasIdentity = [u8; 20];
+
+/// Content identity is computed when immutable session assets are loaded, not
+/// once per rendered frame. Dimensions remain part of the key so differently
+/// shaped images cannot reuse an incompatible GPU texture.
+pub(crate) fn atlas_identity(rgba: &[u8], width: u32, height: u32) -> AtlasIdentity {
+    use sha1::{Digest, Sha1};
+    let mut digest = Sha1::new();
+    digest.update(width.to_le_bytes());
+    digest.update(height.to_le_bytes());
+    digest.update(rgba);
+    digest.finalize().into()
+}
+
 #[derive(Default)]
 pub(crate) struct GpuFrameProfile {
     pub draw_preparation: std::time::Duration,
+    pub render_target_setup: std::time::Duration,
+    pub initial_rgba_conversion: std::time::Duration,
+    pub initial_framebuffer_upload: std::time::Duration,
+    pub atlas_hashing: std::time::Duration,
+    pub atlas_cache_upload: std::time::Duration,
+    pub readback_buffer_setup: std::time::Duration,
     pub encode_submit: std::time::Duration,
     pub wait_map: std::time::Duration,
     pub unpack: std::time::Duration,
+    pub ppm_packaging: std::time::Duration,
     pub draw_calls: usize,
     pub atlas_uploads: usize,
     pub readback_bytes: u64,
@@ -153,6 +174,61 @@ impl GpuRenderer {
             Ok(renderer) => Ok(renderer),
             Err(error) => bail!("initializing shared wgpu backend: {error}"),
         }
+    }
+
+    fn atlas_texture(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        identity: AtlasIdentity,
+    ) -> Result<(Arc<wgpu::Texture>, bool)> {
+        let mut cache = self
+            .atlases
+            .lock()
+            .map_err(|_| anyhow::anyhow!("wgpu atlas cache lock was poisoned"))?;
+        if let Some(texture) = cache.get(&identity) {
+            return Ok((texture.clone(), false));
+        }
+        if cache.len() >= 8 {
+            cache.clear();
+        }
+        let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("resident source atlas"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let texture = Arc::new(texture);
+        cache.insert(identity, texture.clone());
+        Ok((texture, true))
     }
 }
 
@@ -257,7 +333,7 @@ fn gpu() -> Result<Gpu> {
 
 fn render(
     renderer: &GpuRenderer,
-    atlases: &[(&[u8], u32, u32)],
+    atlases: &[(&[u8], u32, u32, AtlasIdentity)],
     width: u32,
     height: u32,
     aspect: f64,
@@ -267,6 +343,7 @@ fn render(
 ) -> Result<Vec<u8>> {
     let gpu = &renderer.gpu;
     let encode_start;
+    let target_setup_start = profile.as_ref().map(|_| std::time::Instant::now());
     if let Some(p) = profile.as_deref_mut() {
         p.draw_calls = draws.len();
         p.adapter = Some(renderer.adapter.clone());
@@ -288,10 +365,18 @@ fn render(
             | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
+    if let (Some(start), Some(p)) = (target_setup_start, profile.as_deref_mut()) {
+        p.render_target_setup = start.elapsed();
+    }
+    let rgba_start = profile.as_ref().map(|_| std::time::Instant::now());
     let initial_rgba = rgb_to_rgba(initial_rgb);
     if initial_rgba.len() != width as usize * height as usize * 4 {
         bail!("initial framebuffer has invalid dimensions");
     }
+    if let (Some(start), Some(p)) = (rgba_start, profile.as_deref_mut()) {
+        p.initial_rgba_conversion = start.elapsed();
+    }
+    let initial_upload_start = profile.as_ref().map(|_| std::time::Instant::now());
     gpu.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &tex,
@@ -311,86 +396,37 @@ fn render(
             depth_or_array_layers: 1,
         },
     );
-    use sha1::{Digest, Sha1};
+    if let (Some(start), Some(p)) = (initial_upload_start, profile.as_deref_mut()) {
+        p.initial_framebuffer_upload = start.elapsed();
+    }
     let mut resident = Vec::with_capacity(atlases.len());
-    for (input, iw, ih) in atlases {
-        let mut digest = Sha1::new();
-        digest.update(iw.to_le_bytes());
-        digest.update(ih.to_le_bytes());
-        digest.update(input);
-        let key: [u8; 20] = digest.finalize().into();
-        if profile.is_some() {
-            let cache_miss = renderer
-                .atlases
-                .lock()
-                .map(|cache| !cache.contains_key(&key))
-                .unwrap_or(false);
-            if cache_miss {
-                if let Some(p) = profile.as_deref_mut() {
-                    p.atlas_uploads += 1;
-                }
+    for (input, iw, ih, identity) in atlases {
+        let atlas_cache_start = profile.as_ref().map(|_| std::time::Instant::now());
+        let (atlas, uploaded) = renderer.atlas_texture(input, *iw, *ih, *identity)?;
+        if uploaded {
+            if let Some(p) = profile.as_deref_mut() {
+                p.atlas_uploads += 1;
             }
         }
-        let atlas = {
-            let mut cache = renderer
-                .atlases
-                .lock()
-                .map_err(|_| anyhow::anyhow!("wgpu atlas cache lock was poisoned"))?;
-            if !cache.contains_key(&key) && cache.len() >= 8 {
-                cache.clear();
-            }
-            cache
-                .entry(key)
-                .or_insert_with(|| {
-                    let atlas = gpu.device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("resident source atlas"),
-                        size: wgpu::Extent3d {
-                            width: *iw,
-                            height: *ih,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
-                    });
-                    gpu.queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &atlas,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        input,
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(*iw * 4),
-                            rows_per_image: Some(*ih),
-                        },
-                        wgpu::Extent3d {
-                            width: *iw,
-                            height: *ih,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-                    Arc::new(atlas)
-                })
-                .clone()
-        };
         resident.push(atlas.create_view(&Default::default()));
+        if let (Some(start), Some(p)) = (atlas_cache_start, profile.as_deref_mut()) {
+            p.atlas_cache_upload += start.elapsed();
+        }
     }
     let view = tex.create_view(&Default::default());
     let stride = width.checked_mul(4).context("frame row overflow")?;
     let padded =
         stride.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let readback_setup_start = profile.as_ref().map(|_| std::time::Instant::now());
     let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("framebuffer readback"),
         size: u64::from(padded) * u64::from(height),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
+    if let (Some(start), Some(p)) = (readback_setup_start, profile.as_deref_mut()) {
+        p.readback_buffer_setup = start.elapsed();
+    }
     encode_start = profile.as_ref().map(|_| std::time::Instant::now());
     let mut encoder = gpu
         .device
@@ -535,13 +571,19 @@ pub(crate) fn render_display_list(
     height: u32,
     aspect: f64,
     skin: &crate::formats::SkinAssets,
+    skin_identity: AtlasIdentity,
     bindings: &std::collections::BTreeMap<u32, String>,
     runtime: &[f64; 16],
-    background: Option<(&crate::formats::BackgroundAssets, [[f64; 2]; 4])>,
+    background: Option<(
+        &crate::formats::BackgroundAssets,
+        [[f64; 2]; 4],
+        AtlasIdentity,
+    )>,
     particles: Option<(
         &crate::formats::ParticleAssets,
         &[crate::particles::ParticleSpriteDraw],
         &[f64; 16],
+        AtlasIdentity,
     )>,
     mut profile: Option<&mut GpuFrameProfile>,
 ) -> Result<Vec<u8>> {
@@ -562,9 +604,9 @@ pub(crate) fn render_display_list(
         bail!("skin atlas dimensions do not match its RGBA pixel buffer");
     }
     let mut draws = Vec::new();
-    let mut atlases = vec![(skin.rgba.as_slice(), skin.width, skin.height)];
+    let mut atlases = vec![(skin.rgba.as_slice(), skin.width, skin.height, skin_identity)];
     let mut initial = vec![0u8; width as usize * height as usize * 3];
-    if let Some((bg, quad)) = background {
+    if let Some((bg, quad, bg_identity)) = background {
         if bg.configuration.blur != 0.0 {
             bail!("nonzero Sonolus background blur is not yet supported");
         }
@@ -581,7 +623,7 @@ pub(crate) fn render_display_list(
             pixel.copy_from_slice(&base[..3]);
         }
         let bg_atlas = atlases.len();
-        atlases.push((bg.rgba.as_slice(), bg.width, bg.height));
+        atlases.push((bg.rgba.as_slice(), bg.width, bg.height, bg_identity));
         draws.push(DrawOp {
             rect: [0, 0, bg.width, bg.height],
             corners: quad,
@@ -650,7 +692,7 @@ pub(crate) fn render_display_list(
             mask: false,
         });
     }
-    if let Some((assets, particle_draws, particle_runtime)) = particles {
+    if let Some((assets, particle_draws, particle_runtime, particle_identity)) = particles {
         let particle_atlas = atlases.len();
         if assets.width == 0
             || assets.height == 0
@@ -658,7 +700,12 @@ pub(crate) fn render_display_list(
         {
             bail!("particle atlas dimensions do not match its RGBA pixel buffer");
         }
-        atlases.push((assets.rgba.as_slice(), assets.width, assets.height));
+        atlases.push((
+            assets.rgba.as_slice(),
+            assets.width,
+            assets.height,
+            particle_identity,
+        ));
         for d in particle_draws {
             if d.alpha <= 0.0
                 || !d.alpha.is_finite()
@@ -699,9 +746,21 @@ pub(crate) fn render_display_list(
         p.draw_preparation = start.elapsed();
     }
     let rgb = render(
-        renderer, &atlases, width, height, aspect, &initial, draws, profile,
+        renderer,
+        &atlases,
+        width,
+        height,
+        aspect,
+        &initial,
+        draws,
+        profile.as_deref_mut(),
     )?;
-    Ok(ppm(&rgb, width, height))
+    let pack_start = profile.as_ref().map(|_| std::time::Instant::now());
+    let ppm = ppm(&rgb, width, height);
+    if let (Some(start), Some(p)) = (pack_start, profile.as_deref_mut()) {
+        p.ppm_packaging = start.elapsed();
+    }
+    Ok(ppm)
 }
 fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
     rgb.chunks_exact(3)
@@ -713,6 +772,45 @@ fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn atlas_identity_is_stable_and_changes_with_pixels_or_dimensions() {
+        let pixels: Vec<u8> = (0..24).collect();
+        let original = atlas_identity(&pixels, 3, 2);
+        assert_eq!(original, atlas_identity(&pixels, 3, 2));
+
+        let mut changed_pixels = pixels.clone();
+        changed_pixels[17] ^= 0x80;
+        assert_ne!(original, atlas_identity(&changed_pixels, 3, 2));
+        assert_ne!(original, atlas_identity(&pixels, 2, 3));
+    }
+
+    #[test]
+    fn atlas_cache_reuses_identity_and_invalidates_changed_resources() {
+        let gpu = GpuRenderer::shared().unwrap();
+        let pixels: Vec<u8> = (32..56).collect();
+        let identity = atlas_identity(&pixels, 3, 2);
+        let (first, uploaded) = gpu.atlas_texture(&pixels, 3, 2, identity).unwrap();
+        assert!(uploaded);
+
+        let (cached, uploaded) = gpu.atlas_texture(&pixels, 3, 2, identity).unwrap();
+        assert!(!uploaded);
+        assert!(Arc::ptr_eq(&first, &cached));
+
+        let mut changed_pixels = pixels.clone();
+        changed_pixels[9] ^= 0x40;
+        let changed_identity = atlas_identity(&changed_pixels, 3, 2);
+        let (changed, uploaded) = gpu
+            .atlas_texture(&changed_pixels, 3, 2, changed_identity)
+            .unwrap();
+        assert!(uploaded);
+        assert!(!Arc::ptr_eq(&first, &changed));
+
+        let reshaped_identity = atlas_identity(&pixels, 2, 3);
+        let (reshaped, uploaded) = gpu.atlas_texture(&pixels, 2, 3, reshaped_identity).unwrap();
+        assert!(uploaded);
+        assert!(!Arc::ptr_eq(&first, &reshaped));
+    }
 
     #[test]
     fn particle_sprite_is_composited_in_the_single_gpu_frame_pass() {
@@ -755,10 +853,16 @@ mod tests {
             4,
             1.0,
             &skin,
+            atlas_identity(&skin.rgba, skin.width, skin.height),
             &BTreeMap::new(),
             &transform,
             None,
-            Some((&particles, std::slice::from_ref(&draw), &transform)),
+            Some((
+                &particles,
+                std::slice::from_ref(&draw),
+                &transform,
+                atlas_identity(&particles.rgba, particles.width, particles.height),
+            )),
             None,
         )
         .unwrap();

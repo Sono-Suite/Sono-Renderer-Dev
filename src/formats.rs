@@ -1038,6 +1038,55 @@ pub fn load_background_assets(path: &Path, name: &str) -> Result<BackgroundAsset
     })
 }
 
+/// Resolve only the Runtime Background quad inputs. This verifies and decodes
+/// the selected background metadata, but reads only the PNG dimensions instead
+/// of decoding/uploading its pixels. Event-only export passes use this to keep
+/// Watch initialization identical without preparing a framebuffer.
+pub fn load_background_runtime_quad(
+    path: &Path,
+    name: &str,
+    screen_aspect_ratio: f64,
+) -> Result<[[f64; 2]; 4]> {
+    let file = fs::File::open(path).with_context(|| format!("opening SCP {}", path.display()))?;
+    let mut zip = ZipArchive::new(file).context("SCP is not a valid ZIP archive")?;
+    let manifest_path = format!("sonolus/backgrounds/{name}");
+    let mut manifest_bytes = Vec::new();
+    zip.by_name(&manifest_path)
+        .with_context(|| format!("background {name:?} is not present in {}", path.display()))?
+        .read_to_end(&mut manifest_bytes)?;
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("decoding background manifest {manifest_path}"))?;
+    let item = manifest.get("item").unwrap_or(&manifest);
+    let data = read_background_blob(&mut zip, item, "data")?;
+    let image = read_background_blob(&mut zip, item, "image")?;
+    let configuration = read_background_blob(&mut zip, item, "configuration")?;
+    let data: BackgroundData =
+        serde_json::from_slice(&decode_payload(data)?).context("decoding BackgroundData JSON")?;
+    let configuration: BackgroundConfiguration =
+        serde_json::from_slice(&decode_payload(configuration)?)
+            .context("decoding BackgroundConfiguration JSON")?;
+    if !configuration.blur.is_finite() || !(0.0..=1.0).contains(&configuration.blur) {
+        bail!("background blur must be finite and in 0..=1");
+    }
+    let (width, height) = png_dimensions(&image)?;
+    parse_background_color(&data.color, false)?;
+    parse_background_color(&configuration.mask, true)?;
+    data.runtime_quad(screen_aspect_ratio, f64::from(width) / f64::from(height))
+}
+
+fn png_dimensions(data: &[u8]) -> Result<(u32, u32)> {
+    const HEADER: &[u8; 16] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+    if data.len() < 24 || !data.starts_with(HEADER) {
+        bail!("background image has no valid PNG IHDR header");
+    }
+    let width = u32::from_be_bytes(data[16..20].try_into().unwrap());
+    let height = u32::from_be_bytes(data[20..24].try_into().unwrap());
+    if width == 0 || height == 0 {
+        bail!("background image dimensions must be nonzero");
+    }
+    Ok((width, height))
+}
+
 fn read_background_blob(
     zip: &mut ZipArchive<fs::File>,
     item: &Value,

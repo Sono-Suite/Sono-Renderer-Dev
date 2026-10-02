@@ -67,6 +67,16 @@ pub struct RenderConfig {
     pub profile: bool,
     #[serde(default)]
     pub profile_frames: bool,
+    /// Run a full rendered preflight and compare draw/RGB hashes against the
+    /// streaming render. Disabled for ordinary exports.
+    #[serde(default)]
+    pub validate_determinism: bool,
+    /// Run SFX event collection concurrently with the independent render session.
+    #[serde(default = "default_concurrent_sfx_prepass")]
+    pub concurrent_sfx_prepass: bool,
+    /// Overlap serial Watch preparation with ordered render/output work.
+    #[serde(default = "default_frame_pipeline")]
+    pub frame_pipeline: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,6 +98,14 @@ fn default_width() -> u32 {
 }
 fn default_height() -> u32 {
     360
+}
+
+fn default_concurrent_sfx_prepass() -> bool {
+    false
+}
+
+fn default_frame_pipeline() -> bool {
+    true
 }
 
 impl RenderConfig {
@@ -224,6 +242,8 @@ mod tests {
         assert_eq!((config.fps, config.width, config.height), (12, 640, 360));
         assert_eq!(config.layers, RenderLayers::default());
         assert_eq!(config.backend, RenderBackend::Wgpu);
+        assert!(!config.concurrent_sfx_prepass);
+        assert!(config.frame_pipeline);
         assert!(!config.ui.enabled);
         assert_eq!((0.01_f64 * 12.0).ceil() as u64, 1);
     }
@@ -270,6 +290,105 @@ mod tests {
         }));
         assert_eq!(stepper.runtime_mut().global_memory.get(2002, 1), 10.8);
         assert_eq!(stepper.runtime_mut().global_memory.get(2002, 22), 1.0);
+    }
+
+    #[test]
+    fn next_rush_event_only_prepass_matches_render_session_events_and_runtime() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let package =
+            formats::load_engine(&repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"))
+                .unwrap();
+        let level = formats::load_level(&repo.join("TestingSuite/Next Sekai Engine/levels/Various Artists - Baumkuchen x Retry Now/Baumkuchen x Retry Now.json.gz")).unwrap();
+        let resources = repo.join("TestingSuite/Next Sekai Engine/skin/ProSeka Faithful 0.8.3.scp");
+        let defaults: std::collections::BTreeMap<_, _> =
+            package.metadata.resource_defaults().into_iter().collect();
+        let skin = defaults.get("skins").unwrap();
+        let background = defaults.get("backgrounds").map(String::as_str);
+        let effects = defaults.get("effects").map(String::as_str);
+        let particles = defaults.get("particles").map(String::as_str);
+        let options = [(1, 10.8), (22, 1.0)];
+        let mut render = FrameSession::new_configured(
+            &package.watch,
+            &package.rom,
+            &package.configuration,
+            &level,
+            &resources,
+            skin,
+            background,
+            effects,
+            particles,
+            64,
+            36,
+            12,
+            &options,
+            false,
+            RendererUiConfig::default(),
+            0.0,
+            2.0,
+            RenderBackend::Cpu,
+            false,
+            false,
+        )
+        .unwrap();
+        let mut events = crate::offline::EventSession::new_configured(
+            &package.watch,
+            &package.rom,
+            &package.configuration,
+            &level,
+            &resources,
+            skin,
+            background,
+            effects,
+            particles,
+            64,
+            36,
+            12,
+            &options,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let mut saw_audio_events = false;
+        for frame_index in 0..120 {
+            let event_report = events.advance_global_frame(frame_index).unwrap();
+            let rendered_report = render.render_global_frame(frame_index).unwrap().report;
+            assert_eq!(event_report.callbacks, rendered_report.callbacks);
+            assert_eq!(event_report.runtime_update, rendered_report.runtime_update);
+            assert_eq!(
+                event_report.runtime_update_after_callbacks,
+                rendered_report.runtime_update_after_callbacks
+            );
+            assert_eq!(event_report.audio_events, rendered_report.audio_events);
+            assert_eq!(
+                event_report.scheduled_effects,
+                rendered_report.scheduled_effects
+            );
+            assert_eq!(
+                event_report.scheduled_looped_effects,
+                rendered_report.scheduled_looped_effects
+            );
+            assert_eq!(
+                event_report.scheduled_looped_effect_stops,
+                rendered_report.scheduled_looped_effect_stops
+            );
+            assert_eq!(
+                event_report.particle_events,
+                rendered_report.particle_events
+            );
+            assert_eq!(
+                event_report.destroyed_particle_effects,
+                rendered_report.destroyed_particle_effects
+            );
+            saw_audio_events |= !event_report.audio_events.is_empty()
+                || !event_report.scheduled_effects.is_empty()
+                || !event_report.scheduled_looped_effects.is_empty()
+                || !event_report.scheduled_looped_effect_stops.is_empty();
+        }
+        assert!(
+            saw_audio_events,
+            "Baumkuchen fixture should exercise SFX events"
+        );
     }
 
     #[test]
