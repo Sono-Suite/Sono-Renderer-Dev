@@ -161,8 +161,6 @@ pub struct FrameStageProfile {
     pub gpu_readback_buffer_setup: std::time::Duration,
     pub gpu_wait_map: std::time::Duration,
     pub framebuffer_unpack: std::time::Duration,
-    pub framebuffer_packaging: std::time::Duration,
-    pub framebuffer_copy: std::time::Duration,
     pub gpu_draw_calls: usize,
     pub atlas_uploads: usize,
     pub readback_bytes: u64,
@@ -740,10 +738,10 @@ pub(crate) fn render_prepared_frame(
         .try_into()
         .map_err(|_| anyhow::anyhow!("Runtime Background quad has invalid length"))?;
     let background = resources.background.as_ref().map(|assets| (assets, quad));
-    let mut ppm = match resources.backend {
+    let mut rgb = match resources.backend {
         crate::render::RenderBackend::Cpu => report
             .display_list
-            .render_skin_ppm_with_runtime_transform_and_background(
+            .render_skin_rgb_with_runtime_transform_and_background(
                 resources.width,
                 resources.height,
                 f64::from(resources.width) / f64::from(resources.height),
@@ -752,7 +750,7 @@ pub(crate) fn render_prepared_frame(
                 &report.runtime_skin_transform,
                 background,
             )?,
-        crate::render::RenderBackend::Wgpu => crate::gpu_render::render_display_list(
+        crate::render::RenderBackend::Wgpu => crate::gpu_render::render_display_list_rgb(
             resources
                 .gpu
                 .as_ref()
@@ -795,7 +793,6 @@ pub(crate) fn render_prepared_frame(
     };
     if resources.backend == crate::render::RenderBackend::Cpu {
         if let (Some(assets), Some(draws)) = (&resources.particles, particle_draws.as_deref()) {
-            let mut rgb = ppm_rgb_payload(&ppm, resources.width, resources.height)?;
             DisplayList::composite_particle_sprites(
                 &mut rgb,
                 resources.width,
@@ -805,14 +802,12 @@ pub(crate) fn render_prepared_frame(
                 draws,
                 &report.runtime_particle_transform,
             )?;
-            ppm = rgb_to_ppm(&rgb, resources.width, resources.height);
         }
     }
     let cpu_render = render_start.map(|t| t.elapsed()).unwrap_or_default();
     let backend_wall = backend_start.map(|t| t.elapsed()).unwrap_or_default();
     let ui_start = profile_enabled.then(std::time::Instant::now);
     if resources.ui.enabled {
-        let mut rgb = ppm_rgb_payload(&ppm, resources.width, resources.height)?;
         let mut values = ui_values.into_iter();
         crate::render_ui::render_overlay(
             &mut rgb,
@@ -824,14 +819,8 @@ pub(crate) fn render_prepared_frame(
             &resources.ui,
             |_| Ok(values.next().unwrap_or(0.0)),
         )?;
-        ppm = rgb_to_ppm(&rgb, resources.width, resources.height);
     }
     let runtime_ui = ui_start.map(|t| t.elapsed()).unwrap_or_default();
-    let framebuffer_copy_start = profile_enabled.then(std::time::Instant::now);
-    let rgb = ppm_rgb_payload(&ppm, resources.width, resources.height)?;
-    let framebuffer_copy = framebuffer_copy_start
-        .map(|t| t.elapsed())
-        .unwrap_or_default();
     let profile = total_start.map(|_| FrameStageProfile {
         vm,
         preparation,
@@ -862,8 +851,6 @@ pub(crate) fn render_prepared_frame(
             .map_or_default(|p| p.readback_buffer_setup),
         gpu_wait_map: gpu_profile.as_ref().map_or_default(|p| p.wait_map),
         framebuffer_unpack: gpu_profile.as_ref().map_or_default(|p| p.unpack),
-        framebuffer_packaging: gpu_profile.as_ref().map_or_default(|p| p.ppm_packaging),
-        framebuffer_copy,
         gpu_draw_calls: gpu_profile.as_ref().map_or(0, |p| p.draw_calls),
         atlas_uploads: gpu_profile.as_ref().map_or(0, |p| p.atlas_uploads),
         readback_bytes: gpu_profile.as_ref().map_or(0, |p| p.readback_bytes),
@@ -881,12 +868,6 @@ pub(crate) fn render_prepared_frame(
         profile.total = start.elapsed();
     }
     Ok(rendered)
-}
-
-fn rgb_to_ppm(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
-    ppm.extend_from_slice(rgb);
-    ppm
 }
 
 fn skin_bindings(watch: &WatchData) -> Result<BTreeMap<u32, String>> {

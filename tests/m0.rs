@@ -1354,6 +1354,9 @@ fn skin_rasterizer_samples_bound_sprite_and_composites_alpha() {
         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
     ];
+    let runtime_identity = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
     let skin = SkinAssets {
         width: 1,
         height: 1,
@@ -1389,8 +1392,20 @@ fn skin_rasterizer_samples_bound_sprite_and_composites_alpha() {
             &BTreeMap::from([(7, "half-red".to_owned())]),
         )
         .unwrap();
+    let rgb = display_list
+        .render_skin_rgb_with_runtime_transform_and_background(
+            2,
+            2,
+            1.0,
+            &skin,
+            &BTreeMap::from([(7, "half-red".to_owned())]),
+            &runtime_identity,
+            None,
+        )
+        .unwrap();
     assert_eq!(&ppm[..11], b"P6\n2 2\n255\n");
     let pixels = &ppm[11..];
+    assert_eq!(rgb, pixels);
     assert_eq!(pixels, &[64, 0, 0, 64, 0, 0, 64, 0, 0, 64, 0, 0]);
 
     let diagnostic = display_list
@@ -1431,6 +1446,26 @@ fn skin_rasterizer_samples_bound_sprite_and_composites_alpha() {
     );
     assert_eq!(diagnostic.unclipped_pixel_bounds, [0, 0, 2, 2]);
     assert_eq!(diagnostic.clipped_pixel_bounds, [0, 0, 2, 2]);
+
+    let uncovered = DisplayList::default();
+    let uncovered_ppm = uncovered
+        .render_skin_ppm(2, 2, 1.0, &skin, &BTreeMap::new())
+        .unwrap();
+    let uncovered_rgb = uncovered
+        .render_skin_rgb_with_runtime_transform_and_background(
+            2,
+            2,
+            1.0,
+            &skin,
+            &BTreeMap::new(),
+            &[
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+            None,
+        )
+        .unwrap();
+    assert_eq!(uncovered_rgb, &uncovered_ppm[11..]);
+    assert!(uncovered_rgb.iter().all(|byte| *byte == 0));
 }
 
 #[test]
@@ -1818,6 +1853,9 @@ fn background_renders_first_and_applies_data_color_and_configuration_mask() {
     let identity = std::array::from_fn(|row| {
         std::array::from_fn(|column| if row == column { 1.0 } else { 0.0 })
     });
+    let runtime_identity = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
     let skin = renderer::formats::SkinAssets {
         width: 1,
         height: 1,
@@ -1857,6 +1895,21 @@ fn background_renders_first_and_applies_data_color_and_configuration_mask() {
             )),
         )
         .unwrap();
+    let rgb = draws
+        .render_skin_rgb_with_runtime_transform_and_background(
+            2,
+            2,
+            1.0,
+            &skin,
+            &std::collections::BTreeMap::from([(0, "white".to_owned())]),
+            &runtime_identity,
+            Some((
+                &background,
+                [[-1.0, -1.0], [-1.0, 1.0], [1.0, 1.0], [1.0, -1.0]],
+            )),
+        )
+        .unwrap();
+    assert_eq!(rgb, &ppm[11..]);
     assert_eq!(&ppm[11..14], &[192, 128, 191]);
 }
 

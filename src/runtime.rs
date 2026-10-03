@@ -600,6 +600,30 @@ impl DisplayList {
         runtime_transform: &[f64; 16],
         background: Option<(&crate::formats::BackgroundAssets, [[f64; 2]; 4])>,
     ) -> Result<Vec<u8>> {
+        let rgb = self.render_skin_rgb_with_runtime_transform_and_background(
+            width,
+            height,
+            aspect_ratio,
+            skin,
+            bindings,
+            runtime_transform,
+            background,
+        )?;
+        Ok(rgb_to_ppm(&rgb, width, height))
+    }
+
+    /// Rasterize the skin and background directly to tightly packed RGB24.
+    /// Call the PPM API when a serialized P6 image is part of the output contract.
+    pub fn render_skin_rgb_with_runtime_transform_and_background(
+        &self,
+        width: u32,
+        height: u32,
+        aspect_ratio: f64,
+        skin: &crate::formats::SkinAssets,
+        bindings: &BTreeMap<u32, String>,
+        runtime_transform: &[f64; 16],
+        background: Option<(&crate::formats::BackgroundAssets, [[f64; 2]; 4])>,
+    ) -> Result<Vec<u8>> {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             bail!("frame dimensions must be in 1..=8192");
         }
@@ -700,9 +724,7 @@ impl DisplayList {
                 }
             }
         }
-        let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
-        ppm.extend_from_slice(&rgb);
-        Ok(ppm)
+        Ok(rgb)
     }
 
     /// Composite particle atlas sprites above an already rendered RGB frame.
@@ -940,6 +962,12 @@ pub fn render_background_ppm(
     let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
     ppm.extend_from_slice(&rgb);
     Ok(ppm)
+}
+
+fn rgb_to_ppm(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+    ppm.extend_from_slice(rgb);
+    ppm
 }
 
 fn sample_rgba_bilinear(rgba: &[u8], width: u32, height: u32, x: f64, y: f64) -> [u8; 4] {

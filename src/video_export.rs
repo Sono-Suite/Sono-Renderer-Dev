@@ -1024,8 +1024,7 @@ fn stream_frames_pipelined(
                         frame_profile.total = frame_profile.vm
                             + frame_profile.preparation
                             + frame_profile.backend_wall
-                            + frame_profile.runtime_ui
-                            + frame_profile.framebuffer_copy;
+                            + frame_profile.runtime_ui;
                     }
                     let diagnostic_start = Instant::now();
                     let diagnostic = frame_diagnostic(
@@ -1700,7 +1699,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_without_preflight_keeps_known_baumkuchen_frame_hash() {
+    fn streaming_without_preflight_matches_sequential_baumkuchen_frame() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let package =
             crate::formats::load_engine(&repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"))
@@ -1709,29 +1708,33 @@ mod tests {
         let resources = repo.join("TestingSuite/Next Sekai Engine/skin/ProSeka Faithful 0.8.3.scp");
         let defaults: std::collections::BTreeMap<_, _> =
             package.metadata.resource_defaults().into_iter().collect();
-        let session = FrameSession::new_configured(
-            &package.watch,
-            &package.rom,
-            &package.configuration,
-            &level,
-            &resources,
-            defaults.get("skins").unwrap(),
-            defaults.get("backgrounds").map(String::as_str),
-            defaults.get("effects").map(String::as_str),
-            defaults.get("particles").map(String::as_str),
-            320,
-            180,
-            12,
-            &[(1, 10.8), (22, 1.0)],
-            false,
-            crate::render_ui::RendererUiConfig::default(),
-            0.0,
-            0.25,
-            crate::render::RenderBackend::Wgpu,
-            true,
-            false,
-        )
-        .unwrap();
+        let make_session = || {
+            FrameSession::new_configured(
+                &package.watch,
+                &package.rom,
+                &package.configuration,
+                &level,
+                &resources,
+                defaults.get("skins").unwrap(),
+                defaults.get("backgrounds").map(String::as_str),
+                defaults.get("effects").map(String::as_str),
+                defaults.get("particles").map(String::as_str),
+                320,
+                180,
+                12,
+                &[(1, 10.8), (22, 1.0)],
+                false,
+                crate::render_ui::RendererUiConfig::default(),
+                0.0,
+                0.25,
+                crate::render::RenderBackend::Wgpu,
+                true,
+                false,
+            )
+            .unwrap()
+        };
+        let expected_frame = make_session().render_global_frame(0).unwrap();
+        let session = make_session();
         let range = FrameRange {
             first_index: 0,
             frame_count: 1,
@@ -1754,9 +1757,86 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(
             frames[0].rgb_sha1,
-            "d45f286a15fac6be9b51ded7d0015356b8b92a72"
+            crate::offline::hash_rgb(&expected_frame.rgb)
         );
         assert_eq!(output.len(), 320 * 180 * 3);
+    }
+
+    #[test]
+    fn wgpu_pipeline_matches_sequential_rgb_with_determinism_validation() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let package =
+            crate::formats::load_engine(&repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"))
+                .unwrap();
+        let level = crate::formats::load_level(&repo.join("TestingSuite/Next Sekai Engine/levels/Various Artists - Baumkuchen x Retry Now/Baumkuchen x Retry Now.json.gz")).unwrap();
+        let resources = repo.join("TestingSuite/Next Sekai Engine/skin/ProSeka Faithful 0.8.3.scp");
+        let defaults: std::collections::BTreeMap<_, _> =
+            package.metadata.resource_defaults().into_iter().collect();
+        let make_session = || {
+            FrameSession::new_configured(
+                &package.watch,
+                &package.rom,
+                &package.configuration,
+                &level,
+                &resources,
+                defaults.get("skins").unwrap(),
+                defaults.get("backgrounds").map(String::as_str),
+                defaults.get("effects").map(String::as_str),
+                defaults.get("particles").map(String::as_str),
+                64,
+                36,
+                12,
+                &[(1, 10.8), (22, 1.0)],
+                true,
+                crate::render_ui::RendererUiConfig::default(),
+                0.0,
+                2.0,
+                crate::render::RenderBackend::Wgpu,
+                false,
+                false,
+            )
+            .unwrap()
+        };
+        let range = FrameRange {
+            first_index: 0,
+            frame_count: 24,
+            fps: 12,
+        };
+        let mut sequential_rgb = Vec::new();
+        let expected = stream_frames(
+            make_session(),
+            range,
+            &mut sequential_rgb,
+            None,
+            &package.watch,
+            None,
+            None,
+            "FFmpeg handoff",
+            "FFmpeg final input flush/close",
+            None,
+        )
+        .unwrap();
+        let mut pipeline_rgb = Vec::new();
+        let output = stream_frames_pipelined(
+            make_session(),
+            range,
+            &mut pipeline_rgb,
+            Some(&expected),
+            &package.watch,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(pipeline_rgb, sequential_rgb);
+        assert!(compare_frame_diagnostics(&expected, &output.diagnostics));
+        assert_eq!(
+            output
+                .diagnostics
+                .iter()
+                .map(|frame| frame.global_frame_index)
+                .collect::<Vec<_>>(),
+            (0..range.frame_count).collect::<Vec<_>>(),
+        );
     }
 
     #[test]
@@ -1912,7 +1992,7 @@ mod tests {
     }
 
     #[test]
-    fn baumkuchen_1080p_pipeline_preserves_known_rgb_sfx_and_workload_hashes() {
+    fn baumkuchen_1080p_pipeline_matches_sequential_rgb_and_known_sfx_workload() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let package =
             crate::formats::load_engine(&repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"))
@@ -1931,29 +2011,40 @@ mod tests {
             frame_count: 120,
             fps: 60,
         };
-        let session = FrameSession::new_configured(
-            &package.watch,
-            &package.rom,
-            &package.configuration,
-            &level,
-            &resources,
-            skin,
-            background,
-            effects,
-            particles,
-            1920,
-            1080,
-            60,
-            &options,
-            true,
-            crate::render_ui::RendererUiConfig::default(),
-            0.0,
-            2.0,
-            crate::render::RenderBackend::Wgpu,
-            true,
-            false,
-        )
-        .unwrap();
+        let make_session = || {
+            FrameSession::new_configured(
+                &package.watch,
+                &package.rom,
+                &package.configuration,
+                &level,
+                &resources,
+                skin,
+                background,
+                effects,
+                particles,
+                1920,
+                1080,
+                60,
+                &options,
+                true,
+                crate::render_ui::RendererUiConfig::default(),
+                0.0,
+                2.0,
+                crate::render::RenderBackend::Wgpu,
+                true,
+                false,
+            )
+            .unwrap()
+        };
+        let mut sequential = make_session();
+        let sequential_hashes: Vec<_> = (0..range.frame_count)
+            .map(|local| {
+                let global = range.index(local).unwrap();
+                let frame = sequential.render_global_frame(global).unwrap();
+                (global, crate::offline::hash_rgb(&frame.rgb))
+            })
+            .collect();
+        let session = make_session();
         let output = stream_frames_pipelined(
             session,
             range,
@@ -1964,14 +2055,12 @@ mod tests {
             false,
         )
         .unwrap();
-        let rgb_sequence = hash_sequence(
-            &output
-                .diagnostics
-                .iter()
-                .map(|frame| frame.rgb_sha1.clone())
-                .collect::<Vec<_>>(),
-        );
-        assert_eq!(rgb_sequence, "6e8363f683b1bae0bc8b8f568633699fad668286");
+        let pipelined_hashes: Vec<_> = output
+            .diagnostics
+            .iter()
+            .map(|frame| (frame.global_frame_index, frame.rgb_sha1.clone()))
+            .collect();
+        assert_eq!(pipelined_hashes, sequential_hashes);
         assert_eq!(
             output
                 .diagnostics

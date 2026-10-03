@@ -290,7 +290,6 @@ impl ProfileCollector {
             self.record("GPU encode/submit", profile.gpu_encode_submit);
             self.record("GPU wait/map", profile.gpu_wait_map);
             self.record("GPU readback unpack", profile.framebuffer_unpack);
-            self.record("Framebuffer PPM packaging", profile.framebuffer_packaging);
             let gpu_measured = profile.gpu_draw_preparation
                 + profile.gpu_render_target_setup
                 + profile.gpu_initial_rgba_conversion
@@ -300,8 +299,7 @@ impl ProfileCollector {
                 + profile.gpu_readback_buffer_setup
                 + profile.gpu_encode_submit
                 + profile.gpu_wait_map
-                + profile.framebuffer_unpack
-                + profile.framebuffer_packaging;
+                + profile.framebuffer_unpack;
             self.record(
                 "GPU backend residual",
                 profile.backend_wall.saturating_sub(gpu_measured),
@@ -310,12 +308,8 @@ impl ProfileCollector {
             self.record("CPU backend render/composite", profile.backend_wall);
         }
         self.record("Runtime UI", profile.runtime_ui);
-        self.record("Final framebuffer RGB copy", profile.framebuffer_copy);
-        let frame_measured = profile.vm
-            + profile.preparation
-            + profile.backend_wall
-            + profile.runtime_ui
-            + profile.framebuffer_copy;
+        let frame_measured =
+            profile.vm + profile.preparation + profile.backend_wall + profile.runtime_ui;
         self.record(
             "FrameSession residual",
             profile.total.saturating_sub(frame_measured),
@@ -398,10 +392,6 @@ impl ProfileCollector {
             self.record("Preflight GPU encode/submit", profile.gpu_encode_submit);
             self.record("Preflight GPU wait/map", profile.gpu_wait_map);
             self.record("Preflight GPU readback unpack", profile.framebuffer_unpack);
-            self.record(
-                "Preflight framebuffer PPM packaging",
-                profile.framebuffer_packaging,
-            );
             let gpu_measured = profile.gpu_draw_preparation
                 + profile.gpu_render_target_setup
                 + profile.gpu_initial_rgba_conversion
@@ -411,8 +401,7 @@ impl ProfileCollector {
                 + profile.gpu_readback_buffer_setup
                 + profile.gpu_encode_submit
                 + profile.gpu_wait_map
-                + profile.framebuffer_unpack
-                + profile.framebuffer_packaging;
+                + profile.framebuffer_unpack;
             self.record(
                 "Preflight GPU backend residual",
                 profile.backend_wall.saturating_sub(gpu_measured),
@@ -424,16 +413,9 @@ impl ProfileCollector {
             );
         }
         self.record("Preflight Runtime UI", profile.runtime_ui);
-        self.record(
-            "Preflight final framebuffer RGB copy",
-            profile.framebuffer_copy,
-        );
         self.record("Preflight diagnostics/hash", diagnostics);
-        let frame_measured = profile.vm
-            + profile.preparation
-            + profile.backend_wall
-            + profile.runtime_ui
-            + profile.framebuffer_copy;
+        let frame_measured =
+            profile.vm + profile.preparation + profile.backend_wall + profile.runtime_ui;
         self.record(
             "Preflight FrameSession residual",
             profile.total.saturating_sub(frame_measured),

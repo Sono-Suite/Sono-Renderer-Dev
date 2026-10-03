@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn next_rush_baumkuchen_shared_preview_has_deterministic_wgpu_frame() {
+    fn next_rush_baumkuchen_shared_preview_matches_cpu_reference_on_wgpu() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let config: RenderConfig = serde_json::from_value(serde_json::json!({
             "engine": repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"),
@@ -408,11 +408,35 @@ mod tests {
             "backend": "wgpu"
         })).unwrap();
 
+        let cpu = {
+            let mut cpu_config = config.clone();
+            cpu_config.backend = RenderBackend::Cpu;
+            cpu_config.render_frame(0.0).unwrap()
+        };
         let frame = config.render_frame(0.0).unwrap();
+        let uploaded =
+            crate::gpu_render::with_uploaded_base_reference(|| config.render_frame(0.0).unwrap());
+        if let Some(index) = frame
+            .rgb
+            .iter()
+            .zip(&uploaded.rgb)
+            .position(|(a, b)| a != b)
+        {
+            panic!(
+                "clear/upload first divergence at pixel ({}, {}), channel {}: {} != {}",
+                index / 3 % 320,
+                index / 3 / 320,
+                index % 3,
+                frame.rgb[index],
+                uploaded.rgb[index],
+            );
+        }
+        assert_eq!(frame.rgb.len(), uploaded.rgb.len());
         assert_eq!(
             crate::offline::hash_rgb(&frame.rgb),
-            "d45f286a15fac6be9b51ded7d0015356b8b92a72"
+            crate::offline::hash_rgb(&uploaded.rgb)
         );
+        assert_close_rgb(&cpu.rgb, &frame.rgb, 3, 0.002);
     }
 
     #[test]

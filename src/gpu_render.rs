@@ -96,6 +96,7 @@ struct Params {
     sampling: [f32; 4],
 }
 
+#[cfg_attr(test, derive(Clone))]
 struct DrawOp {
     rect: [u32; 4],
     corners: [[f64; 2]; 4],
@@ -105,6 +106,41 @@ struct DrawOp {
     atlas: usize,
     background: bool,
     mask: bool,
+}
+
+enum FrameBase {
+    Clear([u8; 3]),
+    #[cfg(test)]
+    UploadReference([u8; 3]),
+}
+
+#[cfg(test)]
+thread_local! {
+    static USE_UPLOAD_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_uploaded_base_reference<T>(operation: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            USE_UPLOAD_REFERENCE.set(self.0);
+        }
+    }
+    let _restore = Restore(USE_UPLOAD_REFERENCE.replace(true));
+    operation()
+}
+
+fn base_clear_color(rgb: [u8; 3]) -> wgpu::Color {
+    // The old RGB upload added alpha 255. Keep that opaque destination for
+    // blending, including pixels not covered by any draw. Rgba8Unorm is linear;
+    // tests verify all 256 byte values against the previous upload path.
+    wgpu::Color {
+        r: f64::from(rgb[0]) / 255.0,
+        g: f64::from(rgb[1]) / 255.0,
+        b: f64::from(rgb[2]) / 255.0,
+        a: 1.0,
+    }
 }
 
 struct Gpu {
@@ -147,7 +183,6 @@ pub(crate) struct GpuFrameProfile {
     pub encode_submit: std::time::Duration,
     pub wait_map: std::time::Duration,
     pub unpack: std::time::Duration,
-    pub ppm_packaging: std::time::Duration,
     pub draw_calls: usize,
     pub atlas_uploads: usize,
     pub readback_bytes: u64,
@@ -337,7 +372,7 @@ fn render(
     width: u32,
     height: u32,
     aspect: f64,
-    initial_rgb: &[u8],
+    base: FrameBase,
     draws: Vec<DrawOp>,
     mut profile: Option<&mut GpuFrameProfile>,
 ) -> Result<Vec<u8>> {
@@ -368,37 +403,14 @@ fn render(
     if let (Some(start), Some(p)) = (target_setup_start, profile.as_deref_mut()) {
         p.render_target_setup = start.elapsed();
     }
-    let rgba_start = profile.as_ref().map(|_| std::time::Instant::now());
-    let initial_rgba = rgb_to_rgba(initial_rgb);
-    if initial_rgba.len() != width as usize * height as usize * 4 {
-        bail!("initial framebuffer has invalid dimensions");
-    }
-    if let (Some(start), Some(p)) = (rgba_start, profile.as_deref_mut()) {
-        p.initial_rgba_conversion = start.elapsed();
-    }
-    let initial_upload_start = profile.as_ref().map(|_| std::time::Instant::now());
-    gpu.queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &tex,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &initial_rgba,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(width * 4),
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    if let (Some(start), Some(p)) = (initial_upload_start, profile.as_deref_mut()) {
-        p.initial_framebuffer_upload = start.elapsed();
-    }
+    let load = match base {
+        FrameBase::Clear(rgb) => wgpu::LoadOp::Clear(base_clear_color(rgb)),
+        #[cfg(test)]
+        FrameBase::UploadReference(rgb) => {
+            upload_reference_base(gpu, &tex, width, height, rgb);
+            wgpu::LoadOp::Load
+        }
+    };
     let mut resident = Vec::with_capacity(atlases.len());
     for (input, iw, ih, identity) in atlases {
         let atlas_cache_start = profile.as_ref().map(|_| std::time::Instant::now());
@@ -441,7 +453,7 @@ fn render(
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
+                    load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -558,13 +570,7 @@ fn render(
     Ok(rgb)
 }
 
-fn ppm(rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
-    let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
-    out.extend_from_slice(rgb);
-    out
-}
-
-pub(crate) fn render_display_list(
+pub(crate) fn render_display_list_rgb(
     renderer: &GpuRenderer,
     list: &crate::runtime::DisplayList,
     width: u32,
@@ -605,7 +611,7 @@ pub(crate) fn render_display_list(
     }
     let mut draws = Vec::new();
     let mut atlases = vec![(skin.rgba.as_slice(), skin.width, skin.height, skin_identity)];
-    let mut initial = vec![0u8; width as usize * height as usize * 3];
+    let mut base = [0u8; 3];
     if let Some((bg, quad, bg_identity)) = background {
         if bg.configuration.blur != 0.0 {
             bail!("nonzero Sonolus background blur is not yet supported");
@@ -617,11 +623,9 @@ pub(crate) fn render_display_list(
         {
             bail!("background asset or Runtime Background quad is invalid");
         }
-        let base = crate::formats::parse_background_color(&bg.data.color, false)?;
+        let color = crate::formats::parse_background_color(&bg.data.color, false)?;
         let mask = crate::formats::parse_background_color(&bg.configuration.mask, true)?;
-        for pixel in initial.chunks_exact_mut(3) {
-            pixel.copy_from_slice(&base[..3]);
-        }
+        base.copy_from_slice(&color[..3]);
         let bg_atlas = atlases.len();
         atlases.push((bg.rgba.as_slice(), bg.width, bg.height, bg_identity));
         draws.push(DrawOp {
@@ -724,10 +728,9 @@ pub(crate) fn render_display_list(
             {
                 bail!("particle sprite has an invalid atlas rectangle");
             }
-            let c = crate::runtime::gpu_transform_particle_corners(d, particle_runtime);
             draws.push(DrawOp {
                 rect: [s.x, s.y, s.width, s.height],
-                corners: c,
+                corners: crate::runtime::gpu_transform_particle_corners(d, particle_runtime),
                 alpha: d.alpha.clamp(0.0, 1.0),
                 tint: [
                     d.color[0] as f64 / 255.0,
@@ -745,33 +748,290 @@ pub(crate) fn render_display_list(
     if let (Some(start), Some(p)) = (preparation_start, profile.as_deref_mut()) {
         p.draw_preparation = start.elapsed();
     }
-    let rgb = render(
+    let base = FrameBase::Clear(base);
+    #[cfg(test)]
+    let base = match base {
+        FrameBase::Clear(rgb) if USE_UPLOAD_REFERENCE.get() => FrameBase::UploadReference(rgb),
+        base => base,
+    };
+    render(
         renderer,
         &atlases,
         width,
         height,
         aspect,
-        &initial,
+        base,
         draws,
         profile.as_deref_mut(),
-    )?;
-    let pack_start = profile.as_ref().map(|_| std::time::Instant::now());
-    let ppm = ppm(&rgb, width, height);
-    if let (Some(start), Some(p)) = (pack_start, profile.as_deref_mut()) {
-        p.ppm_packaging = start.elapsed();
-    }
-    Ok(ppm)
+    )
 }
-fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
-    rgb.chunks_exact(3)
+#[cfg(test)]
+fn upload_reference_base(gpu: &Gpu, tex: &wgpu::Texture, width: u32, height: u32, base: [u8; 3]) {
+    // Keep the former CPU RGB -> RGBA -> upload initialization only in tests.
+    let mut rgb = vec![0u8; width as usize * height as usize * 3];
+    for pixel in rgb.chunks_exact_mut(3) {
+        pixel.copy_from_slice(&base);
+    }
+    let rgba: Vec<u8> = rgb
+        .chunks_exact(3)
         .flat_map(|p| [p[0], p[1], p[2], 255])
-        .collect()
+        .collect();
+    gpu.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    fn assert_exact_rgb(actual: &[u8], expected: &[u8], width: usize, context: &str) {
+        assert_eq!(actual.len(), expected.len());
+        if let Some(index) = actual.iter().zip(expected).position(|(a, b)| a != b) {
+            panic!(
+                "{context}: first difference at pixel ({}, {}), channel {}: {} != {}",
+                index / 3 % width,
+                index / 3 / width,
+                index % 3,
+                actual[index],
+                expected[index]
+            );
+        }
+    }
+
+    #[test]
+    fn clear_base_matches_uploaded_base_for_every_channel_byte() {
+        let gpu = GpuRenderer::new().unwrap();
+        // Each channel visits every possible byte. Width 3 also exercises padded
+        // readback rows. Alternating colors checks fresh-frame independence.
+        for value in 0..=255u8 {
+            let base = [value, 255 - value, value.rotate_left(1)];
+            let reference = render(
+                &gpu,
+                &[],
+                3,
+                2,
+                1.5,
+                FrameBase::UploadReference(base),
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+            let mut profile = GpuFrameProfile::default();
+            let cleared = render(
+                &gpu,
+                &[],
+                3,
+                2,
+                1.5,
+                FrameBase::Clear(base),
+                Vec::new(),
+                Some(&mut profile),
+            )
+            .unwrap();
+            let expected = base.repeat(6);
+            assert_exact_rgb(&reference, &expected, 3, &format!("uploaded base {base:?}"));
+            assert_exact_rgb(&cleared, &reference, 3, &format!("cleared base {base:?}"));
+            assert_eq!(profile.initial_rgba_conversion, std::time::Duration::ZERO);
+            assert_eq!(
+                profile.initial_framebuffer_upload,
+                std::time::Duration::ZERO
+            );
+        }
+    }
+
+    #[test]
+    fn clear_base_preserves_partial_coverage_and_ordered_blending() {
+        let gpu = GpuRenderer::new().unwrap();
+        let pixels = [219, 57, 103, 128];
+        let atlases = [(pixels.as_slice(), 1, 1, atlas_identity(&pixels, 1, 1))];
+        let partial = [[-0.5, -0.5], [-0.5, 0.5], [0.5, 0.5], [0.5, -0.5]];
+        let sprite = DrawOp {
+            rect: [0, 0, 1, 1],
+            corners: partial,
+            alpha: 0.5,
+            tint: [1.0; 4],
+            interpolation: false,
+            atlas: 0,
+            background: false,
+            mask: false,
+        };
+        // Background sampling, full-screen mask, skin and tinted particle paths
+        // all blend in the same pass. Compare with the former initialization,
+        // keeping every draw parameter and its order identical.
+        let draws = vec![
+            DrawOp {
+                background: true,
+                interpolation: true,
+                ..sprite.clone()
+            },
+            DrawOp {
+                corners: [[-1.0, -1.0], [-1.0, 1.0], [1.0, 1.0], [1.0, -1.0]],
+                alpha: 119.0 / 255.0,
+                tint: [0.2, 0.4, 0.6, 1.0],
+                mask: true,
+                ..sprite.clone()
+            },
+            sprite.clone(),
+            DrawOp {
+                tint: [0.3, 0.7, 0.9, 1.0],
+                ..sprite
+            },
+        ];
+        for value in 0..=255u8 {
+            let base = [value, 255 - value, value.rotate_left(1)];
+            // Also test genuinely untouched pixels without the full-screen mask.
+            for with_mask in [false, true] {
+                let ordered: Vec<_> = draws
+                    .iter()
+                    .filter(|d| with_mask || !d.mask)
+                    .cloned()
+                    .collect();
+                let reference = render(
+                    &gpu,
+                    &atlases,
+                    8,
+                    8,
+                    1.0,
+                    FrameBase::UploadReference(base),
+                    ordered.clone(),
+                    None,
+                )
+                .unwrap();
+                let cleared = render(
+                    &gpu,
+                    &atlases,
+                    8,
+                    8,
+                    1.0,
+                    FrameBase::Clear(base),
+                    ordered,
+                    None,
+                )
+                .unwrap();
+                assert_exact_rgb(
+                    &cleared,
+                    &reference,
+                    8,
+                    &format!("base {base:?}, mask={with_mask}"),
+                );
+                if !with_mask {
+                    assert_eq!(&cleared[..3], &base);
+                    assert_ne!(&cleared[(4 * 8 + 4) * 3..(4 * 8 + 4) * 3 + 3], &base);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clear_base_background_mask_and_skin_match_exact_cpu_pixels() {
+        let gpu = GpuRenderer::new().unwrap();
+        let transform = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        let mut sprite_transform = [[0.0; 8]; 8];
+        for (i, row) in sprite_transform.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        let skin = crate::formats::SkinAssets {
+            width: 1,
+            height: 1,
+            interpolation: false,
+            rgba: vec![19, 83, 227, 255],
+            sprites: [(
+                "test".into(),
+                crate::formats::SkinSpriteAsset {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                    transform: sprite_transform,
+                },
+            )]
+            .into(),
+        };
+        let bindings = [(0, "test".into())].into();
+        let list = crate::runtime::DisplayList {
+            sprites: vec![crate::runtime::SpriteDraw {
+                sprite_id: 0,
+                corners: [[-0.5, -0.5], [-0.5, 0.5], [0.5, 0.5], [0.5, -0.5]],
+                z: [0.0; 4],
+                alpha: 1.0,
+                provenance: None,
+                trace: None,
+            }],
+        };
+        for color in ["#123456", "#abc", "#fe0180"] {
+            for mask in ["#0000", "#13579bff"] {
+                let background = crate::formats::BackgroundAssets {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![79, 137, 201, 0],
+                    data: crate::formats::BackgroundData {
+                        aspect_ratio: None,
+                        fit: "contain".into(),
+                        color: color.into(),
+                        scale_x: None,
+                        scale_y: None,
+                    },
+                    configuration: crate::formats::BackgroundConfiguration {
+                        blur: 0.0,
+                        mask: mask.into(),
+                    },
+                };
+                let quad = [[-0.5, -0.5], [-0.5, 0.5], [0.5, 0.5], [0.5, -0.5]];
+                // These CPU cases use transparent background pixels, opaque
+                // masks and opaque skin, for which exact agreement is valid.
+                for background in [None, Some((&background, quad))] {
+                    for display in [&crate::runtime::DisplayList::default(), &list] {
+                        let cpu = display
+                            .render_skin_ppm_with_runtime_transform_and_background(
+                                8, 8, 1.0, &skin, &bindings, &transform, background,
+                            )
+                            .unwrap();
+                        let actual = render_display_list_rgb(
+                            &gpu,
+                            display,
+                            8,
+                            8,
+                            1.0,
+                            &skin,
+                            atlas_identity(&skin.rgba, 1, 1),
+                            &bindings,
+                            &transform,
+                            background.map(|(bg, quad)| (bg, quad, atlas_identity(&bg.rgba, 1, 1))),
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                        assert_exact_rgb(
+                            &actual,
+                            &crate::offline::ppm_rgb_payload(&cpu, 8, 8).unwrap(),
+                            8,
+                            &format!("background {color}, mask {mask}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn atlas_identity_is_stable_and_changes_with_pixels_or_dimensions() {
@@ -846,7 +1106,7 @@ mod tests {
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
         ];
         let gpu = GpuRenderer::shared().unwrap();
-        let ppm = render_display_list(
+        let gpu_rgb = render_display_list_rgb(
             gpu,
             &crate::runtime::DisplayList::default(),
             4,
@@ -866,14 +1126,6 @@ mod tests {
             None,
         )
         .unwrap();
-        let header_end = ppm
-            .iter()
-            .enumerate()
-            .filter(|(_, byte)| **byte == b'\n')
-            .nth(2)
-            .map(|(index, _)| index + 1)
-            .unwrap();
-        let gpu_rgb = &ppm[header_end..];
         let mut cpu_rgb = vec![0u8; 4 * 4 * 3];
         crate::runtime::DisplayList::composite_particle_sprites(
             &mut cpu_rgb,
