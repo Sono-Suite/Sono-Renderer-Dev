@@ -3257,7 +3257,7 @@ fn watch_while_legacy_condition_body_is_pretest_and_returns_last_body_value() {
 }
 
 #[test]
-fn watch_while_single_body_repeats_until_break_and_returns_break_value() {
+fn watch_vm_local_legacy_single_body_while_repeats_until_break() {
     use renderer::watch::EngineNode as N;
     let nodes: Vec<N> = serde_json::from_value(serde_json::json!([
         {"value":2000},{"value":0},{"value":1},{"value":3},
@@ -3269,6 +3269,8 @@ fn watch_while_single_body_repeats_until_break_and_returns_break_value() {
     ]))
     .unwrap();
     let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    // Local compatibility coverage only: this one-child While form is not a
+    // valid Sonolus v1.1.4 oracle fixture.
     assert_eq!(vm.execute(13).unwrap(), 99.0);
     assert_eq!(vm.memory.get(2000, 0), 3.0);
 }
