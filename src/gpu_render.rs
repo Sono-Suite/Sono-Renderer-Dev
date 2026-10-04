@@ -66,11 +66,34 @@ fn sample_at(x0: i32, y0: i32, fx: f32, fy: f32) -> vec4<f32> {
   let d=textureLoad(tex,vec2<i32>(clamp(x0+1,xlo,xhi),clamp(y0+1,ylo,yhi)),0);
   return floor(((a*(1.0-fx)+b*fx)*(1.0-fy)+(c*(1.0-fx)+d*fx)*fy)*255.0+0.5)/255.0;
 }
+fn triangle_uv(coord: vec2<f32>, ids: vec3<u32>) -> vec2<f32> {
+  let a=p.corners[ids.x].xy; let ab=p.corners[ids.y].xy-a; let ac=p.corners[ids.z].xy-a; let ap=coord-a;
+  let det=ab.x*ac.y-ab.y*ac.x;
+  if abs(det)<1e-12 { return vec2(-1000.0); }
+  let beta=(ap.x*ac.y-ap.y*ac.x)/det; let gamma=(ab.x*ap.y-ab.y*ap.x)/det;
+  let bary=vec3(1.0-beta-gamma,beta,gamma);
+  if min(min(bary.x,bary.y),bary.z)<-1e-7 { return vec2(-1000.0); }
+  let w=bary*vec3(p.corners[ids.x].z,p.corners[ids.y].z,p.corners[ids.z].z);
+  let sum=w.x+w.y+w.z;
+  if abs(sum)<1e-12 { return vec2(-1000.0); }
+  var uv=array<vec2<f32>,4>(vec2(0.0,0.0),vec2(0.0,1.0),vec2(1.0,1.0),vec2(1.0,0.0));
+  return (w.x*uv[ids.x]+w.y*uv[ids.y]+w.z*uv[ids.z])/sum;
+}
+fn lightweight_uv(coord: vec2<f32>) -> vec2<f32> {
+  let uv=triangle_uv(coord,vec3<u32>(0u,1u,2u));
+  if uv.x>-999.0 { return uv; }
+  return triangle_uv(coord,vec3<u32>(0u,2u,3u));
+}
 @fragment fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
   if p.sampling.z > 0.5 { return vec4(p.tint.rgb, p.frame.w); }
   let coord=vec2((frag.x/p.frame.x*2.0-1.0)*p.frame.z, 1.0-frag.y/p.frame.y*2.0);
-  let uv=invbilinear(coord);
-  if uv.x < -1e-7 || uv.x > 1.0000001 || uv.y < -1e-7 || uv.y > 1.0000001 { discard; }
+  var uv=vec2<f32>(0.0);
+  if p.sampling.w > 0.5 { uv=lightweight_uv(coord); } else { uv=invbilinear(coord); }
+  if p.sampling.w > 0.5 {
+    if uv.x < -999.0 { discard; }
+  } else {
+    if uv.x < -1e-7 || uv.x > 1.0000001 || uv.y < -1e-7 || uv.y > 1.0000001 { discard; }
+  }
   var texel: vec4<f32>;
   if p.sampling.y > 0.5 {
     let tx=p.atlas.x+clamp(uv.x,0.0,1.0)*(p.atlas.z-1.0);
@@ -106,6 +129,7 @@ struct DrawOp {
     atlas: usize,
     background: bool,
     mask: bool,
+    skin_mode: crate::skin_render_mode::SkinRenderMode,
 }
 
 enum FrameBase {
@@ -129,6 +153,26 @@ pub(crate) fn with_uploaded_base_reference<T>(operation: impl FnOnce() -> T) -> 
     }
     let _restore = Restore(USE_UPLOAD_REFERENCE.replace(true));
     operation()
+}
+
+// Test-only readback of the real render target, including its alpha channel.
+#[cfg(test)]
+thread_local! {
+    static RGBA_CAPTURE: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn capture_rgba<T>(operation: impl FnOnce() -> T) -> (T, Vec<u8>) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RGBA_CAPTURE.with(|s| *s.borrow_mut() = None);
+        }
+    }
+    RGBA_CAPTURE.with(|s| *s.borrow_mut() = Some(Vec::new()));
+    let _reset = Reset;
+    let result = operation();
+    let rgba = RGBA_CAPTURE.with(|s| s.borrow_mut().take().unwrap());
+    (result, rgba)
 }
 
 fn base_clear_color(rgb: [u8; 3]) -> wgpu::Color {
@@ -466,7 +510,22 @@ fn render(
         for d in draws {
             let [x, y, w, h] = d.rect;
             let params = Params {
-                corners: d.corners.map(|p| [p[0] as f32, p[1] as f32, 0.0, 0.0]),
+                corners: {
+                    let weights =
+                        if d.skin_mode == crate::skin_render_mode::SkinRenderMode::Lightweight {
+                            crate::skin_render_mode::projective_weights(&d.corners)
+                        } else {
+                            [0.0; 4]
+                        };
+                    std::array::from_fn(|i| {
+                        [
+                            d.corners[i][0] as f32,
+                            d.corners[i][1] as f32,
+                            weights[i] as f32,
+                            0.0,
+                        ]
+                    })
+                },
                 atlas: [x as f32, y as f32, w as f32, h as f32],
                 frame: [width as f32, height as f32, aspect as f32, d.alpha as f32],
                 tint: d.tint.map(|v| v as f32),
@@ -478,7 +537,11 @@ fn render(
                     },
                     if d.background { 1.0 } else { 0.0 },
                     if d.mask { 1.0 } else { 0.0 },
-                    0.0,
+                    if d.skin_mode == crate::skin_render_mode::SkinRenderMode::Lightweight {
+                        1.0
+                    } else {
+                        0.0
+                    },
                 ],
             };
             let ub = gpu
@@ -559,6 +622,12 @@ fn render(
         for pixel in
             mapped[row * padded as usize..row * padded as usize + stride as usize].chunks_exact(4)
         {
+            #[cfg(test)]
+            RGBA_CAPTURE.with(|s| {
+                if let Some(rgba) = s.borrow_mut().as_mut() {
+                    rgba.extend_from_slice(pixel);
+                }
+            });
             rgb.extend_from_slice(&pixel[..3]);
         }
     }
@@ -570,6 +639,7 @@ fn render(
     Ok(rgb)
 }
 
+#[cfg(test)]
 pub(crate) fn render_display_list_rgb(
     renderer: &GpuRenderer,
     list: &crate::runtime::DisplayList,
@@ -591,7 +661,48 @@ pub(crate) fn render_display_list_rgb(
         &[f64; 16],
         AtlasIdentity,
     )>,
+    profile: Option<&mut GpuFrameProfile>,
+) -> Result<Vec<u8>> {
+    render_display_list_rgb_with_skin_mode(
+        renderer,
+        list,
+        width,
+        height,
+        aspect,
+        skin,
+        skin_identity,
+        bindings,
+        runtime,
+        background,
+        particles,
+        profile,
+        crate::skin_render_mode::SkinRenderMode::Standard,
+    )
+}
+
+pub(crate) fn render_display_list_rgb_with_skin_mode(
+    renderer: &GpuRenderer,
+    list: &crate::runtime::DisplayList,
+    width: u32,
+    height: u32,
+    aspect: f64,
+    skin: &crate::formats::SkinAssets,
+    skin_identity: AtlasIdentity,
+    bindings: &std::collections::BTreeMap<u32, String>,
+    runtime: &[f64; 16],
+    background: Option<(
+        &crate::formats::BackgroundAssets,
+        [[f64; 2]; 4],
+        AtlasIdentity,
+    )>,
+    particles: Option<(
+        &crate::formats::ParticleAssets,
+        &[crate::particles::ParticleSpriteDraw],
+        &[f64; 16],
+        AtlasIdentity,
+    )>,
     mut profile: Option<&mut GpuFrameProfile>,
+    skin_mode: crate::skin_render_mode::SkinRenderMode,
 ) -> Result<Vec<u8>> {
     let preparation_start = profile.as_ref().map(|_| std::time::Instant::now());
     if width == 0
@@ -637,6 +748,7 @@ pub(crate) fn render_display_list_rgb(
             atlas: bg_atlas,
             background: true,
             mask: false,
+            skin_mode: crate::skin_render_mode::SkinRenderMode::Standard,
         });
         let full = [
             [-aspect, -1.0],
@@ -658,6 +770,7 @@ pub(crate) fn render_display_list_rgb(
             atlas: 0,
             background: false,
             mask: true,
+            skin_mode: crate::skin_render_mode::SkinRenderMode::Standard,
         });
     }
     let mut order: Vec<_> = list.sprites.iter().collect();
@@ -694,6 +807,7 @@ pub(crate) fn render_display_list_rgb(
             atlas: 0,
             background: false,
             mask: false,
+            skin_mode,
         });
     }
     if let Some((assets, particle_draws, particle_runtime, particle_identity)) = particles {
@@ -742,6 +856,7 @@ pub(crate) fn render_display_list_rgb(
                 atlas: particle_atlas,
                 background: false,
                 mask: false,
+                skin_mode: crate::skin_render_mode::SkinRenderMode::Standard,
             });
         }
     }
@@ -872,6 +987,7 @@ mod tests {
             atlas: 0,
             background: false,
             mask: false,
+            skin_mode: crate::skin_render_mode::SkinRenderMode::Standard,
         };
         // Background sampling, full-screen mask, skin and tinted particle paths
         // all blend in the same pass. Compare with the former initialization,

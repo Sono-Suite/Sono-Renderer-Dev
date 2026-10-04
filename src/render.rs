@@ -41,12 +41,25 @@ pub struct RenderConfig {
     pub skin: Option<String>,
     #[serde(default)]
     pub music: Option<PathBuf>,
+    /// Explicit video background, sampled on the canonical media timeline.
+    #[serde(default)]
+    pub mv: Option<PathBuf>,
+    #[serde(default = "default_mv_enabled")]
+    pub mv_enabled: bool,
+    /// Sono-Renderer presentation brightness; does not change media timing.
+    #[serde(default = "default_mv_background")]
+    pub mv_background: f64,
+    #[serde(default)]
+    pub resource_overrides: ResourceOverrides,
     #[serde(default)]
     pub output: Option<PathBuf>,
     #[serde(default)]
     pub start_time: f64,
     #[serde(default = "default_duration")]
     pub duration: f64,
+    /// Infer an end from evaluated Watch schedules and audio bounds.
+    #[serde(default)]
+    pub whole_chart: bool,
     #[serde(default = "default_fps")]
     pub fps: u32,
     #[serde(default = "default_width")]
@@ -71,7 +84,7 @@ pub struct RenderConfig {
     /// streaming render. Disabled for ordinary exports.
     #[serde(default)]
     pub validate_determinism: bool,
-    /// Run SFX event collection concurrently with the independent render session.
+    /// Legacy configuration field, accepted but ignored: SFX now comes from rendering.
     #[serde(default = "default_concurrent_sfx_prepass")]
     pub concurrent_sfx_prepass: bool,
     /// Overlap serial Watch preparation with ordered render/output work.
@@ -87,6 +100,27 @@ pub enum RenderBackend {
     Wgpu,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ResourceOverrides {
+    pub particles: Option<PathBuf>,
+    pub effects: Option<PathBuf>,
+    pub background: Option<PathBuf>,
+    pub particle_name: Option<String>,
+}
+
+pub(crate) fn validate_mv_background(value: f64) -> Result<()> {
+    if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+        bail!("MV background percentage must be in 0..=100");
+    }
+    Ok(())
+}
+
+fn default_mv_enabled() -> bool {
+    true
+}
+fn default_mv_background() -> f64 {
+    100.0
+}
 fn default_duration() -> f64 {
     2.0
 }
@@ -133,6 +167,7 @@ impl RenderConfig {
                 bail!("Level Option {} must be finite", option.index);
             }
         }
+        validate_mv_background(self.mv_background)?;
         self.ui.validate()?;
         Ok(())
     }
@@ -172,7 +207,7 @@ impl RenderConfig {
             .iter()
             .map(|item| (item.index, item.value))
             .collect();
-        let mut session = FrameSession::new_configured(
+        let mut session = FrameSession::new_configured_with_sources(
             &package.watch,
             &package.rom,
             &package.configuration,
@@ -181,7 +216,10 @@ impl RenderConfig {
             skin,
             background,
             effects,
-            particles,
+            self.resource_overrides
+                .particle_name
+                .as_deref()
+                .or(particles),
             self.width,
             self.height,
             self.fps,
@@ -193,7 +231,18 @@ impl RenderConfig {
             self.backend,
             self.profile,
             self.trace_entity_id.is_some(),
+            &self.resource_overrides,
         )?;
+        if let Some(path) = self.mv.as_deref().filter(|_| self.mv_enabled) {
+            let range = crate::offline::FrameRange::new(time, 1.0 / f64::from(self.fps), self.fps)?;
+            let timeline = crate::export_timeline::ExportTimeline::new(
+                time,
+                range,
+                level.bgm_offset.unwrap_or(0.0),
+            )?;
+            session.configure_mv(&crate::ffmpeg::resolve()?, path, timeline)?;
+            session.set_mv_background(self.mv_background);
+        }
         let index = (time * f64::from(self.fps)).ceil() as u64;
         session.render_global_frame(index)
     }
@@ -202,11 +251,50 @@ impl RenderConfig {
         self.validate()?;
         video_export::export_config(self)
     }
+
+    pub fn render_video_controlled(
+        &self,
+        sink: crate::export_progress::ProgressSink,
+        control: crate::export_control::ExportControl,
+    ) -> Result<video_export::ExportReport> {
+        self.validate()?;
+        video_export::export_config_controlled(self, sink, control)
+    }
+
+    pub fn render_video_with_progress(
+        &self,
+        sink: crate::export_progress::ProgressSink,
+    ) -> Result<video_export::ExportReport> {
+        self.validate()?;
+        video_export::export_config_with_progress(self, sink)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mv_percentage_validation_and_shared_roundtrip() {
+        let mut config: RenderConfig =
+            serde_json::from_value(serde_json::json!({"engine":"e", "resources":"r", "level":"l"}))
+                .unwrap();
+        assert_eq!(config.mv_background, 100.0);
+        assert!(config.mv_enabled);
+        config.mv_enabled = false;
+        for percent in [0.0, 40.0, 100.0] {
+            config.mv_background = percent;
+            config.validate().unwrap();
+            let copy: RenderConfig =
+                serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+            assert_eq!(copy.mv_background, percent);
+            assert!(!copy.mv_enabled);
+        }
+        for percent in [-0.01, 100.01, f64::NAN, f64::INFINITY] {
+            config.mv_background = percent;
+            assert!(config.validate().is_err());
+        }
+    }
 
     #[test]
     fn config_json_preserves_arbitrary_level_option_indices_and_layer_toggles() {
@@ -478,6 +566,8 @@ mod tests {
         let cpu = config.render_frame(0.0).unwrap();
         let mut gpu_config = config;
         gpu_config.backend = RenderBackend::Wgpu;
+        gpu_config.mv = Some("deliberately absent disabled movie.mp4".into());
+        gpu_config.mv_enabled = false;
         let gpu = gpu_config.render_frame(0.0).unwrap();
         assert_close_rgb(&cpu.rgb, &gpu.rgb, 3, 0.002);
     }

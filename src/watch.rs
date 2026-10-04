@@ -8,7 +8,7 @@ pub struct WatchData {
     pub archetypes: Vec<WatchArchetype>,
     #[serde(default)]
     pub nodes: Vec<EngineNode>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_skin")]
     pub skin: Value,
     #[serde(default)]
     pub effect: Value,
@@ -20,6 +20,30 @@ pub struct WatchData {
     pub buckets: Vec<Value>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+fn deserialize_skin<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
+    let skin = Value::deserialize(deserializer)?;
+    parse_skin_render_mode(&skin)
+        .map_err(|error| serde::de::Error::custom(format!("skin.renderMode: {error}")))?;
+    Ok(skin)
+}
+
+fn parse_skin_render_mode(
+    skin: &Value,
+) -> Result<crate::skin_render_mode::SkinRenderModePreference, serde_json::Error> {
+    match skin.get("renderMode") {
+        None => Ok(crate::skin_render_mode::SkinRenderModePreference::Default),
+        Some(value) => serde_json::from_value(value.clone()),
+    }
+}
+
+impl WatchData {
+    pub fn skin_render_mode(
+        &self,
+    ) -> Result<crate::skin_render_mode::SkinRenderModePreference, serde_json::Error> {
+        parse_skin_render_mode(&self.skin)
+    }
 }
 /// A compiled Sonolus node. `func` is deliberately an open string: engines may
 /// use any operation name, even when this renderer has no VM implementation.

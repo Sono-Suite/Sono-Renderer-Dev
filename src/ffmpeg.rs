@@ -87,9 +87,17 @@ fn binary_names() -> (&'static str, &'static str) {
 /// directory. Cargo debug/release binaries use the repository as their root.
 fn application_root() -> Result<PathBuf> {
     let executable = std::env::current_exe().context("locating Sono-Renderer executable")?;
-    let executable_dir = executable
+    let mut executable_dir = executable
         .parent()
         .ok_or_else(|| anyhow!("executable path has no parent directory"))?;
+    // Cargo integration/unit test executables live in target/{debug,release}/deps.
+    // Resolve their sibling profile directory before applying the normal
+    // development-build rule below.
+    if executable_dir.file_name().and_then(|s| s.to_str()) == Some("deps") {
+        executable_dir = executable_dir
+            .parent()
+            .ok_or_else(|| anyhow!("test executable directory has no profile parent"))?;
+    }
     let profile = executable_dir.file_name().and_then(|s| s.to_str());
     if matches!(profile, Some("debug" | "release")) {
         return Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
@@ -126,7 +134,7 @@ fn validate_binary(path: &Path, label: &str) -> Result<()> {
 }
 
 fn run_version(path: &Path) -> Result<String> {
-    let output = Command::new(path)
+    let output = crate::export_control::hide_child_window(&mut Command::new(path))
         .arg("-version")
         .output()
         .with_context(|| format!("launching {}", path.display()))?;
@@ -206,7 +214,7 @@ fn download_archive(destination: &Path) -> Result<()> {
     let command = format!(
         "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '{DISTRIBUTION_URL}' -OutFile '{script_path}'"
     );
-    let output = Command::new("powershell.exe")
+    let output = crate::export_control::hide_child_window(&mut Command::new("powershell.exe"))
         .args(["-NoProfile", "-NonInteractive", "-Command", &command])
         .output()
         .context("starting the managed FFmpeg download")?;
@@ -230,7 +238,7 @@ fn verify_archive(path: &Path) -> Result<()> {
         let command = format!(
             "$ErrorActionPreference='Stop'; (Get-FileHash -Algorithm SHA256 -LiteralPath '{escaped}').Hash"
         );
-        let output = Command::new("powershell.exe")
+        let output = crate::export_control::hide_child_window(&mut Command::new("powershell.exe"))
             .args(["-NoProfile", "-NonInteractive", "-Command", &command])
             .output()
             .context("calculating managed FFmpeg archive SHA-256")?;

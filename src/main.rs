@@ -318,7 +318,7 @@ enum Command {
         #[arg(long, default_value_t = 720)]
         height: u32,
     },
-    /// Render a bounded deterministic Watch timeline segment to an MP4 with level music.
+    /// Render a deterministic Watch segment or whole chart to MP4 with level music.
     RenderVideo {
         engine: PathBuf,
         resources: PathBuf,
@@ -328,13 +328,27 @@ enum Command {
         /// Optional presentation asset; not used in gameplay rendering.
         #[arg(long)]
         cover: Option<PathBuf>,
-        /// Custom MV compositing is not implemented.
+        /// Custom video background on the BGM media timeline.
         #[arg(long = "mv")]
         custom_mv: Option<PathBuf>,
-        #[arg(long, default_value_t = 14.0)]
-        start_time: f64,
-        #[arg(long, default_value_t = 2.0)]
-        duration: f64,
+        /// Retain a selected MV path but disable video background use.
+        #[arg(long)]
+        no_mv: bool,
+        /// MV presentation brightness, independent of the media timeline.
+        #[arg(long, default_value_t = 100.0, value_parser = parse_mv_background)]
+        mv_background: f64,
+        /// Optional separate SCP particle resource collection.
+        #[arg(long)]
+        particle_resources: Option<PathBuf>,
+        #[arg(long)]
+        particle_name: Option<String>,
+        #[arg(long)]
+        start_time: Option<f64>,
+        #[arg(long, conflicts_with = "whole_chart")]
+        duration: Option<f64>,
+        /// Infer the chart end from Watch schedules, BGM, and known SFX tails.
+        #[arg(long)]
+        whole_chart: bool,
         #[arg(long, default_value_t = 12)]
         fps: u32,
         #[arg(long, default_value_t = 640)]
@@ -353,10 +367,10 @@ enum Command {
         /// Render a full preflight and compare draw/RGB hashes against streaming.
         #[arg(long)]
         validate_determinism: bool,
-        /// Force sequential SFX collection for --sequential-frames (production default).
+        /// Legacy no-op: SFX is collected by the rendering Watch execution.
         #[arg(long, conflicts_with = "concurrent_sfx_prepass")]
         sequential_sfx_prepass: bool,
-        /// Compare the legacy concurrent SFX prepass when --sequential-frames is selected.
+        /// Legacy no-op: no independent SFX Watch session is created.
         #[arg(
             long,
             requires = "sequential_frames",
@@ -375,11 +389,26 @@ enum Command {
         #[command(flatten)]
         render_layers: RenderLayerArgs,
     },
-    /// Open the local browser based preview and video export frontend.
+    /// Open the native desktop export application.
     Gui,
 }
 
+fn parse_mv_background(value: &str) -> std::result::Result<f64, String> {
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| "expected a percentage".to_owned())?;
+    if value.is_finite() && (0.0..=100.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err("MV background must be in 0..=100".into())
+    }
+}
+
 fn main() -> Result<()> {
+    if std::env::args_os().len() == 1 {
+        return renderer::gui::launch();
+    }
+
     match Cli::parse().command {
         Command::FfmpegInfo => {
             let installation = renderer::ffmpeg::resolve()?;
@@ -998,8 +1027,13 @@ fn main() -> Result<()> {
             output,
             cover,
             custom_mv,
+            no_mv,
+            mv_background,
+            particle_resources,
+            particle_name,
             start_time,
             duration,
+            whole_chart,
             fps,
             width,
             height,
@@ -1014,9 +1048,6 @@ fn main() -> Result<()> {
             concurrent_sfx_prepass,
             sequential_frames,
         } => {
-            if custom_mv.is_some() {
-                anyhow::bail!("custom MV compositing is not implemented");
-            }
             let _optional_cover = cover;
             let option_overrides = level_options
                 .iter()
@@ -1028,9 +1059,18 @@ fn main() -> Result<()> {
                 level,
                 skin: None,
                 music: Some(music),
+                mv: custom_mv,
+                mv_enabled: !no_mv,
+                mv_background,
+                resource_overrides: renderer::render::ResourceOverrides {
+                    particles: particle_resources,
+                    particle_name,
+                    ..Default::default()
+                },
                 output: Some(output.clone()),
-                start_time,
-                duration,
+                start_time: start_time.unwrap_or(if whole_chart { 0.0 } else { 14.0 }),
+                duration: duration.unwrap_or(2.0),
+                whole_chart,
                 fps,
                 width,
                 height,
@@ -1053,7 +1093,8 @@ fn main() -> Result<()> {
                     && !sequential_sfx_prepass,
                 frame_pipeline: !sequential_frames,
             };
-            let report = config.render_video()?;
+            let report =
+                config.render_video_with_progress(renderer::export_progress::terminal_sink())?;
             println!("wrote MP4 to {}", output.display());
             println!(
                 "submitted deterministic frames: {}",
@@ -1068,6 +1109,29 @@ fn main() -> Result<()> {
             );
             println!("FPS: {}", report.fps);
             println!("Level bgmOffset: {}s", report.bgm_offset);
+            if let Some(mv) = &report.mv {
+                println!(
+                    "MV: {} (canonical media time, contain fit, source audio ignored)",
+                    mv.display()
+                );
+            }
+            if let Some(end) = &report.chart_end {
+                println!(
+                    "Whole-chart end: {:.6}s ({})",
+                    end.watch_end, end.confidence
+                );
+                println!("End evidence: {} finite entities, {} persistent non-input entities, {} discovery frames; BGM Watch end {:?}s, SFX end {:.6}s; persistent endpoint policy threshold {:.6} (spawning timeline units)",
+                    end.finite_entity_count, end.persistent_entity_count, end.discovery_frames,
+                    end.bgm_watch_end, end.sfx_watch_end, end.persistent_lifetime_threshold);
+            }
+            println!(
+                "Requested start: {:.6}s; frame-aligned start: {:.6}s",
+                report.timeline.requested_start, report.timeline.watch_start
+            );
+            if let Some(samples) = report.bgm_pcm_sample_frames {
+                println!("BGM PCM: {samples} stereo sample frames at 44100 Hz; desired media interval [{:.6},{:.6})s; source duration {:.6}s",
+                    report.timeline.output_to_media(0.0), report.timeline.output_to_media(report.timeline.duration), report.bgm_source_duration.unwrap_or(0.0));
+            }
             if render_layers.layers().bgm {
                 println!(
                     "Audio mapping: music source {:.6}s, leading silence {:.6}s",
@@ -1089,6 +1153,17 @@ fn main() -> Result<()> {
             println!(
                 "SFX event sequence SHA-1: {} ({:?})",
                 report.sfx_event_sha1, report.sfx_event_counts
+            );
+            println!(
+                "SFX decoding: {} playback events, {} named resources used, {} new unique payloads decoded, {} FFmpeg decodes",
+                report.sfx_playback_events,
+                report.sfx_resources_used,
+                report.sfx_decoded_unique_resources,
+                report.sfx_ffmpeg_decodes
+            );
+            println!(
+                "Watch playback traversals: {} (SFX collected during rendering)",
+                report.watch_traversals
             );
             println!(
                 "SFX event pass workload: {} runtime frames, {} callbacks, {} evaluations",
@@ -1187,6 +1262,38 @@ fn parse_level_option_override(value: &str) -> Result<(usize, f64)> {
 mod cli_tests {
     use super::parse_level_option_override;
     use clap::Parser;
+
+    #[test]
+    fn whole_chart_accepts_optional_start_and_conflicts_with_duration() {
+        let base = [
+            "renderer",
+            "render-video",
+            "engine.zip",
+            "resources.scp",
+            "level.json",
+            "music.mp3",
+            "out.mp4",
+        ];
+        let mut args = base.to_vec();
+        args.extend(["--whole-chart"]);
+        match super::Cli::try_parse_from(&args).unwrap().command {
+            super::Command::RenderVideo {
+                whole_chart,
+                start_time,
+                duration,
+                ..
+            } => {
+                assert!(whole_chart);
+                assert_eq!(start_time, None);
+                assert_eq!(duration, None);
+            }
+            _ => panic!("expected render-video"),
+        }
+        args.extend(["--start-time", "5"]);
+        assert!(super::Cli::try_parse_from(&args).is_ok());
+        args.extend(["--duration", "1"]);
+        assert!(super::Cli::try_parse_from(&args).is_err());
+    }
 
     #[test]
     fn parses_level_option_override() {
@@ -1376,5 +1483,59 @@ mod cli_tests {
             "--profile-frames"
         ])
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod desktop_cli_tests {
+    use super::*;
+    use clap::Parser;
+    #[test]
+    fn mv_percent_and_particle_sources_parse_in_shared_cli() {
+        for value in ["0", "40.5", "100"] {
+            let cli = Cli::try_parse_from([
+                "renderer",
+                "render-video",
+                "e.zip",
+                "r.scp",
+                "l.data",
+                "bgm.mp3",
+                "out.mp4",
+                "--mv-background",
+                value,
+                "--particle-resources",
+                "p.scp",
+                "--particle-name",
+                "custom",
+            ])
+            .unwrap();
+            match cli.command {
+                Command::RenderVideo {
+                    mv_background,
+                    particle_resources,
+                    particle_name,
+                    ..
+                } => {
+                    assert_eq!(mv_background, value.parse::<f64>().unwrap());
+                    assert_eq!(particle_resources, Some(PathBuf::from("p.scp")));
+                    assert_eq!(particle_name.as_deref(), Some("custom"));
+                }
+                _ => panic!(),
+            }
+        }
+        for value in ["-1", "100.1", "NaN", "inf"] {
+            assert!(Cli::try_parse_from([
+                "renderer",
+                "render-video",
+                "e",
+                "r",
+                "l",
+                "b",
+                "o",
+                "--mv-background",
+                value
+            ])
+            .is_err());
+        }
     }
 }

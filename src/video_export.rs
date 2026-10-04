@@ -26,6 +26,13 @@ use std::{
 
 #[derive(Debug, Serialize)]
 pub struct ExportReport {
+    pub watch_traversals: u32,
+    pub audio_prepass_checkpoints: Vec<crate::audio_prepass_profile::AudioPrepassCheckpoint>,
+    pub mv: Option<std::path::PathBuf>,
+    pub timeline: crate::export_timeline::ExportTimeline,
+    pub chart_end: Option<crate::export_end::ChartEnd>,
+    pub bgm_source_duration: Option<f64>,
+    pub bgm_pcm_sample_frames: Option<u64>,
     pub ffmpeg_source: String,
     pub ffmpeg_path: String,
     pub ffprobe_path: String,
@@ -37,6 +44,10 @@ pub struct ExportReport {
     pub audio_window: AudioWindow,
     pub sfx_event_sha1: String,
     pub sfx_event_counts: SfxEventCounts,
+    pub sfx_playback_events: usize,
+    pub sfx_resources_used: usize,
+    pub sfx_decoded_unique_resources: usize,
+    pub sfx_ffmpeg_decodes: usize,
     pub event_pass_runtime_frames: u64,
     pub event_pass_callbacks: u64,
     pub event_pass_evaluations: u64,
@@ -78,6 +89,8 @@ pub struct SfxEventCounts {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FrameDiagnostic {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mv_media_pts: Option<f64>,
     pub output_local_frame_index: u64,
     pub global_frame_index: u64,
     pub requested_timeline_time: f64,
@@ -126,9 +139,13 @@ pub struct ExportRequest<'a> {
     pub resources: &'a Path,
     pub level: &'a Path,
     pub music: &'a Path,
+    pub mv: Option<&'a Path>,
+    pub mv_background: f64,
+    pub resource_overrides: &'a crate::render::ResourceOverrides,
     pub output: &'a Path,
     pub start_time: f64,
     pub duration: f64,
+    pub whole_chart: bool,
     pub fps: u32,
     pub width: u32,
     pub height: u32,
@@ -150,23 +167,39 @@ pub struct ExportRequest<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrepassPlan {
     None,
-    EventsOnly,
     FullValidation,
 }
 
-fn prepass_plan(sfx_enabled: bool, validate_determinism: bool) -> PrepassPlan {
+fn prepass_plan(_sfx_enabled: bool, validate_determinism: bool) -> PrepassPlan {
     if validate_determinism {
         PrepassPlan::FullValidation
-    } else if sfx_enabled {
-        PrepassPlan::EventsOnly
     } else {
         PrepassPlan::None
     }
 }
 
-const MAX_CONCURRENT_RGB_SPOOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
 pub fn export_config(config: &RenderConfig) -> Result<ExportReport> {
+    export_config_with_progress(config, Box::new(|_| {}))
+}
+
+pub fn export_config_with_progress(
+    config: &RenderConfig,
+    sink: crate::export_progress::ProgressSink,
+) -> Result<ExportReport> {
+    export_config_controlled(
+        config,
+        sink,
+        crate::export_control::ExportControl::default(),
+    )
+}
+
+pub fn export_config_controlled(
+    config: &RenderConfig,
+    sink: crate::export_progress::ProgressSink,
+    control: crate::export_control::ExportControl,
+) -> Result<ExportReport> {
+    config.validate()?;
+    control.check()?;
     let output = config
         .output
         .as_deref()
@@ -179,34 +212,92 @@ pub fn export_config(config: &RenderConfig) -> Result<ExportReport> {
         .iter()
         .map(|item| (item.index, item.value))
         .collect();
-    export(ExportRequest {
-        engine: &config.engine,
-        resources: &config.resources,
-        level: &config.level,
-        music: config.music.as_deref().unwrap_or(&config.resources),
-        output,
-        start_time: config.start_time,
-        duration: config.duration,
-        fps: config.fps,
-        width: config.width,
-        height: config.height,
-        trace_entity_id: config.trace_entity_id,
-        level_option_overrides: &options,
-        skin_name: config.skin.as_deref(),
-        particles_enabled: config.layers.particles,
-        sfx_enabled: config.layers.sfx,
-        bgm_enabled: config.layers.bgm,
-        ui: &config.ui,
-        backend: config.backend,
-        profile: config.profile,
-        profile_frames: config.profile_frames,
-        validate_determinism: config.validate_determinism,
-        concurrent_sfx_prepass: config.concurrent_sfx_prepass,
-        frame_pipeline: config.frame_pipeline,
-    })
+    export_using_tools_controlled(
+        ExportRequest {
+            engine: &config.engine,
+            resources: &config.resources,
+            level: &config.level,
+            music: config.music.as_deref().unwrap_or(&config.resources),
+            mv: config.mv.as_deref().filter(|_| config.mv_enabled),
+            mv_background: config.mv_background,
+            resource_overrides: &config.resource_overrides,
+            output,
+            start_time: config.start_time,
+            duration: config.duration,
+            whole_chart: config.whole_chart,
+            fps: config.fps,
+            width: config.width,
+            height: config.height,
+            trace_entity_id: config.trace_entity_id,
+            level_option_overrides: &options,
+            skin_name: config.skin.as_deref(),
+            particles_enabled: config.layers.particles,
+            sfx_enabled: config.layers.sfx,
+            bgm_enabled: config.layers.bgm,
+            ui: &config.ui,
+            backend: config.backend,
+            profile: config.profile,
+            profile_frames: config.profile_frames,
+            validate_determinism: config.validate_determinism,
+            concurrent_sfx_prepass: config.concurrent_sfx_prepass,
+            frame_pipeline: config.frame_pipeline,
+        },
+        sink,
+        ffmpeg::resolve,
+        control,
+    )
+}
+
+struct ExportChild(std::process::Child);
+impl std::ops::Deref for ExportChild {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for ExportChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for ExportChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
+    export_with_progress(request, Box::new(|_| {}))
+}
+
+pub fn export_with_progress(
+    request: ExportRequest<'_>,
+    sink: crate::export_progress::ProgressSink,
+) -> Result<ExportReport> {
+    export_using_tools(request, sink, ffmpeg::resolve)
+}
+
+fn export_using_tools(
+    request: ExportRequest<'_>,
+    sink: crate::export_progress::ProgressSink,
+    resolve_tools: impl FnOnce() -> Result<ffmpeg::FfmpegInstallation>,
+) -> Result<ExportReport> {
+    export_using_tools_controlled(request, sink, resolve_tools, Default::default())
+}
+
+fn export_using_tools_controlled(
+    mut request: ExportRequest<'_>,
+    sink: crate::export_progress::ProgressSink,
+    resolve_tools: impl FnOnce() -> Result<ffmpeg::FfmpegInstallation>,
+    control: crate::export_control::ExportControl,
+) -> Result<ExportReport> {
+    let sfx_decode_snapshot = crate::audio::decode_cache_stats();
+    crate::render::validate_mv_background(request.mv_background)?;
+    control.check()?;
+    use crate::export_progress::{ExportPhase, ProgressTracker, ProgressWriter};
+    let progress = ProgressTracker::new(sink);
+    progress.phase(ExportPhase::Preparing, None);
     let export_start = request.profile.then(Instant::now);
     let mut profile = request.profile.then(|| {
         crate::profiling::ProfileCollector::new(
@@ -249,7 +340,27 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
     if request.width % 2 != 0 || request.height % 2 != 0 {
         bail!("H.264 yuv420p output requires even frame dimensions");
     }
-    let range = FrameRange::new(request.start_time, request.duration, request.fps)?;
+    if let Ok(output_path) = request.output.canonicalize() {
+        for input in [
+            Some(request.engine),
+            Some(request.resources),
+            Some(request.level),
+            Some(request.music),
+            request.mv,
+            request.resource_overrides.particles.as_deref(),
+            request.resource_overrides.effects.as_deref(),
+            request.resource_overrides.background.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if input.canonicalize().ok().as_ref() == Some(&output_path) {
+                bail!("export output must not overwrite an input file");
+            }
+        }
+    }
+    // Validate before initializing any runtime/discovery pass.
+    FrameRange::new(request.start_time, request.duration, request.fps)?;
     let package = crate::formats::load_engine(request.engine)?;
     let level = crate::formats::load_level(request.level)?;
     let resource_defaults: std::collections::BTreeMap<_, _> =
@@ -271,6 +382,11 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         .get("particles")
         .map(String::as_str)
         .or(package.metadata.particle_name.as_deref());
+    let particle_name = request
+        .resource_overrides
+        .particle_name
+        .as_deref()
+        .or(particle_name);
     let background_name = resource_defaults
         .get("backgrounds")
         .map(String::as_str)
@@ -279,10 +395,92 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
     if !bgm_offset.is_finite() {
         bail!("level bgmOffset must be finite");
     }
-    let audio = crate::offline::audio_window(range.start_time(), bgm_offset)?;
+    let installation = resolve_tools()?;
+    let bgm_source_duration = request
+        .bgm_enabled
+        .then(|| crate::export_media::source_duration(&installation, request.music))
+        .transpose()?;
+    let effect_assets = request
+        .sfx_enabled
+        .then_some(effect_name)
+        .flatten()
+        .map(|name| {
+            crate::formats::load_effect_assets_optional(
+                request
+                    .resource_overrides
+                    .effects
+                    .as_deref()
+                    .unwrap_or(request.resources),
+                name,
+            )
+        })
+        .transpose()?
+        .flatten()
+        .unwrap_or_else(|| crate::formats::EffectAssets {
+            clips: std::collections::BTreeMap::new(),
+        });
+    let bindings = if request.sfx_enabled {
+        crate::offline::effect_clip_bindings(&package.watch)?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    let chart_end = if request.whole_chart {
+        let mut discovery = EventSession::new_configured_with_sources(
+            &package.watch,
+            &package.rom,
+            &package.configuration,
+            &level,
+            request.resources,
+            skin_name,
+            background_name,
+            effect_name,
+            particle_name,
+            request.width,
+            request.height,
+            request.fps,
+            request.level_option_overrides,
+            request.particles_enabled,
+            false,
+            false,
+            request.resource_overrides,
+        )?;
+        discovery.set_export_control(control.clone());
+        let end = crate::export_end::discover(
+            discovery,
+            request.fps,
+            bgm_source_duration.map(|d| (d - bgm_offset).max(0.0)),
+            &effect_assets,
+            &bindings,
+            Some(&progress),
+            &package.watch,
+        )?;
+        control.log(format!(
+            "Whole-chart end: {:.6}s ({})",
+            end.watch_end, end.confidence
+        ));
+        let aligned_start =
+            (request.start_time * f64::from(request.fps)).ceil() / f64::from(request.fps);
+        if end.watch_end <= aligned_start {
+            bail!("whole-chart start is at or beyond the inferred end");
+        }
+        request.duration = end.watch_end - aligned_start;
+        eprintln!(
+            "Whole-chart end: {:.6}s ({}, {}; {} persistent non-input entities)",
+            end.watch_end, end.confidence, end.policy, end.persistent_entity_count
+        );
+        Some(end)
+    } else {
+        None
+    };
+    let range = FrameRange::new(request.start_time, request.duration, request.fps)?;
+    let timeline =
+        crate::export_timeline::ExportTimeline::new(request.start_time, range, bgm_offset)?;
+    let audio = crate::offline::audio_window(timeline.watch_start, bgm_offset)?;
+    progress.phase(ExportPhase::Preparing, Some(range.frame_count));
 
+    let watch_traversals = std::cell::Cell::new(0);
     let make_session = || {
-        FrameSession::new_configured(
+        let mut session = FrameSession::new_configured_with_sources(
             &package.watch,
             &package.rom,
             &package.configuration,
@@ -303,184 +501,49 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
             request.backend,
             request.profile,
             request.trace_entity_id.is_some(),
-        )
-    };
-    let plan = prepass_plan(request.sfx_enabled, request.validate_determinism);
-    let rgb_spool_bytes = range
-        .frame_count
-        .checked_mul(u64::from(request.width))
-        .and_then(|bytes| bytes.checked_mul(u64::from(request.height)))
-        .and_then(|bytes| bytes.checked_mul(3))
-        .context("concurrent RGB spool size overflows")?;
-    let concurrent_sfx_prepass_used = plan == PrepassPlan::EventsOnly
-        && request.concurrent_sfx_prepass
-        && !request.frame_pipeline
-        && rgb_spool_bytes <= MAX_CONCURRENT_RGB_SPOOL_BYTES;
-    if plan == PrepassPlan::EventsOnly
-        && request.concurrent_sfx_prepass
-        && !request.frame_pipeline
-        && !concurrent_sfx_prepass_used
-    {
-        eprintln!(
-            "warning: concurrent SFX export needs {rgb_spool_bytes} bytes of temporary RGB storage (limit {MAX_CONCURRENT_RGB_SPOOL_BYTES}); using sequential SFX event collection"
-        );
-    }
-    let mut expected_frames = None;
-    let mut concurrent_output: Option<(Vec<FrameDiagnostic>, tempfile::NamedTempFile)> = None;
-    let mut audio_requests = empty_audio_requests();
-    let mut event_pass_runtime_frames = 0;
-    let mut event_pass_callbacks = 0;
-    let mut event_pass_evaluations = 0;
-    if plan == PrepassPlan::FullValidation {
-        let initialization = make_session()?;
-        if let Some(p) = profile.as_mut() {
-            p.record(
-                "Validation session initialization",
-                startup_start.map_or(Duration::ZERO, |t| t.elapsed()),
-            );
+            request.resource_overrides,
+        )?;
+        session.set_export_control(control.clone());
+        if let Some(path) = request.mv {
+            session.configure_mv(&installation, path, timeline)?;
+            session.set_mv_background(request.mv_background);
         }
-        let preflight_start = request.profile.then(Instant::now);
-        let frames = render_diagnostic_pass(
+        watch_traversals.set(watch_traversals.get() + 1);
+        Ok::<_, anyhow::Error>(session)
+    };
+    // Only explicit determinism validation has a second playback traversal.
+    let plan = prepass_plan(request.sfx_enabled, request.validate_determinism);
+    let concurrent_sfx_prepass_used = false;
+    let rgb_spool_bytes = 0;
+    let mut expected_frames: Option<Vec<FrameDiagnostic>> = None;
+    if plan == PrepassPlan::FullValidation {
+        progress.phase(ExportPhase::Validating, None);
+        let initialization = make_session()?;
+        let preflight_start = Instant::now();
+        expected_frames = Some(render_diagnostic_pass(
             initialization,
             range,
             &package.watch,
             request.trace_entity_id,
             profile.as_mut(),
-        )?;
+        )?);
         if let Some(p) = profile.as_mut() {
-            let elapsed = preflight_start.map_or(Duration::ZERO, |t| t.elapsed());
-            p.record("Full determinism validation preflight", elapsed);
-            p.record_preflight_wrapper(elapsed);
+            p.record(
+                "Full determinism validation preflight",
+                preflight_start.elapsed(),
+            );
+            p.record_preflight_wrapper(preflight_start.elapsed());
         }
-        audio_requests = collect_audio_requests(&frames);
-        expected_frames = Some(frames);
     } else if let Some(p) = profile.as_mut() {
         p.record(
             "Initialization/startup",
             startup_start.map_or(Duration::ZERO, |t| t.elapsed()),
         );
     }
-    if plan == PrepassPlan::EventsOnly {
-        let prepass_start = request.profile.then(Instant::now);
-        let event_session = EventSession::new_configured(
-            &package.watch,
-            &package.rom,
-            &package.configuration,
-            &level,
-            request.resources,
-            skin_name,
-            background_name,
-            effect_name,
-            particle_name,
-            request.width,
-            request.height,
-            request.fps,
-            request.level_option_overrides,
-            request.particles_enabled,
-            request.profile,
-            request.trace_entity_id.is_some(),
-        )?;
-        if concurrent_sfx_prepass_used {
-            let session_start = request.profile.then(Instant::now);
-            let stream_session = make_session()?;
-            if let Some(p) = profile.as_mut() {
-                p.record(
-                    "Concurrent session initialization",
-                    session_start.map_or(Duration::ZERO, |start| start.elapsed()),
-                );
-            }
-            let ConcurrentStreamOutput {
-                events,
-                frames,
-                spool,
-                profile: stream_profile,
-            } = concurrent_event_and_render(
-                event_session,
-                stream_session,
-                range,
-                &package.watch,
-                request.trace_entity_id,
-                profile.take(),
-                request.profile,
-            )?;
-            audio_requests = events.requests;
-            event_pass_runtime_frames = events.runtime_frames;
-            event_pass_callbacks = events.callbacks;
-            event_pass_evaluations = events.evaluations;
-            profile = stream_profile;
-            if let Some(p) = profile.as_mut() {
-                for (runtime, wall) in &events.profiles {
-                    p.record_event_only(runtime, *wall);
-                }
-                p.record("SFX event-only worker wall", events.elapsed);
-                p.record(
-                    "Concurrent SFX/render wall",
-                    prepass_start.map_or(Duration::ZERO, |s| s.elapsed()),
-                );
-            }
-            concurrent_output = Some((frames, spool));
-        } else {
-            let output = collect_event_only_requests(
-                event_session,
-                range,
-                request.profile,
-                &AtomicU8::new(0),
-            )?;
-            audio_requests = output.requests;
-            event_pass_runtime_frames = output.runtime_frames;
-            event_pass_callbacks = output.callbacks;
-            event_pass_evaluations = output.evaluations;
-            if let Some(p) = profile.as_mut() {
-                for (runtime, wall) in &output.profiles {
-                    p.record_event_only(runtime, *wall);
-                }
-                p.record(
-                    "SFX runtime/event-only prepass",
-                    prepass_start.map_or(Duration::ZERO, |s| s.elapsed()),
-                );
-            }
-        }
-    }
-    let audio_start = request.profile.then(Instant::now);
-    let effect_assets = request
-        .sfx_enabled
-        .then_some(effect_name)
-        .flatten()
-        .map(|name| crate::formats::load_effect_assets_optional(request.resources, name))
-        .transpose()?
-        .flatten()
-        .unwrap_or_else(|| crate::formats::EffectAssets {
-            clips: std::collections::BTreeMap::new(),
-        });
-    let bindings = if request.sfx_enabled {
-        crate::offline::effect_clip_bindings(&package.watch)?
-    } else {
-        std::collections::BTreeMap::new()
-    };
-    let sfx_event_sha1 = hash_audio_requests(&audio_requests)?;
-    let sfx_event_counts = count_audio_requests(&audio_requests);
-    let (events, scheduled, loop_starts, loop_stops) = audio_requests;
-    let effect_mix = if request.sfx_enabled {
-        crate::audio::mix_effects_wav(
-            &effect_assets,
-            &bindings,
-            &events,
-            &scheduled,
-            &loop_starts,
-            &loop_stops,
-            range.start_time(),
-            range.frame_count as f64 / f64::from(range.fps),
-        )?
-    } else {
-        crate::audio::SfxMixResult {
-            wav: None,
-            warnings: vec![],
-        }
-    };
-    for warning in &effect_mix.warnings {
-        eprintln!("warning: {warning}");
-    }
-    let effect_audio = effect_mix.wav;
+    let audio_prepass_checkpoints = Vec::new();
+    let event_pass_runtime_frames = 0;
+    let event_pass_callbacks = 0;
+    let event_pass_evaluations = 0;
     let first_pass_hash = expected_frames.as_ref().map(|frames| {
         hash_sequence(
             &frames
@@ -489,16 +552,9 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
                 .collect::<Vec<_>>(),
         )
     });
-    if let Some(p) = profile.as_mut() {
-        p.record(
-            "Audio/SFX preparation",
-            audio_start.map_or(Duration::ZERO, |t| t.elapsed()),
-        );
-    }
-
     let ffmpeg_start = request.profile.then(Instant::now);
-    let installation = ffmpeg::resolve()?;
     let mut command = Command::new(&installation.ffmpeg);
+    crate::export_control::hide_child_window(&mut command);
     command.args([
         "-hide_banner",
         "-loglevel",
@@ -513,33 +569,7 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         "-framerate",
         &request.fps.to_string(),
     ]);
-    if let Some((_, spool)) = concurrent_output.as_ref() {
-        command.arg("-i").arg(spool.path());
-    } else {
-        command.args(["-i", "pipe:0"]);
-    }
-    if request.bgm_enabled {
-        command.arg("-i").arg(request.music);
-    }
-    let sfx_file = effect_audio
-        .as_ref()
-        .map(|bytes| {
-            let mut file = tempfile::Builder::new()
-                .suffix(".wav")
-                .tempfile()
-                .context("creating temporary SFX mix")?;
-            file.write_all(bytes).context("writing temporary SFX mix")?;
-            Ok::<_, anyhow::Error>(file)
-        })
-        .transpose()?;
-    if let Some(file) = &sfx_file {
-        command.arg("-i").arg(file.path());
-    }
-    command.args(audio_map_args(
-        request.bgm_enabled,
-        sfx_file.is_some(),
-        audio,
-    ));
+    command.args(["-i", "pipe:0"]);
     command.args([
         "-vf",
         "format=yuv420p",
@@ -558,10 +588,20 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         "-movflags",
         "+faststart",
     ]);
-    if request.bgm_enabled || sfx_file.is_some() {
-        command.args(["-c:a", "aac", "-b:a", "192k"]);
-    }
-    command.arg(&request.output);
+    let output_directory = request
+        .output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let video_file = tempfile::Builder::new()
+        .prefix("sono-video-")
+        .suffix(".mp4")
+        .tempfile_in(output_directory)?;
+    let final_file = tempfile::Builder::new()
+        .prefix("sono-final-")
+        .suffix(".mp4")
+        .tempfile_in(output_directory)?;
+    command.args(["-an"]).arg(video_file.path());
     // Drain FFmpeg diagnostics to a file so a noisy failure cannot fill a
     // stderr pipe while the render worker is blocked writing video frames.
     let mut ffmpeg_stderr_capture =
@@ -569,16 +609,14 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
     let ffmpeg_stderr_writer = ffmpeg_stderr_capture
         .try_clone()
         .context("cloning FFmpeg diagnostic capture handle")?;
-    let mut child = command
-        .stdin(if concurrent_output.is_some() {
-            Stdio::null()
-        } else {
-            Stdio::piped()
-        })
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(ffmpeg_stderr_writer))
-        .spawn()
-        .with_context(|| format!("launching FFmpeg at {}", installation.ffmpeg.display()))?;
+    let mut child = ExportChild(
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(ffmpeg_stderr_writer))
+            .spawn()
+            .with_context(|| format!("launching FFmpeg at {}", installation.ffmpeg.display()))?,
+    );
     if let Some(p) = profile.as_mut() {
         p.record(
             "FFmpeg startup",
@@ -587,9 +625,18 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
     }
 
     let mut frame_pipeline_stats = None;
-    let (actual_frames, _spool_guard) = if let Some((frames, spool)) = concurrent_output.take() {
-        (frames, Some(spool))
-    } else {
+    progress.phase(ExportPhase::Rendering, None);
+    let stdin = child
+        .stdin
+        .take()
+        .context("FFmpeg process did not expose its raw-video input")?;
+    let stdin = ProgressWriter::new(
+        stdin,
+        progress.clone(),
+        request.width as usize * request.height as usize * 3,
+    )
+    .with_control(control.clone());
+    let (actual_frames, audio_requests) = {
         let streaming_session_start = request.profile.then(Instant::now);
         let streaming_session = make_session()?;
         if let Some(p) = profile.as_mut() {
@@ -599,10 +646,6 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
             );
             p.begin_render();
         }
-        let stdin = child
-            .stdin
-            .take()
-            .context("FFmpeg process did not expose its raw-video input")?;
         let frames = if request.frame_pipeline {
             match stream_frames_pipelined(
                 streaming_session,
@@ -661,7 +704,7 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
                             result.stats.first_frame_latency_ms,
                         );
                     }
-                    result.diagnostics
+                    (result.diagnostics, result.audio_requests)
                 }
                 Err(error) => {
                     let _ = child.kill();
@@ -682,7 +725,10 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
                 "FFmpeg final input flush/close",
                 None,
             ) {
-                Ok(frames) => frames,
+                Ok(frames) => {
+                    let requests = collect_audio_requests(&frames);
+                    (frames, requests)
+                }
                 Err(error) => {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -693,12 +739,18 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         if let Some(p) = profile.as_mut() {
             p.finish_render();
         }
-        (frames, None)
+        frames
     };
+    progress.validate_complete()?;
+    progress.phase(ExportPhase::AudioMixing, None);
     let finalize_start = request.profile.then(Instant::now);
-    let output = child
-        .wait_with_output()
-        .context("waiting for FFmpeg export")?;
+    let output = loop {
+        control.check()?;
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
     ffmpeg_stderr_capture
         .seek(SeekFrom::Start(0))
         .context("rewinding FFmpeg diagnostic capture")?;
@@ -712,15 +764,119 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
             finalize_start.map_or(Duration::ZERO, |t| t.elapsed()),
         );
     }
-    if !output.status.success() {
+    if !output.success() {
         bail!(
             "FFmpeg failed with status {:?}: {}",
-            output.status.code(),
+            output.code(),
             ffmpeg_stderr.trim()
         );
     }
+    // Audio comes exclusively from the authoritative rendering Watch producer.
+    let audio_requests = if request.sfx_enabled {
+        audio_requests
+    } else {
+        empty_audio_requests()
+    };
+    let sfx_event_sha1 = hash_audio_requests(&audio_requests)?;
+    let sfx_event_counts = count_audio_requests(&audio_requests);
+    let audio_start = Instant::now();
+    let bgm_pcm = request
+        .bgm_enabled
+        .then(|| {
+            crate::export_media::prepare_bgm_controlled(
+                &installation,
+                request.music,
+                timeline,
+                &control,
+            )
+        })
+        .transpose()?;
+    let (events, scheduled, loop_starts, loop_stops) = audio_requests;
+    let effect_mix = if request.sfx_enabled {
+        crate::audio::mix_effects_wav(
+            &effect_assets,
+            &bindings,
+            &events,
+            &scheduled,
+            &loop_starts,
+            &loop_stops,
+            timeline.watch_start,
+            timeline.duration,
+        )?
+    } else {
+        crate::audio::SfxMixResult {
+            wav: None,
+            warnings: vec![],
+            unique_resources: 0,
+            ffmpeg_decodes: 0,
+            playback_events: 0,
+        }
+    };
+    control.check()?;
+    for warning in &effect_mix.warnings {
+        control.log(format!("Warning: {warning}"));
+        eprintln!("warning: {warning}");
+    }
+    control.log(format!(
+        "SFX audio: {} playback events, {} unique resources, {} FFmpeg decodes",
+        effect_mix.playback_events, effect_mix.unique_resources, effect_mix.ffmpeg_decodes
+    ));
+    let sfx_decode_totals = crate::audio::decode_cache_stats();
+    control.log(format!(
+        "SFX decode cache for export: {} new unique resources, {} FFmpeg decodes; process totals {} resources / {} decodes",
+        sfx_decode_totals.0.saturating_sub(sfx_decode_snapshot.0),
+        sfx_decode_totals.1.saturating_sub(sfx_decode_snapshot.1),
+        sfx_decode_totals.0,
+        sfx_decode_totals.1
+    ));
+    let sfx_file = effect_mix
+        .wav
+        .as_ref()
+        .map(|bytes| {
+            let mut file = tempfile::Builder::new().suffix(".wav").tempfile()?;
+            file.write_all(bytes)?;
+            Ok::<_, anyhow::Error>(file)
+        })
+        .transpose()?;
+    if let Some(p) = profile.as_mut() {
+        p.record("Post-render audio preparation", audio_start.elapsed());
+    }
+    progress.phase(ExportPhase::AudioEncoding, None);
+    let mut mux = Command::new(&installation.ffmpeg);
+    crate::export_control::hide_child_window(&mut mux);
+    mux.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(video_file.path());
+    if let Some(file) = &bgm_pcm {
+        mux.args(["-f", "s16le", "-ar", "44100", "-ac", "2", "-i"])
+            .arg(file.path());
+    }
+    if let Some(file) = &sfx_file {
+        mux.arg("-i").arg(file.path());
+    }
+    mux.args(audio_map_args(request.bgm_enabled, sfx_file.is_some()));
+    mux.args([
+        "-c:v",
+        "copy",
+        "-t",
+        &format!("{:.12}", timeline.duration),
+        "-movflags",
+        "+faststart",
+    ]);
+    if request.bgm_enabled || sfx_file.is_some() {
+        mux.args(["-c:a", "aac", "-b:a", "192k"]);
+    }
+    let mux_result = control
+        .output(mux.arg(final_file.path()))
+        .context("muxing collected Watch audio with encoded video")?;
+    if !mux_result.status.success() {
+        bail!(
+            "post-render audio mux failed: {}",
+            String::from_utf8_lossy(&mux_result.stderr)
+        );
+    }
+    progress.phase(ExportPhase::Finalizing, None);
     let probe_start = request.profile.then(Instant::now);
-    let probe_output = Command::new(&installation.ffprobe)
+    let probe_output = control.output(crate::export_control::hide_child_window(&mut Command::new(&installation.ffprobe))
         .args([
             "-v",
             "error",
@@ -728,9 +884,9 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
             "format=duration,start_time:stream=index,codec_type,codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,time_base,duration,nb_frames,start_time",
             "-of",
             "json",
-            &request.output.to_string_lossy(),
+            &final_file.path().to_string_lossy(),
         ])
-        .output()
+        )
         .context("launching FFprobe on rendered MP4")?;
     if let Some(p) = profile.as_ref() {
         let _ = p;
@@ -781,7 +937,20 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         p.record("Total export", start.elapsed());
         p.print(start.elapsed());
     }
+    control.check()?;
+    final_file
+        .persist(request.output)
+        .map_err(|error| error.error)
+        .context("publishing validated export")?;
+    progress.phase(ExportPhase::Complete, None);
     Ok(ExportReport {
+        watch_traversals: watch_traversals.get(),
+        audio_prepass_checkpoints,
+        mv: request.mv.map(Path::to_path_buf),
+        timeline,
+        chart_end,
+        bgm_source_duration,
+        bgm_pcm_sample_frames: bgm_pcm.as_ref().map(|_| timeline.audio_sample_frames),
         ffmpeg_source: match installation.source {
             ffmpeg::FfmpegSource::SharedAddons => "shared addons".to_owned(),
             ffmpeg::FfmpegSource::Managed => "managed".to_owned(),
@@ -796,6 +965,10 @@ pub fn export(request: ExportRequest<'_>) -> Result<ExportReport> {
         audio_window: audio,
         sfx_event_sha1,
         sfx_event_counts,
+        sfx_playback_events: effect_mix.playback_events,
+        sfx_resources_used: effect_mix.unique_resources,
+        sfx_decoded_unique_resources: sfx_decode_totals.0.saturating_sub(sfx_decode_snapshot.0),
+        sfx_ffmpeg_decodes: sfx_decode_totals.1.saturating_sub(sfx_decode_snapshot.1),
         event_pass_runtime_frames,
         event_pass_callbacks,
         event_pass_evaluations,
@@ -962,6 +1135,7 @@ struct PipelineWorkerResult {
 }
 
 struct PipelineResult {
+    audio_requests: AudioRequests,
     diagnostics: Vec<FrameDiagnostic>,
     stats: FramePipelineStats,
     records: Vec<PipelineFrameRecord>,
@@ -1086,62 +1260,69 @@ fn stream_frames_pipelined(
             result
         });
 
+        let mut audio_requests = empty_audio_requests();
         let mut producer_result: Result<(Duration, Duration, Duration)> =
             Ok((Duration::ZERO, Duration::ZERO, Duration::ZERO));
-        for local_index in 0..range.frame_count {
-            if cancelled.load(Ordering::Acquire) {
-                producer_result = Err(anyhow::anyhow!(
-                    "frame pipeline cancelled after worker failure"
-                ));
-                break;
-            }
-            let global_index = match range.index(local_index) {
-                Ok(index) => index,
-                Err(error) => {
-                    producer_result = Err(error);
+        let producer_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for local_index in 0..range.frame_count {
+                if cancelled.load(Ordering::Acquire) {
+                    producer_result = Err(anyhow::anyhow!(
+                        "frame pipeline cancelled after worker failure"
+                    ));
                     break;
                 }
-            };
-            let prepared = match session.prepare_global_frame(global_index) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    producer_result =
-                        Err(error).context("preparing Watch frame for render pipeline");
+                let global_index = match range.index(local_index) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        producer_result = Err(error);
+                        break;
+                    }
+                };
+                let prepared = match session.prepare_global_frame(global_index) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        producer_result =
+                            Err(error).context("preparing Watch frame for render pipeline");
+                        break;
+                    }
+                };
+                append_report_events(&mut audio_requests, &prepared.report);
+                let (watch_time, snapshot_time) = prepared.producer_timings();
+                let current = producer_result.as_mut().unwrap();
+                current.0 += watch_time;
+                current.1 += snapshot_time;
+                let ready_at = Instant::now();
+                let was_full = outstanding.load(Ordering::Acquire) >= FRAME_QUEUE_CAPACITY;
+                let send_start = Instant::now();
+                outstanding.fetch_add(1, Ordering::AcqRel);
+                let send_result = sender.send(PreparedJob {
+                    local_index,
+                    global_index,
+                    timeline: range.time(global_index),
+                    ready_at,
+                    frame: prepared,
+                });
+                let send_time = send_start.elapsed();
+                if send_result.is_err() {
+                    outstanding.fetch_sub(1, Ordering::AcqRel);
+                    producer_result = Err(anyhow::anyhow!(
+                        "frame render/output worker closed the queue"
+                    ));
                     break;
                 }
-            };
-            let (watch_time, snapshot_time) = prepared.producer_timings();
-            let current = producer_result.as_mut().unwrap();
-            current.0 += watch_time;
-            current.1 += snapshot_time;
-            let ready_at = Instant::now();
-            let was_full = outstanding.load(Ordering::Acquire) >= FRAME_QUEUE_CAPACITY;
-            let send_start = Instant::now();
-            outstanding.fetch_add(1, Ordering::AcqRel);
-            let send_result = sender.send(PreparedJob {
-                local_index,
-                global_index,
-                timeline: range.time(global_index),
-                ready_at,
-                frame: prepared,
-            });
-            let send_time = send_start.elapsed();
-            if send_result.is_err() {
-                outstanding.fetch_sub(1, Ordering::AcqRel);
-                producer_result = Err(anyhow::anyhow!(
-                    "frame render/output worker closed the queue"
-                ));
-                break;
+                if was_full {
+                    producer_result.as_mut().unwrap().2 += send_time;
+                }
+                high_water.fetch_max(
+                    outstanding
+                        .load(Ordering::Acquire)
+                        .min(FRAME_QUEUE_CAPACITY),
+                    Ordering::AcqRel,
+                );
             }
-            if was_full {
-                producer_result.as_mut().unwrap().2 += send_time;
-            }
-            high_water.fetch_max(
-                outstanding
-                    .load(Ordering::Acquire)
-                    .min(FRAME_QUEUE_CAPACITY),
-                Ordering::AcqRel,
-            );
+        }));
+        if producer_panic.is_err() {
+            producer_result = Err(anyhow::anyhow!("Watch frame producer panicked"));
         }
         drop(sender);
         if producer_result.is_err() {
@@ -1159,6 +1340,7 @@ fn stream_frames_pipelined(
                 }
                 let render_phase = pipeline_start.elapsed();
                 Ok(PipelineResult {
+                    audio_requests,
                     diagnostics: worker_result.diagnostics,
                     stats: FramePipelineStats {
                         queue_capacity: FRAME_QUEUE_CAPACITY,
@@ -1253,6 +1435,7 @@ fn frame_diagnostic(
             .collect()
     });
     FrameDiagnostic {
+        mv_media_pts: frame.mv_media_pts,
         output_local_frame_index: output_index,
         global_frame_index: global_index,
         requested_timeline_time: time,
@@ -1262,7 +1445,13 @@ fn frame_diagnostic(
         timescale: frame.report.timescale,
         callback_count: frame.report.callbacks.len(),
         vm_evaluations: frame.report.vm_evaluations,
-        runtime_frame_count: frame.report.runtime_profile.frame_count,
+        runtime_frame_count: if frame.report.runtime_profile.frame_count > 0 {
+            frame.report.runtime_profile.frame_count
+        } else if output_index == 0 {
+            global_index + 1
+        } else {
+            1
+        },
         runtime_entity_count: frame.report.runtime_entity_count,
         active_entity_count: frame.report.active_entity_count,
         draw_count: frame.report.display_list.sprites.len(),
@@ -1327,147 +1516,75 @@ fn collect_audio_requests(frames: &[FrameDiagnostic]) -> AudioRequests {
     requests
 }
 
+#[cfg(test)]
 fn collect_event_only_requests(
-    mut session: EventSession<'_>,
+    session: EventSession<'_>,
     range: FrameRange,
     profile_enabled: bool,
     cancellation: &AtomicU8,
 ) -> Result<EventPassOutput> {
-    let pass_start = Instant::now();
+    collect_event_only_requests_with_progress(session, range, profile_enabled, cancellation, None)
+}
+
+#[cfg(test)]
+fn collect_event_only_requests_with_progress(
+    mut session: EventSession<'_>,
+    range: FrameRange,
+    profile_enabled: bool,
+    cancellation: &AtomicU8,
+    progress: Option<&crate::export_progress::ProgressTracker>,
+) -> Result<EventPassOutput> {
     let mut requests = empty_audio_requests();
-    let mut profiles = Vec::new();
+    let mut checkpoint_accumulator =
+        profile_enabled.then(crate::audio_prepass_profile::Checkpoints::new);
+    let mut checkpoints = Vec::new();
+    let mut previous_index = None;
     let (mut runtime_frames, mut callbacks, mut evaluations) = (0, 0, 0);
     for segment_index in 0..range.frame_count {
         if cancellation.load(Ordering::Acquire) != 0 {
             bail!("SFX event pass cancelled after concurrent render failure");
         }
-        let loop_start = Instant::now();
         let frame_index = range.index(segment_index)?;
         let report = session.advance_global_frame(frame_index)?;
+        if let Some(progress) = progress {
+            progress.pulse();
+        }
         append_report_events(&mut requests, &report);
-        runtime_frames += report.runtime_profile.frame_count;
+        runtime_frames += previous_index.map_or(frame_index + 1, |previous| frame_index - previous);
+        previous_index = Some(frame_index);
         callbacks += report.callbacks.len() as u64;
         evaluations += report.vm_evaluations;
-        if profile_enabled {
-            profiles.push((report.runtime_profile.clone(), loop_start.elapsed()));
+        if let Some(accumulator) = checkpoint_accumulator.as_mut() {
+            if let Some(checkpoint) = accumulator.observe(
+                &report,
+                session.runtime(),
+                (frame_index + 1) as f64 / f64::from(range.fps),
+                segment_index + 1 == range.frame_count,
+            ) {
+                eprintln!(
+                    "AudioPrepass checkpoint {}",
+                    serde_json::to_string(&checkpoint)?
+                );
+                checkpoints.push(checkpoint);
+            }
         }
     }
     Ok(EventPassOutput {
+        checkpoints,
         requests,
-        profiles,
-        elapsed: pass_start.elapsed(),
         runtime_frames,
         callbacks,
         evaluations,
     })
 }
 
+#[cfg(test)]
 struct EventPassOutput {
+    checkpoints: Vec<crate::audio_prepass_profile::AudioPrepassCheckpoint>,
     requests: AudioRequests,
-    profiles: Vec<(crate::watch_runtime::FrameRuntimeProfile, Duration)>,
-    elapsed: Duration,
     runtime_frames: u64,
     callbacks: u64,
     evaluations: u64,
-}
-
-struct ConcurrentStreamOutput {
-    events: EventPassOutput,
-    frames: Vec<FrameDiagnostic>,
-    spool: tempfile::NamedTempFile,
-    profile: Option<crate::profiling::ProfileCollector>,
-}
-
-fn mark_first_failure(cancellation: &AtomicU8, source: u8) {
-    let _ = cancellation.compare_exchange(0, source, Ordering::AcqRel, Ordering::Acquire);
-}
-
-fn concurrent_event_and_render(
-    event_session: EventSession<'_>,
-    stream_session: FrameSession<'_>,
-    range: FrameRange,
-    watch: &crate::watch::WatchData,
-    target_entity_id: Option<usize>,
-    profile: Option<crate::profiling::ProfileCollector>,
-    profile_enabled: bool,
-) -> Result<ConcurrentStreamOutput> {
-    const EVENT_FAILURE: u8 = 1;
-    const RENDER_FAILURE: u8 = 2;
-    let cancellation = AtomicU8::new(0);
-    std::thread::scope(|scope| {
-        let event_worker = scope.spawn(|| {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                collect_event_only_requests(event_session, range, profile_enabled, &cancellation)
-            }))
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("SFX event worker panicked")));
-            if result.is_err() {
-                mark_first_failure(&cancellation, EVENT_FAILURE);
-            }
-            result
-        });
-        let render_worker = scope.spawn(|| {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut spool = tempfile::Builder::new()
-                    .suffix(".rgb")
-                    .tempfile()
-                    .context("creating bounded-memory RGB spool for concurrent SFX export")?;
-                let mut profile = profile;
-                if let Some(profile) = profile.as_mut() {
-                    profile.begin_render();
-                }
-                let frames = stream_frames(
-                    stream_session,
-                    range,
-                    &mut spool,
-                    None,
-                    watch,
-                    target_entity_id,
-                    profile.as_mut(),
-                    "RGB spool buffer",
-                    "RGB spool flush",
-                    Some(&cancellation),
-                )?;
-                if let Some(profile) = profile.as_mut() {
-                    profile.finish_render();
-                }
-                spool
-                    .as_file_mut()
-                    .seek(SeekFrom::Start(0))
-                    .context("rewinding concurrent RGB spool")?;
-                Ok((frames, spool, profile))
-            }))
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("stream render worker panicked")));
-            if result.is_err() {
-                mark_first_failure(&cancellation, RENDER_FAILURE);
-            }
-            result
-        });
-
-        let events = event_worker
-            .join()
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("SFX event worker panicked")));
-        let rendered = render_worker
-            .join()
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("stream render worker panicked")));
-        match cancellation.load(Ordering::Acquire) {
-            EVENT_FAILURE => Err(events
-                .err()
-                .unwrap_or_else(|| anyhow::anyhow!("SFX event worker failed without an error"))),
-            RENDER_FAILURE => Err(rendered.err().unwrap_or_else(|| {
-                anyhow::anyhow!("stream render worker failed without an error")
-            })),
-            _ => {
-                let events = events?;
-                let (frames, spool, profile) = rendered?;
-                Ok(ConcurrentStreamOutput {
-                    events,
-                    frames,
-                    spool,
-                    profile,
-                })
-            }
-        }
-    })
 }
 
 fn hash_sequence(hashes: &[String]) -> String {
@@ -1478,7 +1595,7 @@ fn hash_sequence(hashes: &[String]) -> String {
     hex::encode(digest.finalize())
 }
 
-fn audio_map_args(has_bgm: bool, has_sfx: bool, audio: AudioWindow) -> Vec<String> {
+fn audio_map_args(has_bgm: bool, has_sfx: bool) -> Vec<String> {
     match (has_bgm, has_sfx) {
         (true, true) => vec![
             "-map".into(),
@@ -1486,29 +1603,12 @@ fn audio_map_args(has_bgm: bool, has_sfx: bool, audio: AudioWindow) -> Vec<Strin
             "-map".into(),
             "[aout]".into(),
             "-filter_complex".into(),
-            format!(
-                "[1:a]{}[bgm];[bgm][2:a]amix=inputs=2:duration=first:normalize=0[aout]",
-                audio_filter(audio)
-            ),
+            "[1:a][2:a]amix=inputs=2:duration=first:normalize=0[aout]".into(),
         ],
-        (true, false) => vec![
-            "-map".into(),
-            "0:v:0".into(),
-            "-map".into(),
-            "1:a:0".into(),
-            "-af".into(),
-            audio_filter(audio),
-        ],
+        (true, false) => vec!["-map".into(), "0:v:0".into(), "-map".into(), "1:a:0".into()],
         (false, true) => vec!["-map".into(), "0:v:0".into(), "-map".into(), "1:a:0".into()],
         (false, false) => vec!["-map".into(), "0:v:0".into()],
     }
-}
-
-fn audio_filter(window: AudioWindow) -> String {
-    format!(
-        "atrim=start={:.12},asetpts=PTS-STARTPTS+{:.12}/TB",
-        window.source_start, window.leading_silence
-    )
 }
 
 fn validate_probe(
@@ -1650,10 +1750,380 @@ mod tests {
         }
     }
 
+    // End-to-end seam uses the same exporter and installed tools without
+    // asking unit-test executables to provision FFmpeg in target/debug/deps.
+    #[test]
+    fn single_watch_export_audio_pipeline_offsets_and_failure_cleanup() {
+        let Some(tools) = crate::export_mv::tests::tools() else {
+            return;
+        };
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let resources = repo.join("TestingSuite/Next Sekai Engine/skin/ProSeka Faithful 0.8.3.scp");
+        let package =
+            crate::formats::load_engine(&repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"))
+                .unwrap();
+        let defaults: std::collections::BTreeMap<_, _> =
+            package.metadata.resource_defaults().into_iter().collect();
+        let skin = defaults.get("skins").unwrap();
+        let effect = defaults.get("effects").unwrap();
+        let assets = crate::formats::load_effect_assets_optional(&resources, effect)
+            .unwrap()
+            .unwrap();
+        let binding = crate::offline::effect_clip_bindings(&package.watch)
+            .unwrap()
+            .into_iter()
+            .find(|(_, name)| {
+                assets
+                    .clips
+                    .get(name)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|v| !v.is_empty())
+            })
+            .unwrap();
+        let fixture = crate::export_mv::tests::fixture(&tools, false);
+        let engine = fixture.path().join("engine.zip");
+        let level_path = fixture.path().join("level.json");
+        let music = fixture.path().join("bgm.wav");
+        let mv = fixture.path().join("timestamped.mkv");
+        fs::write(
+            &music,
+            crate::audio::wav_header(44100, 1, &[10000_i16.to_le_bytes(); 44100].concat()),
+        )
+        .unwrap();
+        let ui = crate::render_ui::RendererUiConfig::default();
+        // All calls are valid signatures. Immediate Play runs in initialize,
+        // per-frame Play exercises post-preprocess events, and scheduled events
+        // straddle nonzero export starts and the output end.
+        for (backend, pipeline, start, offset, sfx, whole, validate) in [
+            (
+                crate::render::RenderBackend::Cpu,
+                false,
+                0.0,
+                0.1,
+                true,
+                false,
+                false,
+            ),
+            (
+                crate::render::RenderBackend::Cpu,
+                true,
+                0.3,
+                -0.15,
+                true,
+                false,
+                false,
+            ),
+            (
+                crate::render::RenderBackend::Wgpu,
+                true,
+                0.0,
+                -0.1,
+                true,
+                false,
+                false,
+            ),
+            (
+                crate::render::RenderBackend::Wgpu,
+                false,
+                0.3,
+                0.1,
+                false,
+                false,
+                false,
+            ),
+            (
+                crate::render::RenderBackend::Cpu,
+                true,
+                0.0,
+                0.0,
+                true,
+                true,
+                false,
+            ),
+            (
+                crate::render::RenderBackend::Wgpu,
+                true,
+                0.0,
+                0.0,
+                true,
+                true,
+                false,
+            ),
+            (
+                crate::render::RenderBackend::Cpu,
+                false,
+                0.0,
+                0.0,
+                true,
+                false,
+                true,
+            ),
+        ] {
+            let mut presentation_reference = None;
+            for percent in [100.0, 40.0, 0.0] {
+                let watch: crate::watch::WatchData = serde_json::from_value(serde_json::json!({
+                "archetypes":[{"name":"Note","hasInput":true,"spawnTime":{"index":0},"despawnTime":{"index":1},"preprocess":{"index":7},
+                    "initialize": if whole { serde_json::Value::Null } else { serde_json::json!({"index":8}) },
+                    "updateSequential": if whole { serde_json::Value::Null } else { serde_json::json!({"index":8}) }}],
+                "skin":{"sprites":[]}, "effect":{"clips":[{"id":binding.0,"name":binding.1}]},
+                "nodes":[{"value":0},{"value":0.8},{"value":binding.0},{"value":0.15},{"value":1.45},
+                    {"func":"PlayScheduled","args":[2,3,0]}, {"func":"PlayScheduled","args":[2,4,0]},
+                    {"func":"Execute","args":[5,6]}, {"func":"Play","args":[2,0]}]
+            })).unwrap();
+                let mut archive = zip::ZipWriter::new(fs::File::create(&engine).unwrap());
+                for (name, value) in [
+                    (
+                        "engine.json",
+                        serde_json::json!({"skin_name":skin,"effect_name":effect}),
+                    ),
+                    ("EngineConfiguration", serde_json::json!({"options":[]})),
+                    ("EngineWatchData", serde_json::to_value(&watch).unwrap()),
+                ] {
+                    archive
+                        .start_file(name, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    archive
+                        .write_all(&serde_json::to_vec(&value).unwrap())
+                        .unwrap();
+                }
+                archive.finish().unwrap();
+                let level: crate::formats::LevelData = serde_json::from_value(
+                serde_json::json!({"bgmOffset":offset,"entities":[{"archetype":"Note","data":[]}]}),
+            )
+            .unwrap();
+                fs::write(&level_path, serde_json::to_vec(&level).unwrap()).unwrap();
+                let output = fixture.path().join("export.mp4");
+                let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let captured = phases.clone();
+                let report = export_using_tools(
+                    ExportRequest {
+                        engine: &engine,
+                        resources: &resources,
+                        level: &level_path,
+                        music: &music,
+                        mv: Some(&mv),
+                        mv_background: percent,
+                        resource_overrides: &crate::render::ResourceOverrides::default(),
+                        output: &output,
+                        start_time: start,
+                        duration: 0.75,
+                        whole_chart: whole,
+                        fps: 12,
+                        width: 64,
+                        height: 36,
+                        trace_entity_id: None,
+                        level_option_overrides: &[],
+                        skin_name: None,
+                        particles_enabled: false,
+                        sfx_enabled: sfx,
+                        bgm_enabled: true,
+                        ui: &ui,
+                        backend,
+                        profile: true,
+                        profile_frames: false,
+                        validate_determinism: validate,
+                        concurrent_sfx_prepass: true,
+                        frame_pipeline: pipeline,
+                    },
+                    Box::new(move |event| captured.lock().unwrap().push(event.phase)),
+                    || Ok(tools.clone()),
+                )
+                .unwrap();
+                let invariants = (
+                    report.submitted_frames,
+                    report.timeline.watch_start.to_bits(),
+                    report.timeline.duration.to_bits(),
+                    report.sfx_event_sha1.clone(),
+                    report
+                        .frame_diagnostics
+                        .iter()
+                        .map(|f| {
+                            (
+                                f.global_frame_index,
+                                f.runtime_update.map(f64::to_bits),
+                                f.mv_media_pts.map(f64::to_bits),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                if let Some((old, hash)) = &presentation_reference {
+                    assert_eq!(&invariants, old);
+                    assert_ne!(&report.second_pass_hash, hash);
+                } else {
+                    presentation_reference = Some((invariants, report.second_pass_hash.clone()));
+                }
+                assert_eq!(report.watch_traversals, if validate { 2 } else { 1 });
+                assert_eq!(report.event_pass_runtime_frames, 0);
+                assert_eq!(report.rgb_spool_bytes, 0);
+                assert!(!report.concurrent_sfx_prepass_used);
+                assert_eq!(
+                    report.stream_runtime_frames,
+                    (report.timeline_end * 12.0).round() as u64
+                );
+                assert_eq!(
+                    report.bgm_pcm_sample_frames,
+                    Some(report.timeline.audio_sample_frames)
+                );
+                assert_eq!(report.probe["streams"][1]["start_time"], "0.000000");
+                if validate {
+                    assert_eq!(report.deterministic_frame_hashes_match, Some(true));
+                }
+                let range = FrameRange::new(start, report.timeline.duration, 12).unwrap();
+                let reference = EventSession::new_configured(
+                    &watch,
+                    &[],
+                    &serde_json::json!({"options":[]}),
+                    &level,
+                    &resources,
+                    skin,
+                    None,
+                    Some(effect),
+                    None,
+                    64,
+                    36,
+                    12,
+                    &[],
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+                let events =
+                    collect_event_only_requests(reference, range, false, &AtomicU8::new(0))
+                        .unwrap();
+                assert_eq!(
+                    report.sfx_event_sha1,
+                    hash_audio_requests(&if sfx {
+                        events.requests
+                    } else {
+                        empty_audio_requests()
+                    })
+                    .unwrap()
+                );
+                if sfx && !whole {
+                    assert!(report.sfx_event_counts.audio_events > 0);
+                }
+                let phases = phases.lock().unwrap();
+                assert!(phases.contains(&crate::export_progress::ExportPhase::AudioMixing));
+                assert!(phases.contains(&crate::export_progress::ExportPhase::AudioEncoding));
+                assert_eq!(
+                    phases.last(),
+                    Some(&crate::export_progress::ExportPhase::Complete)
+                );
+                assert!(fs::read_dir(fixture.path()).unwrap().all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("sono-")));
+            }
+        }
+        for phase in [
+            crate::export_progress::ExportPhase::Rendering,
+            crate::export_progress::ExportPhase::AudioEncoding,
+            crate::export_progress::ExportPhase::Finalizing,
+        ] {
+            let output = fixture.path().join("cancelled.mp4");
+            fs::write(&output, b"prior output").unwrap();
+            let control = crate::export_control::ExportControl::default();
+            let cancel = control.clone();
+            let result = export_using_tools_controlled(
+                ExportRequest {
+                    engine: &engine,
+                    resources: &resources,
+                    level: &level_path,
+                    music: &music,
+                    mv: Some(&mv),
+                    mv_background: 40.0,
+                    resource_overrides: &Default::default(),
+                    output: &output,
+                    start_time: 0.0,
+                    duration: 0.5,
+                    whole_chart: false,
+                    fps: 12,
+                    width: 64,
+                    height: 36,
+                    trace_entity_id: None,
+                    level_option_overrides: &[],
+                    skin_name: None,
+                    particles_enabled: false,
+                    sfx_enabled: true,
+                    bgm_enabled: true,
+                    ui: &ui,
+                    backend: crate::render::RenderBackend::Cpu,
+                    profile: false,
+                    profile_frames: false,
+                    validate_determinism: false,
+                    concurrent_sfx_prepass: false,
+                    frame_pipeline: true,
+                },
+                Box::new(move |event| {
+                    if event.phase == phase {
+                        cancel.cancel();
+                    }
+                }),
+                || Ok(tools.clone()),
+                control,
+            );
+            assert!(result.unwrap_err().is::<crate::export_control::Cancelled>());
+            assert_eq!(fs::read(&output).unwrap(), b"prior output");
+            assert!(fs::read_dir(fixture.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("sono-")));
+        }
+        // Failure after video+audio construction (probe) must preserve a prior
+        // output and clean every staged media file, never publish partial data.
+        let output = fixture.path().join("preserved.mp4");
+        fs::write(&output, b"prior output").unwrap();
+        let mut broken_tools = tools.clone();
+        broken_tools.ffprobe = fixture.path().join("missing-ffprobe");
+        let result = export_using_tools(
+            ExportRequest {
+                engine: &engine,
+                resources: &resources,
+                level: &level_path,
+                music: &music,
+                mv: None,
+                mv_background: 100.0,
+                resource_overrides: &crate::render::ResourceOverrides::default(),
+                output: &output,
+                start_time: 0.0,
+                duration: 0.25,
+                whole_chart: false,
+                fps: 12,
+                width: 64,
+                height: 36,
+                trace_entity_id: None,
+                level_option_overrides: &[],
+                skin_name: None,
+                particles_enabled: false,
+                sfx_enabled: true,
+                bgm_enabled: false,
+                ui: &ui,
+                backend: crate::render::RenderBackend::Cpu,
+                profile: false,
+                profile_frames: false,
+                validate_determinism: false,
+                concurrent_sfx_prepass: false,
+                frame_pipeline: true,
+            },
+            Box::new(|_| {}),
+            || Ok(broken_tools),
+        );
+        assert!(result.unwrap_err().to_string().contains("FFprobe"));
+        assert_eq!(fs::read(&output).unwrap(), b"prior output");
+        assert!(fs::read_dir(fixture.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("sono-")));
+    }
+
     #[test]
     fn no_sfx_production_export_has_no_prepass() {
         assert_eq!(prepass_plan(false, false), PrepassPlan::None);
-        assert_eq!(prepass_plan(true, false), PrepassPlan::EventsOnly);
+        assert_eq!(prepass_plan(true, false), PrepassPlan::None);
         assert_eq!(prepass_plan(false, true), PrepassPlan::FullValidation);
         assert_eq!(prepass_plan(true, true), PrepassPlan::FullValidation);
     }
@@ -1661,6 +2131,7 @@ mod tests {
     #[test]
     fn explicit_determinism_validation_compares_draw_and_rgb_hashes() {
         let diagnostic = |draw: &str, rgb: &str| FrameDiagnostic {
+            mv_media_pts: None,
             output_local_frame_index: 0,
             global_frame_index: 0,
             requested_timeline_time: 0.0,
@@ -1760,6 +2231,160 @@ mod tests {
             crate::offline::hash_rgb(&expected_frame.rgb)
         );
         assert_eq!(output.len(), 320 * 180 * 3);
+    }
+
+    #[test]
+    fn mv_pipeline_matches_sequential_and_cpu_wgpu_share_composition() {
+        let Some(tools) = crate::export_mv::tests::tools() else {
+            return;
+        };
+        let fixture = crate::export_mv::tests::fixture(&tools, false);
+        let mv = fixture.path().join("timestamped.mkv");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let package =
+            crate::formats::load_engine(&repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"))
+                .unwrap();
+        let level = crate::formats::load_level(&repo.join("TestingSuite/Next Sekai Engine/levels/Various Artists - Baumkuchen x Retry Now/Baumkuchen x Retry Now.json.gz")).unwrap();
+        let resources = repo.join("TestingSuite/Next Sekai Engine/skin/ProSeka Faithful 0.8.3.scp");
+        let defaults: std::collections::BTreeMap<_, _> =
+            package.metadata.resource_defaults().into_iter().collect();
+        let range = FrameRange::new(0.0, 1.5, 8).unwrap();
+        let timeline = crate::export_timeline::ExportTimeline::new(0.0, range, -0.125).unwrap();
+        let make = |backend, mv_enabled| {
+            let mut session = FrameSession::new_configured(
+                &package.watch,
+                &package.rom,
+                &package.configuration,
+                &level,
+                &resources,
+                defaults.get("skins").unwrap(),
+                defaults.get("backgrounds").map(String::as_str),
+                defaults.get("effects").map(String::as_str),
+                defaults.get("particles").map(String::as_str),
+                64,
+                36,
+                8,
+                &[(1, 10.8), (22, 1.0)],
+                true,
+                crate::render_ui::RendererUiConfig::default(),
+                0.0,
+                1.5,
+                backend,
+                false,
+                false,
+            )
+            .unwrap();
+            if mv_enabled {
+                session.configure_mv(&tools, &mv, timeline).unwrap();
+            }
+            session
+        };
+        let mut backend_rgbs = Vec::new();
+        for backend in [
+            crate::render::RenderBackend::Cpu,
+            crate::render::RenderBackend::Wgpu,
+        ] {
+            let mut sequential_rgb = Vec::new();
+            let expected = stream_frames(
+                make(backend, true),
+                range,
+                &mut sequential_rgb,
+                None,
+                &package.watch,
+                None,
+                None,
+                "test handoff",
+                "test close",
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                expected.iter().map(|f| f.mv_media_pts).collect::<Vec<_>>(),
+                vec![
+                    None,
+                    Some(0.0),
+                    Some(0.0),
+                    Some(0.25),
+                    Some(0.25),
+                    Some(0.5),
+                    Some(0.5),
+                    Some(0.75),
+                    Some(0.75),
+                    None,
+                    None,
+                    None
+                ]
+            );
+            let mut pipeline_rgb = Vec::new();
+            let output = stream_frames_pipelined(
+                make(backend, true),
+                range,
+                &mut pipeline_rgb,
+                Some(&expected),
+                &package.watch,
+                None,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                hash_audio_requests(&output.audio_requests).unwrap(),
+                hash_audio_requests(&collect_audio_requests(&expected)).unwrap()
+            );
+            assert_eq!(pipeline_rgb, sequential_rgb);
+            assert!(compare_frame_diagnostics(&expected, &output.diagnostics));
+            let mut without_mv = Vec::new();
+            stream_frames(
+                make(backend, false),
+                range,
+                &mut without_mv,
+                None,
+                &package.watch,
+                None,
+                None,
+                "test handoff",
+                "test close",
+                None,
+            )
+            .unwrap();
+            let bytes = 64 * 36 * 3;
+            for n in [0, 9, 10, 11] {
+                assert_eq!(
+                    sequential_rgb[n * bytes..(n + 1) * bytes],
+                    without_mv[n * bytes..(n + 1) * bytes]
+                );
+            }
+            assert_ne!(
+                sequential_rgb[bytes..9 * bytes],
+                without_mv[bytes..9 * bytes]
+            );
+            backend_rgbs.push(sequential_rgb);
+        }
+        let max_error = backend_rgbs[0]
+            .iter()
+            .zip(&backend_rgbs[1])
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        assert!(
+            max_error <= 2,
+            "CPU/WGPU MV composition max channel difference: {max_error}"
+        );
+        // A closed output must cancel the bounded pipeline and release its
+        // decoder, even with prepared MV snapshots still in the queue.
+        let error = stream_frames_pipelined(
+            make(crate::render::RenderBackend::Cpu, true),
+            range,
+            BrokenSink,
+            None,
+            &package.watch,
+            None,
+            false,
+        )
+        .err()
+        .unwrap();
+        assert!(error
+            .chain()
+            .any(|e| e.to_string().contains("simulated FFmpeg stdin closure")));
     }
 
     #[test]
@@ -2106,7 +2731,7 @@ mod tests {
         )
         .unwrap();
         let events =
-            collect_event_only_requests(event_session, range, false, &AtomicU8::new(0)).unwrap();
+            collect_event_only_requests(event_session, range, true, &AtomicU8::new(0)).unwrap();
         assert_eq!(
             hash_audio_requests(&events.requests).unwrap(),
             "be53125a6dd38ad4b59dc7fc15b2ca3ca99c1808"
@@ -2120,13 +2745,35 @@ mod tests {
                 loop_stops: 89,
             }
         );
+        // The authoritative serial Watch producer supplies exactly this timeline.
+        assert_eq!(
+            hash_audio_requests(&output.audio_requests).unwrap(),
+            hash_audio_requests(&events.requests).unwrap()
+        );
+        assert_eq!(
+            hash_audio_requests(&collect_audio_requests(&output.diagnostics)).unwrap(),
+            hash_audio_requests(&output.audio_requests).unwrap()
+        );
         assert_eq!(events.runtime_frames, 120);
         assert_eq!(events.callbacks, 10_898);
         assert_eq!(events.evaluations, 12_783_093);
+        assert_eq!(events.checkpoints.len(), 1);
+        let checkpoint = &events.checkpoints[0];
+        assert_eq!((checkpoint.watch_start, checkpoint.watch_end), (0.0, 2.0));
+        assert_eq!(checkpoint.runtime_frames, 120);
+        assert_eq!(checkpoint.callbacks, events.callbacks);
+        assert_eq!(checkpoint.evaluations, events.evaluations);
+        assert_eq!(checkpoint.sfx_events, [0, 615, 89, 89]);
+        assert_eq!(
+            checkpoint.callback_stages.values().sum::<u64>(),
+            events.callbacks
+        );
+        assert!(checkpoint.draw_commands > 0);
+        assert!(checkpoint.memory_entries_copied > 0);
     }
 
     #[test]
-    fn concurrent_and_sequential_baumkuchen_event_and_frame_sequences_match() {
+    fn authoritative_pipeline_baumkuchen_events_match_reference_and_sequential_frames() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let package =
             crate::formats::load_engine(&repo.join("TestingSuite/Next RUSH/engine/Next RUSH.zip"))
@@ -2204,39 +2851,58 @@ mod tests {
             })
             .collect();
 
-        let concurrent = concurrent_event_and_render(
-            make_event_session(),
+        let mut rgb = Vec::new();
+        let concurrent = stream_frames_pipelined(
             make_frame_session(),
             range,
-            &package.watch,
+            &mut rgb,
             None,
+            &package.watch,
             None,
             false,
         )
         .unwrap();
         assert_eq!(
             hash_audio_requests(&sequential_events.requests).unwrap(),
-            hash_audio_requests(&concurrent.events.requests).unwrap()
+            hash_audio_requests(&concurrent.audio_requests).unwrap()
         );
         assert_eq!(
             count_audio_requests(&sequential_events.requests),
-            count_audio_requests(&concurrent.events.requests)
+            count_audio_requests(&concurrent.audio_requests)
         );
         assert!(
-            count_audio_requests(&concurrent.events.requests).audio_events
-                + count_audio_requests(&concurrent.events.requests).scheduled_effects
-                + count_audio_requests(&concurrent.events.requests).loop_starts
-                + count_audio_requests(&concurrent.events.requests).loop_stops
+            count_audio_requests(&concurrent.audio_requests).audio_events
+                + count_audio_requests(&concurrent.audio_requests).scheduled_effects
+                + count_audio_requests(&concurrent.audio_requests).loop_starts
+                + count_audio_requests(&concurrent.audio_requests).loop_stops
                 > 0
         );
         assert_eq!(
             sequential_events.runtime_frames,
-            concurrent.events.runtime_frames
+            concurrent
+                .diagnostics
+                .iter()
+                .map(|f| f.runtime_frame_count)
+                .sum::<u64>()
         );
-        assert_eq!(sequential_events.callbacks, concurrent.events.callbacks);
-        assert_eq!(sequential_events.evaluations, concurrent.events.evaluations);
+        assert_eq!(
+            sequential_events.callbacks,
+            concurrent
+                .diagnostics
+                .iter()
+                .map(|f| f.callback_count as u64)
+                .sum::<u64>()
+        );
+        assert_eq!(
+            sequential_events.evaluations,
+            concurrent
+                .diagnostics
+                .iter()
+                .map(|f| f.vm_evaluations)
+                .sum::<u64>()
+        );
         let concurrent_hashes: Vec<_> = concurrent
-            .frames
+            .diagnostics
             .iter()
             .map(|frame| frame.rgb_sha1.clone())
             .collect();
@@ -2245,47 +2911,38 @@ mod tests {
             hash_sequence(&sequential_hashes),
             hash_sequence(&concurrent_hashes)
         );
-        assert_eq!(
-            fs::metadata(concurrent.spool.path()).unwrap().len(),
-            64 * 36 * 3 * 120
-        );
+        assert_eq!(rgb.len(), 64 * 36 * 3 * 120);
     }
 
     #[test]
-    fn audio_filter_trims_to_timeline_position_and_applies_leading_silence() {
-        assert_eq!(
-            audio_filter(AudioWindow {
-                source_start: 4.5,
-                leading_silence: 0.0
-            }),
-            "atrim=start=4.500000000000,asetpts=PTS-STARTPTS+0.000000000000/TB"
-        );
-        assert!(audio_filter(AudioWindow {
-            source_start: 0.0,
-            leading_silence: 0.05
-        })
-        .contains("+0.050000000000/TB"));
+    fn bgm_preparation_inserts_samples_instead_of_shifting_timestamps() {
+        let timeline = crate::export_timeline::ExportTimeline::new(
+            0.0,
+            FrameRange::new(0.0, 1.0, 12).unwrap(),
+            -0.05,
+        )
+        .unwrap();
+        let filter = timeline.bgm_filter();
+        assert!(filter.contains("adelay=2205S:all=1"));
+        assert!(filter.contains("apad=whole_len=44100,atrim=end_sample=44100"));
+        assert!(filter.ends_with("asetpts=N/SR/TB"));
     }
 
     #[test]
     fn bgm_is_mapped_alone_without_sfx_and_mixed_when_sfx_exists() {
-        let window = AudioWindow {
-            source_start: 1.25,
-            leading_silence: 0.0,
-        };
-        let without_sfx = audio_map_args(true, false, window).join(" ");
+        let without_sfx = audio_map_args(true, false).join(" ");
         assert!(without_sfx.contains("1:a:0"));
-        assert!(without_sfx.contains("atrim=start=1.250000000000"));
+        assert!(!without_sfx.contains("atrim")); // BGM is already zero-based PCM.
 
-        let with_sfx = audio_map_args(true, true, window).join(" ");
+        let with_sfx = audio_map_args(true, true).join(" ");
         assert!(with_sfx.contains("[1:a]"));
         assert!(with_sfx.contains("[2:a]"));
         assert!(with_sfx.contains("amix=inputs=2"));
-        assert!(with_sfx.contains("atrim=start=1.250000000000"));
+        assert!(with_sfx.contains("normalize=0"));
 
-        let sfx_only = audio_map_args(false, true, window).join(" ");
+        let sfx_only = audio_map_args(false, true).join(" ");
         assert!(sfx_only.contains("1:a:0"));
         assert!(!sfx_only.contains("atrim"));
-        assert_eq!(audio_map_args(false, false, window), ["-map", "0:v:0"]);
+        assert_eq!(audio_map_args(false, false), ["-map", "0:v:0"]);
     }
 }

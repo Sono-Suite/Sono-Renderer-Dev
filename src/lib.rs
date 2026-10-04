@@ -1,5 +1,11 @@
 pub mod audio;
+pub mod audio_prepass_profile;
 pub mod compatibility;
+pub mod export_end;
+pub mod export_media;
+mod export_mv;
+pub mod export_progress;
+pub mod export_timeline;
 pub mod ffmpeg;
 pub mod formats;
 pub mod gpu_render;
@@ -11,6 +17,9 @@ pub mod project;
 pub mod render;
 pub mod render_ui;
 pub mod runtime;
+pub mod skin_render_mode;
 pub mod video_export;
 pub mod watch;
 pub mod watch_runtime;
+
+pub mod export_control;

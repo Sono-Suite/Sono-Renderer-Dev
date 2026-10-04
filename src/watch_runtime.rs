@@ -165,6 +165,7 @@ pub struct WatchDiagnosticTarget {
 /// Watch host. Level entities are kept in source order; callback `order` only
 /// changes the order within a lifecycle system and ties preserve source order.
 pub struct WatchRuntime<'a> {
+    export_control: crate::export_control::ExportControl,
     watch: &'a WatchData,
     level_entity_count: usize,
     archetype_defs: Vec<WatchArchetype>,
@@ -196,6 +197,9 @@ pub struct WatchRuntime<'a> {
 }
 
 impl<'a> WatchRuntime<'a> {
+    pub(crate) fn set_export_control(&mut self, control: crate::export_control::ExportControl) {
+        self.export_control = control;
+    }
     pub fn new(watch: &'a WatchData, level: &LevelData) -> Result<Self> {
         let mut archetype_defs = watch.archetypes.clone();
         let mut archetypes = BTreeMap::new();
@@ -242,6 +246,7 @@ impl<'a> WatchRuntime<'a> {
         let level_entity_count = level.entities.len();
         let names = collect_entity_names(&level.entities)?;
         let mut runtime = Self {
+            export_control: Default::default(),
             watch,
             level_entity_count,
             archetype_defs,
@@ -705,8 +710,34 @@ impl<'a> WatchRuntime<'a> {
         Ok(())
     }
 
+    /// Export-boundary evidence only: one-time preprocessing and cached schedules.
+    /// This is not a playback frame and never runs initialize/update/terminate.
+    pub(crate) fn export_schedule_evidence(&mut self) -> Result<FrameReport> {
+        self.preprocess()?;
+        // Match frame(0)'s post-preprocess runtime inputs. updateSpawn itself
+        // is skipped only after the exporter proves a pure affine clock.
+        self.context.time = 0.0;
+        self.global_memory.set(RUNTIME_UPDATE, 0, 0.0);
+        self.global_memory.set(RUNTIME_UPDATE, 1, 0.0);
+        self.global_memory
+            .set(RUNTIME_UPDATE, 2, self.context.scaled_time(0.0)?);
+        self.global_memory.set(RUNTIME_UPDATE, 3, 0.0);
+        self.context.timescale = self.context.time_to_timescale(0.0)?;
+        self.compute_schedules()?;
+        Ok(FrameReport {
+            runtime_entity_count: self.entities.len(),
+            callbacks: self.callback_log.clone(),
+            scheduled_effects: self.frame_scheduled_effects.clone(),
+            scheduled_looped_effects: self.frame_scheduled_looped_effects.clone(),
+            scheduled_looped_effect_stops: self.frame_scheduled_looped_effect_stops.clone(),
+            audio_events: self.frame_audio_events.clone(),
+            ..FrameReport::default()
+        })
+    }
+
     /// Advance one deterministic Watch frame at a caller-supplied time.
     pub fn frame(&mut self, time: f64) -> Result<FrameReport> {
+        self.export_control.check()?;
         if !time.is_finite() {
             bail!("Watch frame time must be finite");
         }
@@ -922,6 +953,7 @@ impl<'a> WatchRuntime<'a> {
     }
 
     fn invoke_entity(&mut self, id: usize, stage: LifecycleStage) -> Result<f64> {
+        self.export_control.check()?;
         let archetype_index = self
             .entities
             .get(id)
@@ -1071,6 +1103,7 @@ impl<'a> WatchRuntime<'a> {
     }
 
     fn invoke_global(&mut self, stage: LifecycleStage, node: usize) -> Result<f64> {
+        self.export_control.check()?;
         if self.profiling {
             self.frame_profile.callbacks += 1;
         }

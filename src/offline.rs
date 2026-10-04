@@ -1,5 +1,5 @@
 //! Deterministic Watch-frame production for offline rendering.
-//! This module knows about Sonolus frames and assets, but not FFmpeg or CLI.
+//! Optional MV snapshots consume canonical media time; encoding stays in video_export.
 
 use crate::{
     formats,
@@ -9,6 +9,8 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
+
+pub(crate) const MAX_EXPORT_FRAMES: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameRange {
@@ -38,7 +40,7 @@ impl FrameRange {
         first_index
             .checked_add(frame_count)
             .context("segment frame range overflows")?;
-        if frame_count > 1_000_000 {
+        if frame_count > MAX_EXPORT_FRAMES {
             bail!("segment is too long (limit: 1,000,000 frames)");
         }
         Ok(Self {
@@ -88,6 +90,7 @@ pub fn audio_window(level_start: f64, bgm_offset: f64) -> Result<AudioWindow> {
 
 pub struct FrameSession<'a> {
     stepper: WatchFrameStepper<'a>,
+    mv: Option<crate::export_mv::MvDecoder>,
     render: std::sync::Arc<FrameRenderResources>,
     profile: bool,
     runtime_construction: std::time::Duration,
@@ -96,7 +99,10 @@ pub struct FrameSession<'a> {
 
 /// Immutable renderer inputs shared with the render worker. Watch state is
 /// intentionally absent: only per-frame snapshots cross the pipeline boundary.
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct FrameRenderResources {
+    requested_skin_mode: crate::skin_render_mode::SkinRenderModePreference,
+    skin_mode: crate::skin_render_mode::SkinRenderMode,
     skin: formats::SkinAssets,
     skin_atlas_identity: Option<crate::gpu_render::AtlasIdentity>,
     background: Option<formats::BackgroundAssets>,
@@ -117,8 +123,10 @@ pub(crate) struct FrameRenderResources {
 
 /// Owned frame snapshot. It can be rasterized after the producer advances the
 /// Watch runtime to later frames.
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct PreparedFrame {
-    report: FrameReport,
+    pub(crate) report: FrameReport,
+    mv_frame: Option<std::sync::Arc<crate::export_mv::MvFrame>>,
     particle_draws: Option<Vec<crate::particles::ParticleSpriteDraw>>,
     ui_values: Vec<f64>,
     vm: std::time::Duration,
@@ -135,6 +143,7 @@ impl PreparedFrame {
 }
 
 pub struct RenderedFrame {
+    pub mv_media_pts: Option<f64>,
     pub report: FrameReport,
     pub rgb: Vec<u8>,
     pub profile: Option<FrameStageProfile>,
@@ -262,7 +271,7 @@ impl<'a> WatchFrameStepper<'a> {
         {
             bail!("Watch frame indices must advance monotonically");
         }
-        if self.last_frame_index.is_none() && frame_index > 1_000_000 {
+        if self.last_frame_index.is_none() && frame_index > MAX_EXPORT_FRAMES {
             bail!("pre-roll exceeds 1,000,000 frames");
         }
         let start = self.last_frame_index.map_or(0, |previous| previous + 1);
@@ -311,6 +320,10 @@ pub struct EventSession<'a> {
 }
 
 impl<'a> EventSession<'a> {
+    pub(crate) fn set_export_control(&mut self, control: crate::export_control::ExportControl) {
+        self.stepper.runtime_mut().set_export_control(control);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_configured(
         watch: &'a WatchData,
@@ -329,6 +342,47 @@ impl<'a> EventSession<'a> {
         particles_enabled: bool,
         profile: bool,
         draw_tracing: bool,
+    ) -> Result<Self> {
+        Self::new_configured_with_sources(
+            watch,
+            rom,
+            configuration,
+            level,
+            resources_path,
+            skin_name,
+            background_name,
+            effect_name,
+            particle_name,
+            width,
+            height,
+            fps,
+            level_option_overrides,
+            particles_enabled,
+            profile,
+            draw_tracing,
+            &crate::render::ResourceOverrides::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_configured_with_sources(
+        watch: &'a WatchData,
+        rom: &[u8],
+        configuration: &serde_json::Value,
+        level: &formats::LevelData,
+        resources_path: &std::path::Path,
+        skin_name: &str,
+        background_name: Option<&str>,
+        effect_name: Option<&str>,
+        particle_name: Option<&str>,
+        width: u32,
+        height: u32,
+        fps: u32,
+        level_option_overrides: &[(usize, f64)],
+        particles_enabled: bool,
+        profile: bool,
+        draw_tracing: bool,
+        sources: &crate::render::ResourceOverrides,
     ) -> Result<Self> {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             bail!("frame dimensions must be in 1..=8192");
@@ -350,8 +404,11 @@ impl<'a> EventSession<'a> {
         let sprite_names = formats::load_skin_sprite_names(resources_path, skin_name)?;
         runtime.bind_skin_sprite_names(&sprite_names)?;
         if let Some(name) = effect_name {
-            let names = formats::load_effect_clip_names_optional(resources_path, name)
-                .with_context(|| format!("resolving selected effect resource {name:?}"))?;
+            let names = formats::load_effect_clip_names_optional(
+                sources.effects.as_deref().unwrap_or(resources_path),
+                name,
+            )
+            .with_context(|| format!("resolving selected effect resource {name:?}"))?;
             if watch
                 .effect
                 .get("clips")
@@ -362,8 +419,11 @@ impl<'a> EventSession<'a> {
             }
         }
         if let Some(name) = particle_name {
-            let names = formats::load_particle_effect_names(resources_path, name)
-                .with_context(|| format!("resolving selected particle resource {name:?}"))?;
+            let names = formats::load_particle_effect_names(
+                sources.particles.as_deref().unwrap_or(resources_path),
+                name,
+            )
+            .with_context(|| format!("resolving selected particle resource {name:?}"))?;
             if watch
                 .particle
                 .get("effects")
@@ -383,7 +443,7 @@ impl<'a> EventSession<'a> {
         }
         if let Some(name) = background_name {
             let quad = formats::load_background_runtime_quad(
-                resources_path,
+                sources.background.as_deref().unwrap_or(resources_path),
                 name,
                 f64::from(width) / f64::from(height),
             )
@@ -396,9 +456,29 @@ impl<'a> EventSession<'a> {
     pub fn advance_global_frame(&mut self, frame_index: u64) -> Result<FrameReport> {
         self.stepper.advance_to(frame_index)
     }
+
+    pub(crate) fn schedule_evidence(&mut self) -> Result<FrameReport> {
+        self.stepper.runtime_mut().export_schedule_evidence()
+    }
+
+    pub(crate) fn runtime(&self) -> &WatchRuntime<'a> {
+        &self.stepper.runtime
+    }
 }
 
 impl<'a> FrameSession<'a> {
+    pub fn skin_render_modes(
+        &self,
+    ) -> (
+        crate::skin_render_mode::SkinRenderModePreference,
+        crate::skin_render_mode::SkinRenderMode,
+    ) {
+        (self.render.requested_skin_mode, self.render.skin_mode)
+    }
+    pub(crate) fn set_export_control(&mut self, control: crate::export_control::ExportControl) {
+        self.stepper.runtime_mut().set_export_control(control);
+    }
+
     pub fn new(
         watch: &'a WatchData,
         rom: &[u8],
@@ -461,6 +541,55 @@ impl<'a> FrameSession<'a> {
         profile: bool,
         draw_tracing: bool,
     ) -> Result<Self> {
+        Self::new_configured_with_sources(
+            watch,
+            rom,
+            configuration,
+            level,
+            resources_path,
+            skin_name,
+            background_name,
+            effect_name,
+            particle_name,
+            width,
+            height,
+            fps,
+            level_option_overrides,
+            particles_enabled,
+            ui,
+            ui_segment_start,
+            ui_segment_duration,
+            backend,
+            profile,
+            draw_tracing,
+            &crate::render::ResourceOverrides::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_configured_with_sources(
+        watch: &'a WatchData,
+        rom: &[u8],
+        configuration: &serde_json::Value,
+        level: &formats::LevelData,
+        resources_path: &std::path::Path,
+        skin_name: &str,
+        background_name: Option<&str>,
+        effect_name: Option<&str>,
+        particle_name: Option<&str>,
+        width: u32,
+        height: u32,
+        fps: u32,
+        level_option_overrides: &[(usize, f64)],
+        particles_enabled: bool,
+        ui: crate::render_ui::RendererUiConfig,
+        ui_segment_start: f64,
+        ui_segment_duration: f64,
+        backend: crate::render::RenderBackend,
+        profile: bool,
+        draw_tracing: bool,
+        sources: &crate::render::ResourceOverrides,
+    ) -> Result<Self> {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             bail!("frame dimensions must be in 1..=8192");
         }
@@ -489,8 +618,11 @@ impl<'a> FrameSession<'a> {
         let sprite_names = skin.sprites.keys().cloned().collect();
         runtime.bind_skin_sprite_names(&sprite_names)?;
         if let Some(name) = effect_name {
-            let names = formats::load_effect_clip_names_optional(resources_path, name)
-                .with_context(|| format!("resolving selected effect resource {name:?}"))?;
+            let names = formats::load_effect_clip_names_optional(
+                sources.effects.as_deref().unwrap_or(resources_path),
+                name,
+            )
+            .with_context(|| format!("resolving selected effect resource {name:?}"))?;
             if watch
                 .effect
                 .get("clips")
@@ -503,12 +635,18 @@ impl<'a> FrameSession<'a> {
         let mut particles = None;
         let mut particle_bindings = BTreeMap::new();
         if let Some(name) = particle_name {
-            let names = formats::load_particle_effect_names(resources_path, name)
-                .with_context(|| format!("resolving selected particle resource {name:?}"))?;
+            let names = formats::load_particle_effect_names(
+                sources.particles.as_deref().unwrap_or(resources_path),
+                name,
+            )
+            .with_context(|| format!("resolving selected particle resource {name:?}"))?;
             if particles_enabled {
                 particles = Some(
-                    formats::load_particle_assets(resources_path, name)
-                        .with_context(|| format!("loading selected particle resource {name:?}"))?,
+                    formats::load_particle_assets(
+                        sources.particles.as_deref().unwrap_or(resources_path),
+                        name,
+                    )
+                    .with_context(|| format!("loading selected particle resource {name:?}"))?,
                 );
             }
             let effect_names: std::collections::BTreeSet<String> = particles
@@ -538,8 +676,11 @@ impl<'a> FrameSession<'a> {
         }
         let background = background_name
             .map(|name| {
-                formats::load_background_assets(resources_path, name)
-                    .with_context(|| format!("resolving selected background resource {name:?}"))
+                formats::load_background_assets(
+                    sources.background.as_deref().unwrap_or(resources_path),
+                    name,
+                )
+                .with_context(|| format!("resolving selected background resource {name:?}"))
             })
             .transpose()?;
         if let Some(assets) = background.as_ref() {
@@ -572,6 +713,12 @@ impl<'a> FrameSession<'a> {
             .map(|start| start.elapsed())
             .unwrap_or_default();
         let render = std::sync::Arc::new(FrameRenderResources {
+            requested_skin_mode: watch
+                .skin_render_mode()
+                .context("invalid EngineWatchData skin.renderMode")?,
+            skin_mode: watch
+                .skin_render_mode()?
+                .resolve(crate::skin_render_mode::SkinRenderMode::Standard),
             skin,
             skin_atlas_identity,
             background,
@@ -595,11 +742,45 @@ impl<'a> FrameSession<'a> {
         });
         Ok(Self {
             stepper,
+            mv: None,
             render,
             profile,
             runtime_construction,
             atlas_identity_preparation,
         })
+    }
+
+    pub(crate) fn set_mv_background(&mut self, percent: f64) {
+        if let Some(mv) = &mut self.mv {
+            mv.set_background_percentage(percent);
+        }
+    }
+
+    pub(crate) fn configure_mv(
+        &mut self,
+        installation: &crate::ffmpeg::FfmpegInstallation,
+        path: &std::path::Path,
+        timeline: crate::export_timeline::ExportTimeline,
+    ) -> Result<()> {
+        let configuration = self
+            .render
+            .background
+            .as_ref()
+            .map(|b| b.configuration.clone())
+            .unwrap_or(formats::BackgroundConfiguration {
+                blur: 0.0,
+                mask: "#0000".into(),
+            });
+        let decoder = crate::export_mv::MvDecoder::new(
+            installation,
+            path,
+            timeline,
+            self.render.width,
+            self.render.height,
+            configuration,
+        )?;
+        self.mv = Some(decoder);
+        Ok(())
     }
 
     pub(crate) fn render_resources(&self) -> std::sync::Arc<FrameRenderResources> {
@@ -649,8 +830,15 @@ impl<'a> FrameSession<'a> {
             timeline,
             &self.stepper.runtime_mut().global_memory,
         )?;
+        let mv_frame = self
+            .mv
+            .as_mut()
+            .map(|mv| mv.at_watch_time(frame_index as f64 / f64::from(self.stepper.fps)))
+            .transpose()?
+            .flatten();
         let preparation = preparation_start.map(|t| t.elapsed()).unwrap_or_default();
         Ok(PreparedFrame {
+            mv_frame,
             report,
             particle_draws,
             ui_values,
@@ -719,6 +907,7 @@ pub(crate) fn render_prepared_frame(
 ) -> Result<RenderedFrame> {
     let PreparedFrame {
         report,
+        mv_frame,
         particle_draws,
         ui_values,
         vm,
@@ -737,59 +926,66 @@ pub(crate) fn render_prepared_frame(
         .collect::<Vec<_>>()
         .try_into()
         .map_err(|_| anyhow::anyhow!("Runtime Background quad has invalid length"))?;
-    let background = resources.background.as_ref().map(|assets| (assets, quad));
+    let background = mv_frame
+        .as_ref()
+        .map(|frame| (&frame.assets, frame.quad))
+        .or_else(|| resources.background.as_ref().map(|assets| (assets, quad)));
     let mut rgb = match resources.backend {
-        crate::render::RenderBackend::Cpu => report
-            .display_list
-            .render_skin_rgb_with_runtime_transform_and_background(
-                resources.width,
-                resources.height,
-                f64::from(resources.width) / f64::from(resources.height),
-                &resources.skin,
-                &resources.bindings,
-                &report.runtime_skin_transform,
-                background,
-            )?,
-        crate::render::RenderBackend::Wgpu => crate::gpu_render::render_display_list_rgb(
-            resources
-                .gpu
-                .as_ref()
-                .context("wgpu backend was not initialized")?,
-            &report.display_list,
+        crate::render::RenderBackend::Cpu => report.display_list.render_skin_rgb_with_mode(
             resources.width,
             resources.height,
             f64::from(resources.width) / f64::from(resources.height),
             &resources.skin,
-            resources
-                .skin_atlas_identity
-                .context("wgpu skin atlas identity was not initialized")?,
             &resources.bindings,
             &report.runtime_skin_transform,
-            background.map(|(assets, quad)| {
-                (
-                    assets,
-                    quad,
-                    resources
-                        .background_atlas_identity
-                        .expect("background identity follows loaded background"),
-                )
-            }),
-            resources
-                .particles
-                .as_ref()
-                .zip(particle_draws.as_deref())
-                .map(|(assets, draws)| {
+            background,
+            resources.skin_mode,
+        )?,
+        crate::render::RenderBackend::Wgpu => {
+            crate::gpu_render::render_display_list_rgb_with_skin_mode(
+                resources
+                    .gpu
+                    .as_ref()
+                    .context("wgpu backend was not initialized")?,
+                &report.display_list,
+                resources.width,
+                resources.height,
+                f64::from(resources.width) / f64::from(resources.height),
+                &resources.skin,
+                resources
+                    .skin_atlas_identity
+                    .context("wgpu skin atlas identity was not initialized")?,
+                &resources.bindings,
+                &report.runtime_skin_transform,
+                background.map(|(assets, quad)| {
                     (
                         assets,
-                        draws,
-                        &report.runtime_particle_transform,
-                        resources
-                            .particle_atlas_identity
-                            .expect("particle identity follows loaded particles"),
+                        quad,
+                        mv_frame
+                            .as_ref()
+                            .map(|frame| frame.identity)
+                            .or(resources.background_atlas_identity)
+                            .expect("background identity follows loaded background"),
                     )
                 }),
-            gpu_profile.as_mut(),
-        )?,
+                resources
+                    .particles
+                    .as_ref()
+                    .zip(particle_draws.as_deref())
+                    .map(|(assets, draws)| {
+                        (
+                            assets,
+                            draws,
+                            &report.runtime_particle_transform,
+                            resources
+                                .particle_atlas_identity
+                                .expect("particle identity follows loaded particles"),
+                        )
+                    }),
+                gpu_profile.as_mut(),
+                resources.skin_mode,
+            )?
+        }
     };
     if resources.backend == crate::render::RenderBackend::Cpu {
         if let (Some(assets), Some(draws)) = (&resources.particles, particle_draws.as_deref()) {
@@ -860,6 +1056,7 @@ pub(crate) fn render_prepared_frame(
         atlas_identity_preparation,
     });
     let mut rendered = RenderedFrame {
+        mv_media_pts: mv_frame.as_ref().map(|f| f.media_pts),
         report,
         rgb,
         profile,
@@ -1072,6 +1269,145 @@ mod tests {
     }
 
     #[test]
+    fn whole_chart_uses_evaluated_schedules_not_music_alone_or_raw_timeline() {
+        let watch: WatchData = serde_json::from_value(serde_json::json!({
+            "archetypes": [
+                {"name":"Note", "hasInput":true, "spawnTime":{"index":0}, "despawnTime":{"index":1}},
+                {"name":"Stage", "spawnTime":{"index":6}, "despawnTime":{"index":7}}
+            ],
+            "nodes":[{"value":0},{"value":2},{"value":1001},{"func":"Get","args":[2,0]},
+                {"value":0.5},{"func":"Multiply","args":[3,4]}, {"value":-100000000},{"value":100000000}],
+            "updateSpawn":5
+        }))
+        .unwrap();
+        let level: formats::LevelData = serde_json::from_value(
+            serde_json::json!({"entities":[{"archetype":"Note","data":[]},{"archetype":"Stage","data":[]}]}),
+        )
+        .unwrap();
+        let session = EventSession {
+            stepper: WatchFrameStepper::new(&watch, &level, 10).unwrap(),
+        };
+        let end = crate::export_end::discover(
+            session,
+            10,
+            Some(1.0),
+            &formats::EffectAssets {
+                clips: BTreeMap::new(),
+            },
+            &BTreeMap::new(),
+            None,
+            &watch,
+        )
+        .unwrap();
+        assert!((end.watch_end - (4.0 + 1.0 / 60.0)).abs() < 1e-9); // Include the lifecycle endpoint, with a fixed 60-Hz inference policy.
+        assert_eq!(end.discovery_frames, 0);
+        assert_eq!(end.persistent_entity_count, 1);
+        assert_eq!(end.confidence, "inferred");
+    }
+
+    #[test]
+    fn whole_chart_keeps_known_sfx_tail_and_rejects_unbounded_content() {
+        let watch: WatchData = serde_json::from_value(serde_json::json!({
+            "archetypes":[{"name":"Note","spawnTime":{"index":0},"despawnTime":{"index":1},"preprocess":{"index":2}}],
+            "nodes":[{"value":0},{"value":0.2},{"func":"Play","args":[0,0]}]
+        })).unwrap();
+        let level: formats::LevelData = serde_json::from_value(
+            serde_json::json!({"entities":[{"archetype":"Note","data":[]}]}),
+        )
+        .unwrap();
+        let pcm = vec![0; 44100 * 2];
+        let assets = formats::EffectAssets {
+            clips: [(
+                "hit".to_string(),
+                Some(crate::audio::wav_header(44100, 1, &pcm)),
+            )]
+            .into(),
+        };
+        let session = EventSession {
+            stepper: WatchFrameStepper::new(&watch, &level, 10).unwrap(),
+        };
+        let end = crate::export_end::discover(
+            session,
+            10,
+            None,
+            &assets,
+            &[(0, "hit".into())].into(),
+            None,
+            &watch,
+        )
+        .unwrap();
+        assert_eq!(end.sfx_watch_end, 1.0);
+        assert_eq!(end.watch_end, 1.0);
+        let unbounded: WatchData =
+            serde_json::from_value(serde_json::json!({"archetypes":[{"name":"Note"}]})).unwrap();
+        let session = EventSession {
+            stepper: WatchFrameStepper::new(&unbounded, &level, 10).unwrap(),
+        };
+        assert!(crate::export_end::discover(
+            session,
+            10,
+            None,
+            &assets,
+            &BTreeMap::new(),
+            None,
+            &unbounded
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("indeterminate"));
+        let input: WatchData = serde_json::from_value(
+            serde_json::json!({"archetypes":[{"name":"Note","hasInput":true}]}),
+        )
+        .unwrap();
+        let session = EventSession {
+            stepper: WatchFrameStepper::new(&input, &level, 10).unwrap(),
+        };
+        assert!(crate::export_end::discover(
+            session,
+            10,
+            Some(1.0),
+            &assets,
+            &BTreeMap::new(),
+            None,
+            &input
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("indeterminate"));
+    }
+
+    #[test]
+    fn whole_chart_includes_future_activation_of_persistent_non_input_entity() {
+        let watch: WatchData = serde_json::from_value(serde_json::json!({
+            "archetypes":[
+                {"name":"Note","hasInput":true,"spawnTime":{"index":0},"despawnTime":{"index":1}},
+                {"name":"FinalDisplay","spawnTime":{"index":2},"despawnTime":{"index":3}}
+            ],
+            "nodes":[{"value":0},{"value":2},{"value":4},{"value":100000000}]
+        }))
+        .unwrap();
+        let level: formats::LevelData = serde_json::from_value(serde_json::json!({"entities":[{"archetype":"Note","data":[]},{"archetype":"FinalDisplay","data":[]}]})).unwrap();
+        let session = EventSession {
+            stepper: WatchFrameStepper::new(&watch, &level, 10).unwrap(),
+        };
+        let end = crate::export_end::discover(
+            session,
+            10,
+            Some(1.0),
+            &formats::EffectAssets {
+                clips: BTreeMap::new(),
+            },
+            &BTreeMap::new(),
+            None,
+            &watch,
+        )
+        .unwrap();
+        assert!((end.watch_end - (4.0 + 1.0 / 60.0)).abs() < 1e-9);
+        assert_eq!(end.finite_entity_count, 1);
+        assert_eq!(end.persistent_entity_count, 1);
+    }
+
+    #[test]
     fn offline_watch_frames_keep_runtime_update_fresh_and_draws_time_dependent() {
         let watch: WatchData = serde_json::from_value(serde_json::json!({
             "archetypes": [{"name":"Moving", "updateParallel":{"index":12}}],
@@ -1149,3 +1485,15 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "mv_composition_tests.rs"]
+mod mv_composition_tests;
+
+#[cfg(test)]
+#[path = "dynamic_stage_tests.rs"]
+mod dynamic_stage_tests;
+
+#[cfg(test)]
+#[path = "sdb_particle_tests.rs"]
+mod sdb_particle_tests;

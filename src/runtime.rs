@@ -624,6 +624,29 @@ impl DisplayList {
         runtime_transform: &[f64; 16],
         background: Option<(&crate::formats::BackgroundAssets, [[f64; 2]; 4])>,
     ) -> Result<Vec<u8>> {
+        self.render_skin_rgb_with_mode(
+            width,
+            height,
+            aspect_ratio,
+            skin,
+            bindings,
+            runtime_transform,
+            background,
+            crate::skin_render_mode::SkinRenderMode::Standard,
+        )
+    }
+
+    pub fn render_skin_rgb_with_mode(
+        &self,
+        width: u32,
+        height: u32,
+        aspect_ratio: f64,
+        skin: &crate::formats::SkinAssets,
+        bindings: &BTreeMap<u32, String>,
+        runtime_transform: &[f64; 16],
+        background: Option<(&crate::formats::BackgroundAssets, [[f64; 2]; 4])>,
+        mode: crate::skin_render_mode::SkinRenderMode,
+    ) -> Result<Vec<u8>> {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             bail!("frame dimensions must be in 1..=8192");
         }
@@ -674,6 +697,12 @@ impl DisplayList {
             }
             let runtime_corners = transform_runtime_skin_corners(draw, runtime_transform);
             let corners = transform_skin_corners(runtime_corners, sprite);
+            let projective_weights = if mode == crate::skin_render_mode::SkinRenderMode::Lightweight
+            {
+                crate::skin_render_mode::projective_weights(&corners)
+            } else {
+                [0.0; 4]
+            };
             if !corners.iter().flatten().all(|value| value.is_finite()) {
                 continue;
             }
@@ -703,10 +732,32 @@ impl DisplayList {
                         (((px as f64 + 0.5) / width as f64) * 2.0 - 1.0) * aspect_ratio,
                         1.0 - ((py as f64 + 0.5) / height as f64) * 2.0,
                     ];
-                    let Some((u, v)) = inverse_bilinear(&corners, target) else {
+                    let uv = match mode {
+                        crate::skin_render_mode::SkinRenderMode::Standard => {
+                            inverse_bilinear(&corners, target)
+                        }
+                        crate::skin_render_mode::SkinRenderMode::Lightweight => {
+                            crate::skin_render_mode::projective_uv(
+                                &corners,
+                                &projective_weights,
+                                [
+                                    f64::from(
+                                        (((px as f32 + 0.5) / width as f32) * 2.0 - 1.0)
+                                            * aspect_ratio as f32,
+                                    ),
+                                    f64::from(1.0 - ((py as f32 + 0.5) / height as f32) * 2.0),
+                                ],
+                            )
+                        }
+                    };
+                    let Some((u, v)) = uv else {
                         continue;
                     };
-                    if !(-1e-7..=1.0000001).contains(&u) || !(-1e-7..=1.0000001).contains(&v) {
+                    // Lightweight coverage was already decided in triangle space.
+                    // Re-testing projective UV amplifies tiny edge errors by q.
+                    if mode == crate::skin_render_mode::SkinRenderMode::Standard
+                        && (!(-1e-7..=1.0000001).contains(&u) || !(-1e-7..=1.0000001).contains(&v))
+                    {
                         continue;
                     }
                     let tex_x = sprite.x as f64 + u.clamp(0.0, 1.0) * sprite.width as f64 - 0.5;
@@ -984,6 +1035,84 @@ fn sample_rgba_bilinear(rgba: &[u8], width: u32, height: u32, x: f64, y: f64) ->
         let bottom = f64::from(at(x0, y1)) * (1.0 - tx) + f64::from(at(x1, y1)) * tx;
         (top * (1.0 - ty) + bottom * ty).round() as u8
     })
+}
+
+// Reuse the actual CPU sampler for focused compositing diagnostics.
+#[cfg(test)]
+pub(crate) fn skin_sample_at_pixel(
+    draw: &SpriteDraw,
+    skin: &crate::formats::SkinAssets,
+    name: &str,
+    matrix: &[f64; 16],
+    width: u32,
+    height: u32,
+    px: u32,
+    py: u32,
+) -> Option<[u8; 4]> {
+    skin_sample_at_pixel_in_mode(
+        draw,
+        skin,
+        name,
+        matrix,
+        width,
+        height,
+        px,
+        py,
+        crate::skin_render_mode::SkinRenderMode::Standard,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn skin_sample_at_pixel_in_mode(
+    draw: &SpriteDraw,
+    skin: &crate::formats::SkinAssets,
+    name: &str,
+    matrix: &[f64; 16],
+    width: u32,
+    height: u32,
+    px: u32,
+    py: u32,
+    mode: crate::skin_render_mode::SkinRenderMode,
+) -> Option<[u8; 4]> {
+    let sprite = &skin.sprites[name];
+    let corners = transform_skin_corners(transform_runtime_skin_corners(draw, matrix), sprite);
+    let coord = [
+        ((f64::from(px) + 0.5) / f64::from(width) * 2.0 - 1.0) * f64::from(width)
+            / f64::from(height),
+        1.0 - (f64::from(py) + 0.5) / f64::from(height) * 2.0,
+    ];
+    let coord = if mode == crate::skin_render_mode::SkinRenderMode::Lightweight {
+        [
+            f64::from(
+                (((px as f32 + 0.5) / width as f32) * 2.0 - 1.0)
+                    * (width as f64 / height as f64) as f32,
+            ),
+            f64::from(1.0 - ((py as f32 + 0.5) / height as f32) * 2.0),
+        ]
+    } else {
+        coord
+    };
+    let (u, v) = match mode {
+        crate::skin_render_mode::SkinRenderMode::Standard => inverse_bilinear(&corners, coord),
+        crate::skin_render_mode::SkinRenderMode::Lightweight => {
+            crate::skin_render_mode::projective_uv(
+                &corners,
+                &crate::skin_render_mode::projective_weights(&corners),
+                coord,
+            )
+        }
+    }?;
+    if mode == crate::skin_render_mode::SkinRenderMode::Standard
+        && (!(-1e-7..=1.0000001).contains(&u) || !(-1e-7..=1.0000001).contains(&v))
+    {
+        return None;
+    }
+    Some(sample_skin(
+        skin,
+        sprite,
+        f64::from(sprite.x) + u.clamp(0.0, 1.0) * f64::from(sprite.width) - 0.5,
+        f64::from(sprite.y) + (1.0 - v.clamp(0.0, 1.0)) * f64::from(sprite.height) - 0.5,
+    ))
 }
 
 fn blend_rgb(target: &mut [u8], source: [u8; 4], alpha: f64) {

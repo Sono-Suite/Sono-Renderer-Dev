@@ -7,12 +7,24 @@ use crate::{
     },
 };
 use anyhow::{bail, Context, Result};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use sha1::Digest;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    io::{Read, Write},
+    process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SfxMixResult {
     pub wav: Option<Vec<u8>>,
     pub warnings: Vec<String>,
+    pub unique_resources: usize,
+    pub ffmpeg_decodes: usize,
+    pub playback_events: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +33,9 @@ struct PcmClip {
     channels: usize,
     samples: Vec<f32>,
 }
+
+static DECODED_SFX: OnceLock<Mutex<HashMap<[u8; 20], Arc<PcmClip>>>> = OnceLock::new();
+static SFX_FFMPEG_DECODES: AtomicUsize = AtomicUsize::new(0);
 
 /// Mix supported Watch play and loop events into stereo PCM16 WAV at 44.1 kHz.
 /// Clip encodings outside uncompressed PCM16 mono/stereo are rejected explicitly.
@@ -113,11 +128,14 @@ pub fn mix_effects_wav(
         return Ok(SfxMixResult {
             wav: None,
             warnings: Vec::new(),
+            unique_resources: 0,
+            ffmpeg_decodes: 0,
+            playback_events: 0,
         });
     }
 
     let sample_rate = 44_100_u32;
-    let frames = (duration * f64::from(sample_rate)).ceil() as usize;
+    let frames = crate::export_timeline::sample_frames(duration) as usize;
     if frames > sample_rate as usize * 60 * 30 {
         bail!("offline SFX mixing is limited to 30 minutes per export");
     }
@@ -127,21 +145,23 @@ pub fn mix_effects_wav(
     let mut warnings = Vec::new();
     let mut has_playable_event = false;
     active.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let playback_events = active.len();
+    let mut ffmpeg_decodes = 0;
     for (name, start, end, minimum_distance, looping) in active {
         let Some(source_start) = start
             .max(timeline_start)
             .partial_cmp(&(timeline_start + duration))
             .filter(|o| *o == std::cmp::Ordering::Less)
-            .map(|_| start)
+            .map(|_| start.max(timeline_start))
         else {
             continue;
         };
         if let Some(previous) = last_play.get(&name) {
-            if !looping && source_start - *previous < minimum_distance.max(0.0) {
+            if !looping && start - *previous < minimum_distance.max(0.0) {
                 continue;
             }
         }
-        last_play.insert(name.clone(), source_start);
+        last_play.insert(name.clone(), start);
         if !decoded.contains_key(&name) {
             let payload = assets
                 .clips
@@ -156,10 +176,10 @@ pub fn mix_effects_wav(
                 }
                 continue;
             };
-            decoded.insert(
-                name.clone(),
-                decode_wav(bytes).with_context(|| format!("decoding SFX clip {name:?}"))?,
-            );
+            let (clip, was_decoded) = decode_sfx_cached(bytes)
+                .with_context(|| format!("decoding SFX clip {name:?} with FFmpeg"))?;
+            ffmpeg_decodes += usize::from(was_decoded);
+            decoded.insert(name.clone(), clip);
         }
         let clip = decoded.get(&name).unwrap();
         has_playable_event = true;
@@ -168,7 +188,8 @@ pub fn mix_effects_wav(
         let until = end
             .unwrap_or(timeline_start + duration)
             .min(timeline_start + duration);
-        let max_output = ((until - timeline_start).max(0.0) * f64::from(sample_rate)) as usize;
+        let max_output =
+            crate::export_timeline::sample_frames((until - timeline_start).max(0.0)) as usize;
         let source_frames = clip.samples.len() / clip.channels;
         let mut out = output_frame;
         let source_step = f64::from(clip.rate) / f64::from(sample_rate);
@@ -209,6 +230,9 @@ pub fn mix_effects_wav(
         return Ok(SfxMixResult {
             wav: None,
             warnings,
+            unique_resources: decoded.len(),
+            ffmpeg_decodes,
+            playback_events,
         });
     }
     let mut pcm = Vec::with_capacity(frames * 4);
@@ -221,6 +245,9 @@ pub fn mix_effects_wav(
     Ok(SfxMixResult {
         wav: Some(wav_header(sample_rate, 2, &pcm)),
         warnings,
+        unique_resources: decoded.len(),
+        ffmpeg_decodes,
+        playback_events,
     })
 }
 
@@ -231,7 +258,107 @@ fn resolve(bindings: &BTreeMap<i64, String>, id: i64) -> Result<String> {
         .unwrap_or_else(|| format!("<unbound clip ID {id}>")))
 }
 
+pub(crate) fn clip_duration(bytes: &[u8]) -> Result<f64> {
+    let (clip, _) = decode_sfx_cached(bytes)?;
+    Ok(clip.samples.len() as f64 / clip.channels as f64 / f64::from(clip.rate))
+}
+
+/// Decode extensionless Sonolus audio through the shared FFmpeg installation.
+/// The content cache is shared by duration inference and the later mixer, so a
+/// resource is transcoded at most once during this process.
+fn decode_sfx_cached(bytes: &[u8]) -> Result<(Arc<PcmClip>, bool)> {
+    let key: [u8; 20] = sha1::Sha1::digest(bytes).into();
+    let cache = DECODED_SFX.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("SFX decode cache poisoned"))?;
+    if let Some(clip) = cache.get(&key) {
+        return Ok((Arc::clone(clip), false));
+    }
+    let clip = Arc::new(decode_sfx_ffmpeg(bytes)?);
+    cache.insert(key, Arc::clone(&clip));
+    SFX_FFMPEG_DECODES.fetch_add(1, Ordering::Relaxed);
+    Ok((clip, true))
+}
+
+pub(crate) fn decode_cache_stats() -> (usize, usize) {
+    let resources = DECODED_SFX
+        .get()
+        .and_then(|cache| cache.lock().ok().map(|cache| cache.len()))
+        .unwrap_or(0);
+    (resources, SFX_FFMPEG_DECODES.load(Ordering::Relaxed))
+}
+
+fn decode_sfx_ffmpeg(bytes: &[u8]) -> Result<PcmClip> {
+    let installation = crate::ffmpeg::resolve().context("resolving FFmpeg for SFX decoding")?;
+    let mut child =
+        crate::export_control::hide_child_window(&mut Command::new(&installation.ffmpeg))
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                "pipe:0",
+                "-acodec",
+                "pcm_f32le",
+                "-ar",
+                "44100",
+                "-f",
+                "wav",
+                "pipe:1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("starting {}", installation.ffmpeg.display()))?;
+    let mut stdout = child.stdout.take().context("FFmpeg stdout unavailable")?;
+    let reader = std::thread::spawn(move || {
+        let mut pcm = Vec::new();
+        stdout.read_to_end(&mut pcm).map(|_| pcm)
+    });
+    let mut stderr = child.stderr.take().context("FFmpeg stderr unavailable")?;
+    let error_reader = std::thread::spawn(move || {
+        let mut message = String::new();
+        stderr.read_to_string(&mut message).map(|_| message)
+    });
+    let write_result = child
+        .stdin
+        .take()
+        .context("FFmpeg stdin unavailable")?
+        .write_all(bytes);
+    let status = child.wait().context("waiting for FFmpeg SFX decode")?;
+    let pcm = reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("FFmpeg PCM reader thread panicked"))?
+        .context("reading FFmpeg PCM output")?;
+    let stderr = error_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("FFmpeg error reader thread panicked"))?
+        .context("reading FFmpeg diagnostics")?;
+    if let Err(error) = write_result {
+        bail!("feeding SFX bytes to FFmpeg: {error}");
+    }
+    if !status.success() {
+        bail!("FFmpeg exited with {status}: {}", stderr.trim());
+    }
+    let decoded = decode_pcm_wav(&pcm).context("parsing FFmpeg's canonical PCM WAV stream")?;
+    if decoded.rate != 44_100 || !matches!(decoded.channels, 1 | 2) {
+        bail!(
+            "FFmpeg returned {} Hz audio with {} channels; the mixer requires 44.1 kHz mono/stereo",
+            decoded.rate,
+            decoded.channels
+        );
+    }
+    Ok(decoded)
+}
+
+#[cfg(test)]
 fn decode_wav(bytes: &[u8]) -> Result<PcmClip> {
+    decode_pcm_wav(bytes)
+}
+
+fn decode_pcm_wav(bytes: &[u8]) -> Result<PcmClip> {
     if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         bail!("unsupported audio: expected RIFF/WAVE");
     }
@@ -242,6 +369,12 @@ fn decode_wav(bytes: &[u8]) -> Result<PcmClip> {
         let id = &bytes[offset..offset + 4];
         let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
         let begin = offset + 8;
+        // WAV written to a pipe cannot seek back to fill RIFF/data sizes.
+        // FFmpeg uses 0xffffffff for the final data chunk in that case.
+        if id == b"data" && size == u32::MAX as usize {
+            data = Some(&bytes[begin..]);
+            break;
+        }
         let end = begin
             .checked_add(size)
             .context("WAV chunk length overflow")?;
@@ -261,20 +394,26 @@ fn decode_wav(bytes: &[u8]) -> Result<PcmClip> {
         offset = end + (size & 1);
     }
     let (format, channels, rate, bits) = format.context("WAV has no fmt chunk")?;
-    if format != 1 || !matches!(channels, 1 | 2) || bits != 16 {
-        bail!("unsupported WAV: require PCM16 mono or stereo");
+    if !((format == 1 && bits == 16) || (format == 3 && bits == 32)) || !matches!(channels, 1 | 2) {
+        bail!("unsupported WAV: require PCM16 or float32 mono/stereo");
     }
     if rate == 0 {
         bail!("WAV sample rate must be positive");
     }
     let raw = data.context("WAV has no data chunk")?;
-    if raw.len() % 2 != 0 {
-        bail!("WAV PCM16 payload has odd byte count");
+    let bytes_per_sample = usize::from(bits / 8);
+    if raw.len() % bytes_per_sample != 0 {
+        bail!("WAV payload ends with an incomplete audio sample");
     }
-    let samples: Vec<f32> = raw
-        .chunks_exact(2)
-        .map(|chunk| f32::from(i16::from_le_bytes([chunk[0], chunk[1]])) / 32768.0)
-        .collect();
+    let samples: Vec<f32> = if format == 1 {
+        raw.chunks_exact(2)
+            .map(|chunk| f32::from(i16::from_le_bytes([chunk[0], chunk[1]])) / 32768.0)
+            .collect()
+    } else {
+        raw.chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    };
     if samples.is_empty() || samples.len() % channels as usize != 0 {
         bail!("WAV contains no complete PCM frames");
     }
@@ -285,7 +424,7 @@ fn decode_wav(bytes: &[u8]) -> Result<PcmClip> {
     })
 }
 
-fn wav_header(rate: u32, channels: u16, pcm: &[u8]) -> Vec<u8> {
+pub(crate) fn wav_header(rate: u32, channels: u16, pcm: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(44 + pcm.len());
     out.extend_from_slice(b"RIFF");
     out.extend_from_slice(&(36_u32 + pcm.len() as u32).to_le_bytes());
@@ -307,11 +446,135 @@ fn wav_header(rate: u32, channels: u16, pcm: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     #[test]
+    fn sfx_born_before_window_is_clipped_instead_of_restarted() {
+        let pcm: Vec<_> = (0..4410_i16).flat_map(i16::to_le_bytes).collect();
+        let assets = EffectAssets {
+            clips: [("ramp".into(), Some(wav_header(44100, 1, &pcm)))].into(),
+        };
+        let events = [AudioEffectEvent::Play {
+            clip_id: 1,
+            minimum_distance: 0.0,
+            requested_at: 0.0,
+        }];
+        let wav = mix_effects_wav(
+            &assets,
+            &[(1, "ramp".into())].into(),
+            &events,
+            &[],
+            &[],
+            &[],
+            0.05,
+            0.1,
+        )
+        .unwrap()
+        .wav
+        .unwrap();
+        let clip = decode_wav(&wav).unwrap();
+        assert!(
+            clip.samples[0] > 0.06,
+            "clipped first sample: {}",
+            clip.samples[0]
+        ); // source sample 2205, not sample zero.
+        assert!(clip.samples[4410..].iter().all(|v| *v == 0.0));
+    }
+    #[test]
+    fn sfx_start_and_tail_share_export_sample_count_and_output_origin() {
+        let assets = EffectAssets {
+            clips: [(
+                "hit".into(),
+                Some(wav_header(
+                    44100,
+                    1,
+                    &[12000_i16.to_le_bytes(); 441].concat(),
+                )),
+            )]
+            .into(),
+        };
+        let bindings = [(1, "hit".into())].into();
+        let events = [AudioEffectEvent::Play {
+            clip_id: 1,
+            minimum_distance: 0.0,
+            requested_at: 2.005,
+        }];
+        let duration = 2.0 / 240.0;
+        let wav = mix_effects_wav(&assets, &bindings, &events, &[], &[], &[], 2.0, duration)
+            .unwrap()
+            .wav
+            .unwrap();
+        let expected = crate::export_timeline::sample_frames(duration) as usize;
+        let decoded = decode_wav(&wav).unwrap();
+        assert_eq!(decoded.samples.len() / 2, expected);
+        let leading = ((2.005_f64 - 2.0) * 44100.0) as usize;
+        assert!(decoded.samples[..leading * 2].iter().all(|v| *v == 0.0));
+        assert!(decoded.samples[leading * 2..].iter().all(|v| *v > 0.0));
+        assert!(
+            mix_effects_wav(&assets, &bindings, &[], &[], &[], &[], 2.0, duration)
+                .unwrap()
+                .wav
+                .is_none()
+        );
+    }
+    #[test]
     fn rejects_compressed_or_non_pcm_effect_clip_formats() {
         assert!(decode_wav(b"OggS")
             .unwrap_err()
             .to_string()
             .contains("RIFF/WAVE"));
+    }
+
+    #[test]
+    fn horizon_extensionless_mp3_decodes_to_cached_canonical_pcm() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let assets = crate::formats::load_effect_assets(
+            &root.join("TestingSuite/Horizon/project(1).scp"),
+            "coconut-horizon-10",
+        )
+        .unwrap();
+        let bytes = assets.clips["#PERFECT"].as_ref().unwrap();
+        assert_ne!(&bytes[..4], b"RIFF");
+        let (clip, decoded_now) = decode_sfx_cached(bytes).unwrap();
+        assert!(decoded_now);
+        assert_eq!(clip.rate, 44_100);
+        assert_eq!(clip.channels, 1, "FFmpeg keeps the source mono layout");
+        assert!(!clip.samples.is_empty());
+        let (again, decoded_now) = decode_sfx_cached(bytes).unwrap();
+        assert!(!decoded_now, "same resource bytes must hit PCM cache");
+        assert!(Arc::ptr_eq(&clip, &again));
+        assert!((clip_duration(bytes).unwrap() - 0.22).abs() < 0.03);
+    }
+
+    #[test]
+    fn overlapping_plays_decode_one_resource_once() {
+        let wav = wav_header(44_100, 1, &[27111_i16.to_le_bytes(); 441].concat());
+        let assets = EffectAssets {
+            clips: [("overlap-cache-unique".into(), Some(wav))].into(),
+        };
+        let events = [
+            AudioEffectEvent::Play {
+                clip_id: 1,
+                minimum_distance: 0.0,
+                requested_at: 0.0,
+            },
+            AudioEffectEvent::Play {
+                clip_id: 1,
+                minimum_distance: 0.0,
+                requested_at: 0.005,
+            },
+        ];
+        let result = mix_effects_wav(
+            &assets,
+            &[(1, "overlap-cache-unique".into())].into(),
+            &events,
+            &[],
+            &[],
+            &[],
+            0.0,
+            0.05,
+        )
+        .unwrap();
+        assert_eq!(result.unique_resources, 1);
+        assert_eq!(result.playback_events, 2);
+        assert_eq!(result.ffmpeg_decodes, 1);
     }
 
     #[test]
@@ -478,6 +741,8 @@ mod tests {
             0.1,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("decoding SFX clip"));
+        let detail = format!("{error:#}");
+        assert!(detail.contains("decoding SFX clip \"bad\""));
+        assert!(detail.contains("FFmpeg exited"));
     }
 }
