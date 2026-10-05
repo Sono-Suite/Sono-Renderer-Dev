@@ -1,5 +1,8 @@
 # SDB particle differential
 
+> Superseded on 2026-10-05 by [the comprehensive particle audit](PARTICLE_FORENSIC_AUDIT.md).
+> New client evidence corrects the earlier size conclusion and resolves `none` easing and entry timing. The source observations below remain historical evidence; the old no-defect conclusion is no longer current.
+
 ## Result and provenance
 
 **No new Sono-Renderer production particle bug is established. No production particle behavior changed.** This follow-up inspected the actual local `sdb-ref` source, not an assumed specification or a screenshot-only comparison. SDB is third-party implementation evidence; it is not automatically correct Sonolus behavior. The previous [particle handoff](PARTICLE_COMPATIBILITY_HANDOFF.md) and private v1.1.4 `PARTICLE_RENDERING_STATIC_AUDIT.md` remain authoritative for their established client CPU observations. The separate client GPU UV assignment remains unresolved; this task adds no evidence that it differs. No APK/ARM analysis or real-client oracle was performed.

@@ -20,6 +20,7 @@ pub mod runtime;
 pub mod skin_render_mode;
 pub mod video_export;
 pub mod watch;
+pub mod watch_diagnostics;
 pub mod watch_runtime;
 
 pub mod export_control;

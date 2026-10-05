@@ -794,15 +794,24 @@ impl<'a> FrameSession<'a> {
         render_prepared_frame(self.render.clone(), self.profile, prepared)
     }
 
+    /// Attach bounded diagnostics to this session's single Watch traversal.
+    pub fn set_execution_trace(
+        &mut self,
+        trace: Option<crate::watch_diagnostics::SharedWatchTrace>,
+    ) {
+        self.stepper.runtime_mut().context.execution_trace = trace;
+    }
+
     pub(crate) fn prepare_global_frame(&mut self, frame_index: u64) -> Result<PreparedFrame> {
         let total_start = self.profile.then(std::time::Instant::now);
         let vm_start = self.profile.then(std::time::Instant::now);
         let report = self.stepper.advance_to(frame_index)?;
         let vm = vm_start.map(|t| t.elapsed()).unwrap_or_default();
         let preparation_start = self.profile.then(std::time::Instant::now);
+        let execution_trace = self.stepper.runtime_mut().context.execution_trace.clone();
         let particle_draws = if self.render.particles_enabled {
             if let Some(assets) = &self.render.particles {
-                Some(crate::particles::render_instances(
+                Some(crate::particles::render_instances_traced(
                     assets,
                     &self.render.particle_bindings,
                     &self
@@ -817,6 +826,12 @@ impl<'a> FrameSession<'a> {
                         .cloned()
                         .collect::<Vec<_>>(),
                     report.timeline.unwrap_or(0.0),
+                    execution_trace.as_ref(),
+                    Some((
+                        self.render.width,
+                        self.render.height,
+                        &report.runtime_particle_transform,
+                    )),
                 )?)
             } else {
                 None

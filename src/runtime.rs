@@ -1387,10 +1387,10 @@ pub struct WatchVm<'a> {
     pub context: VmContext,
     pub function_counts: BTreeMap<String, u64>,
     pub skin_checks: Vec<(i64, bool)>,
-    /// Narrow, opt-in-by-context value trace for the Next RUSH Temp[22] RHS.
-    pub rhs_forensic_events: Vec<String>,
+    /// Optional bounded VM execution diagnostics.
     diagnostics: Option<VmDiagnostics>,
     loop_trace: Vec<LoopTraceFrame>,
+    execution_trace_frames: Vec<(usize, Vec<Option<String>>)>,
     max_evaluations: usize,
     trace_draws: bool,
     capture_draw_argument_values: bool,
@@ -1419,6 +1419,7 @@ struct LoopTraceFrame {
 
 #[derive(Debug, Clone, Default)]
 pub struct VmContext {
+    pub execution_trace: Option<crate::watch_diagnostics::SharedWatchTrace>,
     pub time: f64,
     pub beat: f64,
     pub timescale: f64,
@@ -1487,9 +1488,9 @@ impl<'a> WatchVm<'a> {
             },
             function_counts: BTreeMap::new(),
             skin_checks: Vec::new(),
-            rhs_forensic_events: Vec::new(),
             diagnostics: None,
             loop_trace: Vec::new(),
+            execution_trace_frames: Vec::new(),
             max_evaluations: MAX_EVALUATIONS,
             trace_draws: false,
             capture_draw_argument_values: false,
@@ -1698,42 +1699,6 @@ impl<'a> WatchVm<'a> {
         ));
     }
 
-    fn rhs_forensic_context(&self) -> bool {
-        self.context.entity_archetype.as_deref() == Some("NormalHeadTapNote")
-            && self.context.callback_name.as_deref() == Some("UpdateParallel")
-            && self.context.callback_node == Some(88326)
-    }
-
-    fn record_rhs_forensic_node(&mut self, index: usize, function: &str, value: f64) {
-        const TARGET_NODES: &[usize] = &[
-            17, 1444, 86771, 87893, 888, 1676, 15656, 87897, 87898, 87899, 13494, 13495,
-        ];
-        if !self.rhs_forensic_context() || !TARGET_NODES.contains(&index) {
-            return;
-        }
-        let loops = self
-            .loop_trace
-            .iter()
-            .map(|frame| format!("{}#{}:branch{}", frame.node, frame.iteration, frame.branch))
-            .collect::<Vec<_>>()
-            .join("/");
-        self.rhs_forensic_events.push(format!(
-            "node={index} function={function} value={} loop={loops}",
-            trace_value(value)
-        ));
-    }
-
-    fn record_rhs_temp22(&mut self, operation: &str, node: usize, before: Option<f64>, after: f64) {
-        if !self.rhs_forensic_context() {
-            return;
-        }
-        let before = before.map(trace_value).unwrap_or_else(|| "n/a".to_owned());
-        self.rhs_forensic_events.push(format!(
-            "Temp[22] {operation} node={node} before={before} after={}",
-            trace_value(after)
-        ));
-    }
-
     pub fn execute(&mut self, entry: usize) -> Result<f64> {
         self.evaluations = 0;
         self.depth = 0;
@@ -1763,16 +1728,71 @@ impl<'a> WatchVm<'a> {
                 self.draw_argument_value_texts
                     .insert(index, trace_value(value));
             }
-            self.record_rhs_forensic_node(index, "Constant", value);
+            if self.context.execution_trace.is_some() {
+                self.record_execution_trace(
+                    index,
+                    "Constant",
+                    "evaluation",
+                    serde_json::json!({"children":[],"arguments":[],"result":trace_value(value)}),
+                );
+            }
             return Ok(value);
         }
         let function = node.func.as_deref().with_context(|| {
             format!("Watch node {index} has neither a numeric value nor a function")
         })?;
         self.record_diagnostic(|| format!("node={index} function={function}"));
+        if self.context.execution_trace.is_some() {
+            self.execution_trace_frames
+                .push((index, vec![None; node.args.len()]));
+        }
         self.depth += 1;
+        let particle_event_count = self.particle_events.len();
         let result = self.eval_function(index, function);
         self.depth -= 1;
+        if self.context.execution_trace.is_some() {
+            let (_, arguments) = self.execution_trace_frames.pop().unwrap();
+            let kind = if matches!(
+                function,
+                "Play"
+                    | "PlayScheduled"
+                    | "PlayLooped"
+                    | "PlayLoopedScheduled"
+                    | "StopLooped"
+                    | "StopLoopedScheduled"
+            ) {
+                "audio"
+            } else if matches!(
+                function,
+                "SpawnParticleEffect" | "MoveParticleEffect" | "DestroyParticleEffect"
+            ) {
+                "particle_host"
+            } else {
+                "evaluation"
+            };
+            let mut data = serde_json::json!({"children": self.nodes[index].args, "arguments": arguments,
+                "result": result.as_ref().ok().map(|v| trace_value(*v)), "error":result.as_ref().err().map(|e| e.to_string())});
+            if kind == "audio" && result.is_ok() {
+                data["event"] = match function {
+                    "PlayScheduled" => serde_json::to_value(self.scheduled_effects.last())?,
+                    "PlayLoopedScheduled" => {
+                        serde_json::to_value(self.scheduled_looped_effects.last())?
+                    }
+                    "StopLoopedScheduled" => {
+                        serde_json::to_value(self.scheduled_looped_effect_stops.last())?
+                    }
+                    _ => serde_json::to_value(self.audio_events.last())?,
+                };
+            }
+            if kind == "particle_host" && result.is_ok() {
+                data["event"] = if self.particle_events.len() > particle_event_count {
+                    serde_json::to_value(self.particle_events.last())?
+                } else {
+                    serde_json::Value::Null
+                };
+            }
+            self.record_execution_trace(index, function, kind, data);
+        }
         let result =
             result.with_context(|| format!("executing Watch function {function} at node {index}"));
         if self.capture_draw_argument_values {
@@ -1781,9 +1801,6 @@ impl<'a> WatchVm<'a> {
                 self.draw_argument_value_texts
                     .insert(index, trace_value(*value));
             }
-        }
-        if let Ok(value) = result.as_ref() {
-            self.record_rhs_forensic_node(index, function, *value);
         }
         result
     }
@@ -1797,10 +1814,48 @@ impl<'a> WatchVm<'a> {
         let index = index.as_u64().with_context(|| {
             format!("argument {arg_index} of node {node_index} is not a node index")
         })? as usize;
-        self.eval(index)
+        let value = self.eval(index)?;
+        if let Some((_, arguments)) = self.execution_trace_frames.last_mut() {
+            if let Some(argument) = arguments.get_mut(arg_index) {
+                *argument = Some(trace_value(value));
+            }
+        }
+        Ok(value)
+    }
+
+    fn record_execution_trace(
+        &self,
+        node: usize,
+        operation: &str,
+        kind: &str,
+        data: serde_json::Value,
+    ) {
+        if let Some(trace) = &self.context.execution_trace {
+            let loops = self
+                .loop_trace
+                .iter()
+                .map(|f| (f.node, f.iteration, f.branch))
+                .collect::<Vec<_>>();
+            if let Ok(mut trace) = trace.lock() {
+                trace.record(&self.context, node, operation, kind, &loops, data);
+            }
+        }
     }
 
     fn memory_get(&self, block: i64, slot: usize) -> f64 {
+        let value = self.memory_get_untraced(block, slot);
+        if let Some((node, _)) = self.execution_trace_frames.last() {
+            self.record_execution_trace(
+                *node,
+                self.nodes[*node].func.as_deref().unwrap_or("?"),
+                "memory_read",
+                serde_json::json!({"block":block,"index":slot,"value":trace_value(value)}),
+            );
+        }
+        value
+    }
+
+    fn memory_get_untraced(&self, block: i64, slot: usize) -> f64 {
         if block == 1004 {
             self.context
                 .runtime_background
@@ -1924,6 +1979,23 @@ impl<'a> WatchVm<'a> {
     }
 
     fn memory_set(&mut self, block: i64, slot: usize, value: f64, node: usize) -> Result<()> {
+        if self.context.execution_trace.is_none() {
+            return self.memory_set_untraced(block, slot, value, node);
+        }
+        let old = self.memory_get_untraced(block, slot);
+        let result = self.memory_set_untraced(block, slot, value, node);
+        self.record_execution_trace(node, self.nodes[node].func.as_deref().unwrap_or("?"), "memory_write",
+            serde_json::json!({"block":block,"index":slot,"old":trace_value(old),"value":trace_value(value),"committed":result.is_ok(),"error":result.as_ref().err().map(|e|e.to_string())}));
+        result
+    }
+
+    fn memory_set_untraced(
+        &mut self,
+        block: i64,
+        slot: usize,
+        value: f64,
+        node: usize,
+    ) -> Result<()> {
         if block == RUNTIME_SKIN_TRANSFORM_BLOCK {
             if !matches!(self.context.lifecycle_stage, Some(0 | 5)) {
                 bail!("Runtime Skin Transform is read-only in this lifecycle stage");
@@ -2367,14 +2439,16 @@ impl<'a> WatchVm<'a> {
                 }
             }
             "Switch" => {
-                let discriminant = integer(self.arg(index, 0)?, "switch discriminant")?;
-                let selected = usize::try_from(discriminant)
-                    .ok()
-                    .filter(|branch| *branch + 1 < count);
-                match selected {
-                    Some(branch) => self.arg(index, branch + 1),
-                    None => Ok(0.0),
+                if count == 0 || count % 2 == 0 {
+                    bail!("Switch requires a discriminant and test/consequent pairs");
                 }
+                let discriminant = self.arg(index, 0)?;
+                for pair in 0..(count - 1) / 2 {
+                    if discriminant == self.arg(index, 1 + pair * 2)? {
+                        return self.arg(index, 2 + pair * 2);
+                    }
+                }
+                Ok(0.0)
             }
             "JumpLoop" => {
                 if count == 0 {
@@ -2408,6 +2482,9 @@ impl<'a> WatchVm<'a> {
                         )
                     });
                     let result = self.arg(index, selected)?;
+                    if self.context.execution_trace.is_some() {
+                        self.record_execution_trace(index, "JumpLoop", "route", serde_json::json!({"slot":selected,"child":branch_node,"next":trace_value(result),"last":selected == count-1,"break":self.break_signal}));
+                    }
                     self.record_diagnostic(|| {
                         format!(
                             "JumpLoop node={index} iteration={iteration} branch_result={result}"
@@ -2530,9 +2607,7 @@ impl<'a> WatchVm<'a> {
                     return Ok(0.0);
                 };
                 let value = self.memory_get(block, slot);
-                if block == 10000 && slot == 22 {
-                    self.record_rhs_temp22("Get", index, None, value);
-                }
+
                 if self.capture_draw_argument_values {
                     self.draw_memory_reads.push(MemoryReadTrace {
                         node: index,
@@ -2614,9 +2689,7 @@ impl<'a> WatchVm<'a> {
                     });
                 }
                 self.memory_set(block, slot, result, index)?;
-                if block == 10000 && slot == 22 {
-                    self.record_rhs_temp22("Set", index, Some(old), result);
-                }
+
                 self.record_diagnostic(|| {
                     format!("{name} node={index} block={block} index={slot} old={old} new={result}")
                 });
@@ -2702,17 +2775,9 @@ impl<'a> WatchVm<'a> {
                 self.record_diagnostic(|| {
                     format!("{name} node={index} block={block} index={slot} old={old} new={new}")
                 });
-                Ok(
-                    if name.starts_with("Increment") || name.starts_with("Decrement") {
-                        if name.ends_with("Pre") || name.ends_with("PrePointed") {
-                            new
-                        } else {
-                            old
-                        }
-                    } else {
-                        old
-                    },
-                )
+                // Sonolus names the returned state: Pre returns the value
+                // before the update, Post returns the value after it.
+                Ok(if name.contains("Pre") { old } else { new })
             }
             "IncrementPreShifted"
             | "IncrementPostShifted"
@@ -2733,13 +2798,7 @@ impl<'a> WatchVm<'a> {
                 self.record_diagnostic(|| {
                     format!("{name} node={index} block={block} x={x} y={y} stride={stride} index={slot} old={old} new={new}")
                 });
-                Ok(
-                    if name.starts_with("IncrementPre") || name.starts_with("DecrementPre") {
-                        new
-                    } else {
-                        old
-                    },
-                )
+                Ok(if name.contains("Pre") { old } else { new })
             }
             "Draw" => {
                 let args = self.all_args(index)?;
@@ -3071,7 +3130,19 @@ impl<'a> WatchVm<'a> {
                 }
                 Ok(result)
             }
-            "Add" | "Multiply" | "Min" | "Max" | "Or" | "Mod" | "Rem" => {
+            "Or" => {
+                if count == 0 {
+                    bail!("Or requires at least one argument");
+                }
+                for argument in 0..count {
+                    let value = self.arg(index, argument)?;
+                    if value != 0.0 {
+                        return Ok(value);
+                    }
+                }
+                Ok(0.0)
+            }
+            "Add" | "Multiply" | "Min" | "Max" | "Mod" | "Rem" => {
                 let args = self.all_args(index)?;
                 let first = *args
                     .first()
@@ -3081,7 +3152,6 @@ impl<'a> WatchVm<'a> {
                     "Multiply" => args.iter().product(),
                     "Min" => args.iter().copied().fold(first, f64::min),
                     "Max" => args.iter().copied().fold(first, f64::max),
-                    "Or" => truth(args.iter().any(|value| *value != 0.0)),
                     "Mod" => args
                         .windows(2)
                         .try_fold(first, |a, pair| modulus(a, pair[1]))?,

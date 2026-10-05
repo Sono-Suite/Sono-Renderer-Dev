@@ -1,0 +1,94 @@
+time,operation,effect_id,effect_name,handle,minimum_distance,entity,archetype,callback,node,slot,sequence
+1.7142857142857142,PlayScheduled,9,Sekai Critical Tap,,0.0167,87,CriticalTapNote,Preprocess,49283,10837,463935
+1.7142857142857142,PlayScheduled,1,#PERFECT,,0.0167,174,NormalHeadTapNote,Preprocess,49283,10837,1437116
+2.142857142857143,PlayScheduled,1,#PERFECT,,0.0167,175,NormalTailReleaseNote,Preprocess,49283,10837,1446738
+2.142857142857143,PlayScheduled,1,#PERFECT,,0.0167,178,NormalHeadTapNote,Preprocess,49283,10837,1469686
+2.357142857142857,PlayScheduled,1,#PERFECT,,0.0167,88,NormalTapNote,Preprocess,49283,10837,473641
+2.5714285714285716,PlayScheduled,13,Sekai Trace,,0.0167,179,NormalTailTraceNote,Preprocess,49283,10837,1479398
+2.5714285714285716,PlayScheduled,1,#PERFECT,,0.0167,182,NormalHeadTapNote,Preprocess,49283,10837,1502299
+2.6785714285714284,PlayScheduled,13,Sekai Trace,,0.0167,89,NormalTraceNote,Preprocess,49283,10837,483349
+2.7857142857142856,PlayScheduled,13,Sekai Trace,,0.0167,90,NormalTraceNote,Preprocess,49283,10837,492878
+3.0,PlayScheduled,9,Sekai Critical Tap,,0.0167,91,CriticalTapNote,Preprocess,49283,10837,502407
+3.0,PlayScheduled,1,#PERFECT,,0.0167,183,NormalTailReleaseNote,Preprocess,49283,10837,1512009
+3.2142857142857144,PlayScheduled,1,#PERFECT,,0.0167,92,NormalTapNote,Preprocess,49283,10837,512113
+3.3214285714285716,PlayScheduled,1,#PERFECT,,0.0167,93,NormalTapNote,Preprocess,49283,10837,521819
+3.4285714285714284,PlayScheduled,1,#PERFECT,,0.0167,94,NormalTapNote,Preprocess,49283,10837,531525
+3.4285714285714284,PlayScheduled,9,Sekai Critical Tap,,0.0167,95,CriticalTapNote,Preprocess,49283,10837,541233
+3.5357142857142856,PlayScheduled,1,#PERFECT,,0.0167,96,NormalTapNote,Preprocess,49283,10837,550939
+3.642857142857143,PlayScheduled,1,#PERFECT,,0.0167,97,NormalTapNote,Preprocess,49283,10837,560645
+3.75,PlayScheduled,1,#PERFECT,,0.0167,98,NormalTapNote,Preprocess,49283,10837,570351
+3.857142857142857,PlayScheduled,9,Sekai Critical Tap,,0.0167,99,CriticalTapNote,Preprocess,49283,10837,580059
+3.857142857142857,PlayScheduled,1,#PERFECT,,0.0167,100,NormalTapNote,Preprocess,49283,10837,589765
+3.9642857142857144,PlayScheduled,1,#PERFECT,,0.0167,101,NormalTapNote,Preprocess,49283,10837,599471
+4.071428571428571,PlayScheduled,1,#PERFECT,,0.0167,102,NormalTapNote,Preprocess,49283,10837,609177
+4.178571428571429,PlayScheduled,1,#PERFECT,,0.0167,103,NormalTapNote,Preprocess,49283,10837,618883
+4.285714285714286,PlayScheduled,1,#PERFECT,,0.0167,104,NormalTapNote,Preprocess,49283,10837,628589
+4.285714285714286,PlayScheduled,9,Sekai Critical Tap,,0.0167,105,CriticalTapNote,Preprocess,49283,10837,638297
+4.5,PlayScheduled,1,#PERFECT,,0.0167,106,NormalTapNote,Preprocess,49283,10837,647891
+5.142857142857143,PlayScheduled,10,Sekai Critical Flick,,0.0167,107,CriticalFlickNote,Preprocess,49283,10837,657647
+5.357142857142857,PlayScheduled,1,#PERFECT,,0.0167,108,NormalTapNote,Preprocess,49283,10837,666945
+5.571428571428571,PlayScheduled,10,Sekai Critical Flick,,0.0167,109,CriticalFlickNote,Preprocess,49283,10837,680426
+5.785714285714286,PlayScheduled,1,#PERFECT,,0.0167,110,NormalTapNote,Preprocess,49283,10837,689618
+6.0,PlayScheduled,10,Sekai Critical Flick,,0.0167,111,CriticalFlickNote,Preprocess,49283,10837,703099
+6.214285714285714,PlayScheduled,1,#PERFECT,,0.0167,112,NormalTapNote,Preprocess,49283,10837,712495
+6.428571428571429,PlayScheduled,10,Sekai Critical Flick,,0.0167,113,CriticalFlickNote,Preprocess,49283,10837,726184
+6.642857142857143,PlayScheduled,1,#PERFECT,,0.0167,114,NormalTapNote,Preprocess,49283,10837,735564
+6.857142857142857,PlayScheduled,10,Sekai Critical Flick,,0.0167,115,CriticalFlickNote,Preprocess,49283,10837,749253
+7.071428571428571,PlayScheduled,1,#PERFECT,,0.0167,116,NormalTapNote,Preprocess,49283,10837,758633
+7.285714285714286,PlayScheduled,10,Sekai Critical Flick,,0.0167,117,CriticalFlickNote,Preprocess,49283,10837,772322
+7.5,PlayScheduled,1,#PERFECT,,0.0167,118,NormalTapNote,Preprocess,49283,10837,781702
+7.714285714285714,PlayScheduled,10,Sekai Critical Flick,,0.0167,119,CriticalFlickNote,Preprocess,49283,10837,795391
+7.928571428571429,PlayScheduled,1,#PERFECT,,0.0167,120,NormalTapNote,Preprocess,49283,10837,804771
+8.142857142857142,PlayScheduled,10,Sekai Critical Flick,,0.0167,121,CriticalFlickNote,Preprocess,49283,10837,818460
+8.357142857142858,PlayScheduled,1,#PERFECT,,0.0167,122,NormalTapNote,Preprocess,49283,10837,827840
+8.571428571428571,PlayScheduled,10,Sekai Critical Flick,,0.0167,123,CriticalFlickNote,Preprocess,49283,10837,841529
+8.785714285714286,PlayScheduled,1,#PERFECT,,0.0167,124,NormalTapNote,Preprocess,49283,10837,852462
+9.0,PlayScheduled,10,Sekai Critical Flick,,0.0167,125,CriticalFlickNote,Preprocess,49283,10837,866151
+9.214285714285714,PlayScheduled,1,#PERFECT,,0.0167,126,NormalTapNote,Preprocess,49283,10837,877084
+9.428571428571429,PlayScheduled,10,Sekai Critical Flick,,0.0167,127,CriticalFlickNote,Preprocess,49283,10837,890773
+9.642857142857142,PlayScheduled,1,#PERFECT,,0.0167,128,NormalTapNote,Preprocess,49283,10837,901706
+9.857142857142858,PlayScheduled,10,Sekai Critical Flick,,0.0167,129,CriticalFlickNote,Preprocess,49283,10837,915395
+10.071428571428571,PlayScheduled,1,#PERFECT,,0.0167,130,NormalTapNote,Preprocess,49283,10837,926328
+10.285714285714286,PlayScheduled,10,Sekai Critical Flick,,0.0167,131,CriticalFlickNote,Preprocess,49283,10837,940017
+10.5,PlayScheduled,1,#PERFECT,,0.0167,132,NormalTapNote,Preprocess,49283,10837,950950
+10.714285714285714,PlayScheduled,10,Sekai Critical Flick,,0.0167,133,CriticalFlickNote,Preprocess,49283,10837,964639
+10.928571428571429,PlayScheduled,1,#PERFECT,,0.0167,134,NormalTapNote,Preprocess,49283,10837,975572
+11.142857142857142,PlayScheduled,10,Sekai Critical Flick,,0.0167,135,CriticalFlickNote,Preprocess,49283,10837,989261
+11.357142857142858,PlayScheduled,1,#PERFECT,,0.0167,136,NormalTapNote,Preprocess,49283,10837,1000194
+11.571428571428571,PlayScheduled,10,Sekai Critical Flick,,0.0167,137,CriticalFlickNote,Preprocess,49283,10837,1010343
+11.785714285714286,PlayScheduled,1,#PERFECT,,0.0167,138,NormalTapNote,Preprocess,49283,10837,1021276
+11.892857142857142,PlayScheduled,1,#PERFECT,,0.0167,139,NormalTapNote,Preprocess,49283,10837,1032195
+12.0,PlayScheduled,10,Sekai Critical Flick,,0.0167,140,CriticalFlickNote,Preprocess,49283,10837,1045972
+12.214285714285714,PlayScheduled,1,#PERFECT,,0.0167,141,NormalTapNote,Preprocess,49283,10837,1056905
+12.428571428571429,PlayScheduled,1,#PERFECT,,0.0167,142,NormalTapNote,Preprocess,49283,10837,1067824
+12.642857142857142,PlayScheduled,1,#PERFECT,,0.0167,143,NormalTapNote,Preprocess,49283,10837,1078743
+12.857142857142858,PlayScheduled,10,Sekai Critical Flick,,0.0167,144,CriticalFlickNote,Preprocess,49283,10837,1092520
+13.071428571428571,PlayScheduled,1,#PERFECT,,0.0167,145,NormalTapNote,Preprocess,49283,10837,1109606
+13.285714285714286,PlayScheduled,1,#PERFECT,,0.0167,146,NormalTapNote,Preprocess,49283,10837,1120341
+13.5,PlayScheduled,1,#PERFECT,,0.0167,147,NormalTapNote,Preprocess,49283,10837,1131076
+13.714285714285714,PlayScheduled,10,Sekai Critical Flick,,0.0167,148,CriticalFlickNote,Preprocess,49283,10837,1144853
+13.928571428571429,PlayScheduled,1,#PERFECT,,0.0167,149,NormalTapNote,Preprocess,49283,10837,1155602
+14.142857142857142,PlayScheduled,1,#PERFECT,,0.0167,150,NormalTapNote,Preprocess,49283,10837,1166337
+14.357142857142858,PlayScheduled,1,#PERFECT,,0.0167,151,NormalTapNote,Preprocess,49283,10837,1177072
+14.571428571428571,PlayScheduled,10,Sekai Critical Flick,,0.0167,152,CriticalFlickNote,Preprocess,49283,10837,1190849
+14.785714285714286,PlayScheduled,1,#PERFECT,,0.0167,153,NormalTapNote,Preprocess,49283,10837,1201598
+15.0,PlayScheduled,1,#PERFECT,,0.0167,154,NormalTapNote,Preprocess,49283,10837,1212333
+15.214285714285714,PlayScheduled,1,#PERFECT,,0.0167,155,NormalTapNote,Preprocess,49283,10837,1223068
+15.428571428571429,PlayScheduled,10,Sekai Critical Flick,,0.0167,156,CriticalFlickNote,Preprocess,49283,10837,1236845
+15.642857142857142,PlayScheduled,1,#PERFECT,,0.0167,157,NormalTapNote,Preprocess,49283,10837,1247594
+15.857142857142858,PlayScheduled,1,#PERFECT,,0.0167,158,NormalTapNote,Preprocess,49283,10837,1258329
+16.071428571428573,PlayScheduled,1,#PERFECT,,0.0167,159,NormalTapNote,Preprocess,49283,10837,1269064
+16.285714285714285,PlayScheduled,10,Sekai Critical Flick,,0.0167,160,CriticalFlickNote,Preprocess,49283,10837,1282841
+16.5,PlayScheduled,1,#PERFECT,,0.0167,161,NormalTapNote,Preprocess,49283,10837,1293590
+16.714285714285715,PlayScheduled,1,#PERFECT,,0.0167,162,NormalTapNote,Preprocess,49283,10837,1304325
+16.928571428571427,PlayScheduled,1,#PERFECT,,0.0167,163,NormalTapNote,Preprocess,49283,10837,1315060
+17.142857142857142,PlayScheduled,10,Sekai Critical Flick,,0.0167,164,CriticalFlickNote,Preprocess,49283,10837,1328837
+17.357142857142858,PlayScheduled,1,#PERFECT,,0.0167,165,NormalTapNote,Preprocess,49283,10837,1339586
+17.571428571428573,PlayScheduled,1,#PERFECT,,0.0167,166,NormalTapNote,Preprocess,49283,10837,1350321
+17.785714285714285,PlayScheduled,1,#PERFECT,,0.0167,167,NormalTapNote,Preprocess,49283,10837,1361056
+18.0,PlayScheduled,10,Sekai Critical Flick,,0.0167,168,CriticalFlickNote,Preprocess,49283,10837,1370533
+18.14285712857143,PlayScheduled,1,#PERFECT,,0.0167,169,NormalTapNote,Preprocess,49283,10837,1381282
+18.285714300000002,PlayScheduled,1,#PERFECT,,0.0167,170,NormalTapNote,Preprocess,49283,10837,1392017
+18.428571428571427,PlayScheduled,1,#PERFECT,,0.0167,171,NormalTapNote,Preprocess,49283,10837,1402752
+18.642857142857142,PlayScheduled,1,#PERFECT,,0.0167,172,NormalTapNote,Preprocess,49283,10837,1413487
+18.857142857142858,PlayScheduled,10,Sekai Critical Flick,,0.0167,173,CriticalFlickNote,Preprocess,49283,10837,1427347

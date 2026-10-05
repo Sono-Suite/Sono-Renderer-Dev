@@ -19,28 +19,79 @@ pub fn render_instances(
     instances: &[ParticleEffectInstance],
     time: f64,
 ) -> Result<Vec<ParticleSpriteDraw>> {
+    render_instances_traced(assets, effect_bindings, instances, time, None, None)
+}
+
+/// Observe the production evaluator without replaying Watch or changing random state.
+pub fn render_instances_traced(
+    assets: &formats::ParticleAssets,
+    effect_bindings: &BTreeMap<i64, String>,
+    instances: &[ParticleEffectInstance],
+    time: f64,
+    trace: Option<&crate::watch_diagnostics::SharedWatchTrace>,
+    viewport: Option<(u32, u32, &[f64; 16])>,
+) -> Result<Vec<ParticleSpriteDraw>> {
     if !time.is_finite() {
         bail!("particle render time must be finite");
     }
     let mut draws = Vec::new();
     for instance in instances {
         let Some(effect_name) = effect_bindings.get(&instance.effect_id) else {
+            trace_instance(
+                trace,
+                instance,
+                time,
+                "EffectSuppressed",
+                || serde_json::json!({"reason":"unbound effect ID"}),
+            )?;
             continue;
         };
         let Some(effect) = assets.effects.get(effect_name) else {
+            trace_instance(
+                trace,
+                instance,
+                time,
+                "EffectSuppressed",
+                || serde_json::json!({"reason":"missing effect resource","resource":effect_name}),
+            )?;
             continue;
         };
         if !instance.duration.is_finite() || instance.duration <= 0.0 {
+            trace_instance(
+                trace,
+                instance,
+                time,
+                "EffectSuppressed",
+                || serde_json::json!({"reason":"invalid duration","duration":instance.duration}),
+            )?;
             continue;
         }
         let age = (time - instance.spawned_at).max(0.0);
-        if !instance.is_looped && age >= instance.duration {
+        let last_end = effect
+            .groups
+            .iter()
+            .flat_map(|g| &g.particles)
+            .map(|p| (p.start + p.duration) * instance.duration)
+            .fold(0.0_f64, f64::max);
+        if !instance.is_looped && age >= last_end {
+            trace_instance(
+                trace,
+                instance,
+                time,
+                "EffectSuppressed",
+                || serde_json::json!({"reason":"expired","age":age,"duration":instance.duration}),
+            )?;
             continue;
         }
         let effect_time = (age / instance.duration).fract();
         let mut transform_rng = Rng::new(instance.instance_id as u64 ^ 0x9e3779b97f4a7c15);
         let effect_random = std::array::from_fn(|_| transform_rng.next());
         let effect_corners = transform_corners(effect, instance.corners, &effect_random);
+        if let Some(trace) = trace {
+            trace.lock().map_err(|_|anyhow::anyhow!("particle trace lock poisoned"))?.record_particle(instance,time,"EffectEvaluation",
+                serde_json::json!({"resource":effect_name,"definition":effect,"instance":instance,"age":age,"effect_time":effect_time,
+                    "effect_seed":instance.instance_id as u64 ^ 0x9e3779b97f4a7c15,"effect_random":effect_random,"resource_corners":effect_corners}));
+        }
         for (group_index, group) in effect.groups.iter().enumerate() {
             for copy in 0..group.count {
                 let seed = (instance.instance_id as u64).wrapping_mul(0xd6e8feb86659fd93)
@@ -49,14 +100,19 @@ pub fn render_instances(
                 let mut rng = Rng::new(seed);
                 let randoms = std::array::from_fn(|_| rng.next());
                 for (particle_index, particle) in group.particles.iter().enumerate() {
-                    let particle_end = particle.start + particle.duration;
-                    if particle.duration <= 0.0
-                        || effect_time < particle.start
-                        || effect_time >= particle_end
-                    {
+                    let Some(timing) =
+                        particle_timing(instance, time, particle.start, particle.duration)
+                    else {
+                        trace_instance(
+                            trace,
+                            instance,
+                            time,
+                            "ParticleSuppressed",
+                            || serde_json::json!({"particle":[group_index,copy,particle_index],"reason":"outside particle lifetime","effect_time":effect_time,"start":particle.start,"duration":particle.duration}),
+                        )?;
                         continue;
-                    }
-                    let progress = (effect_time - particle.start) / particle.duration;
+                    };
+                    let progress = timing.progress;
                     let [x, y, width, height, rotation, alpha] = [
                         property(&particle.x, progress, &randoms),
                         property(&particle.y, progress, &randoms),
@@ -74,6 +130,57 @@ pub fn render_instances(
                     let [red, green, blue, _] =
                         formats::parse_background_color(&particle.color, false)?;
                     let corners = particle_corners(effect_corners, x, y, width, height, rotation);
+                    if let Some(trace) = trace {
+                        let local = particle_corners(
+                            [[-1.0, -1.0], [-1.0, 1.0], [1.0, 1.0], [1.0, -1.0]],
+                            x,
+                            y,
+                            width,
+                            height,
+                            rotation,
+                        );
+                        let final_corners = viewport.map(|(_, _, m)| {
+                            crate::runtime::gpu_transform_particle_corners(
+                                &ParticleSpriteDraw {
+                                    sprite_id: particle.sprite,
+                                    corners,
+                                    color: [red, green, blue],
+                                    alpha,
+                                    order: (
+                                        instance.instance_id,
+                                        group_index,
+                                        copy,
+                                        particle_index,
+                                    ),
+                                },
+                                m,
+                            )
+                        });
+                        let pixels = viewport.zip(final_corners).map(|((w, h, _), q)| {
+                            q.map(|[x, y]| {
+                                [
+                                    (x / (f64::from(w) / f64::from(h)) + 1.0) * 0.5 * f64::from(w),
+                                    (1.0 - y) * 0.5 * f64::from(h),
+                                ]
+                            })
+                        });
+                        let atlas_uvs = assets.sprites.get(particle.sprite).map(|s| {
+                            let left = f64::from(s.x) / f64::from(assets.width);
+                            let right = f64::from(s.x + s.width) / f64::from(assets.width);
+                            let top = f64::from(s.y) / f64::from(assets.height);
+                            let bottom = f64::from(s.y + s.height) / f64::from(assets.height);
+                            [[left, bottom], [left, top], [right, top], [right, bottom]]
+                        });
+                        trace.lock().map_err(|_|anyhow::anyhow!("particle trace lock poisoned"))?.record_particle(instance,time,"ParticleEvaluation",
+                            serde_json::json!({"particle":[group_index,copy,particle_index],"group_count":group.count,"entry":particle,
+                                "seed":seed,"randoms":randoms,"spawn_time":timing.spawn_time,
+                                "lifetime":timing.lifetime,"age":timing.age,
+                                "progress":progress,"properties":{"x":x,"y":y,"width":width,"height":height,"rotation":rotation,"alpha":alpha},
+                                "local_corners":local,"effect_corners":corners,"runtime_matrix":viewport.map(|(_,_,m)|m),"final_corners":final_corners,"pixels":pixels,
+                                "sprite":assets.sprites.get(particle.sprite),"sprite_id":particle.sprite,"atlas_dimensions":[assets.width,assets.height],
+                                "uvs":[[0,0],[0,1],[1,1],[1,0]],"atlas_uvs_top_origin":atlas_uvs,"order":[instance.instance_id,group_index as i64,copy as i64,particle_index as i64],
+                                "color":[red,green,blue],"interpolation":assets.interpolation,"blend":"straight-alpha source-over", "uv_interpolation":"inverse bilinear"}));
+                    }
                     draws.push(ParticleSpriteDraw {
                         sprite_id: particle.sprite,
                         corners,
@@ -87,6 +194,59 @@ pub fn render_instances(
     }
     draws.sort_by_key(|draw| draw.order);
     Ok(draws)
+}
+
+struct ParticleTiming {
+    spawn_time: f64,
+    lifetime: f64,
+    age: f64,
+    progress: f64,
+}
+
+/// A resource entry has its own birth and lifetime; effect duration sets the
+/// loop interval, not a clipping plane for delayed particle tails.
+fn particle_timing(
+    instance: &ParticleEffectInstance,
+    time: f64,
+    start: f64,
+    duration: f64,
+) -> Option<ParticleTiming> {
+    let birth = instance.spawned_at + start * instance.duration;
+    let lifetime = duration * instance.duration;
+    if duration <= 0.0 || time < birth {
+        return None;
+    }
+    let elapsed = time - birth;
+    let age = if instance.is_looped {
+        elapsed % instance.duration
+    } else {
+        elapsed
+    };
+    if (instance.is_looped && age > lifetime) || (!instance.is_looped && age >= lifetime) {
+        return None;
+    }
+    Some(ParticleTiming {
+        spawn_time: time - age,
+        lifetime,
+        age,
+        progress: age / lifetime,
+    })
+}
+
+fn trace_instance(
+    trace: Option<&crate::watch_diagnostics::SharedWatchTrace>,
+    instance: &ParticleEffectInstance,
+    time: f64,
+    operation: &str,
+    data: impl FnOnce() -> serde_json::Value,
+) -> Result<()> {
+    if let Some(trace) = trace {
+        trace
+            .lock()
+            .map_err(|_| anyhow::anyhow!("particle trace lock poisoned"))?
+            .record_particle(instance, time, operation, data());
+    }
+    Ok(())
 }
 
 fn transform_corners(
@@ -118,7 +278,14 @@ fn property(property: &formats::ParticleProperty, time: f64, randoms: &[f64; 8])
     let from = evaluate_expression(Some(&property.from), &variables);
     let to = evaluate_expression(Some(&property.to), &variables);
     let eased = match property.ease.as_deref().unwrap_or("linear") {
-        "linear" | "none" => time,
+        "linear" => time,
+        "none" => {
+            if time == 1.0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
         name => {
             let (direction, family) = [
                 ("inOut", "InOut"),
@@ -173,10 +340,10 @@ fn particle_corners(
     rotation: f64,
 ) -> [[f64; 2]; 4] {
     let local = [
-        [x - width * 0.5, y - height * 0.5],
-        [x - width * 0.5, y + height * 0.5],
-        [x + width * 0.5, y + height * 0.5],
-        [x + width * 0.5, y - height * 0.5],
+        [x - width, y - height],
+        [x - width, y + height],
+        [x + width, y + height],
+        [x + width, y - height],
     ];
     let (sin, cos) = rotation.sin_cos();
     local.map(|[px, py]| {
@@ -217,6 +384,79 @@ impl Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn particle_size_spans_the_effect_quad_at_unit_size() {
+        let quad = [[-0.8, -0.6], [-0.8, 0.6], [0.8, 0.6], [0.8, -0.6]];
+        assert_eq!(particle_corners(quad, 0.0, 0.0, 1.0, 1.0, 0.0), quad);
+    }
+
+    #[test]
+    fn none_easing_holds_from_until_the_exact_endpoint() {
+        let mut p = property(2.0, 6.0);
+        p.ease = Some("none".into());
+        for t in [0.0, 0.25, 0.5, 0.999, 1.001] {
+            assert_eq!(super::property(&p, t, &[0.0; 8]), 2.0);
+        }
+        assert_eq!(super::property(&p, 1.0, &[0.0; 8]), 6.0);
+    }
+
+    #[test]
+    fn delayed_particle_lifetime_can_cross_the_effect_interval() {
+        let mut instance = ParticleEffectInstance {
+            instance_id: 0,
+            effect_id: 0,
+            corners: [[0.0; 2]; 4],
+            spawned_at: 2.0,
+            duration: 1.0,
+            is_looped: false,
+        };
+        assert!(particle_timing(&instance, 2.7, 0.75, 0.5).is_none());
+        let timing = particle_timing(&instance, 3.125, 0.75, 0.5).unwrap();
+        assert_eq!(timing.spawn_time, 2.75);
+        assert_eq!(timing.age, 0.375);
+        assert_eq!(timing.progress, 0.75);
+        assert!(particle_timing(&instance, 3.25, 0.75, 0.5).is_none());
+        instance.is_looped = true;
+        let timing = particle_timing(&instance, 4.125, 0.75, 0.5).unwrap();
+        assert_eq!(timing.spawn_time, 3.75);
+        assert_eq!(timing.progress, 0.75);
+        assert!(particle_timing(&instance, 3.625, 0.75, 0.5).is_none());
+    }
+
+    #[test]
+    fn looping_particle_includes_its_property_endpoint_but_nonlooping_particle_expires() {
+        let mut instance = ParticleEffectInstance {
+            instance_id: 0,
+            effect_id: 0,
+            corners: [[0.0; 2]; 4],
+            spawned_at: 0.0,
+            duration: 2.0,
+            is_looped: true,
+        };
+        assert_eq!(
+            particle_timing(&instance, 0.5, 0.125, 0.125)
+                .unwrap()
+                .progress,
+            1.0
+        );
+        assert!(particle_timing(&instance, 0.501, 0.125, 0.125).is_none());
+        instance.is_looped = false;
+        assert!(particle_timing(&instance, 0.5, 0.125, 0.125).is_none());
+        assert!(particle_timing(&instance, -1.0, 0.0, 1.0).is_none());
+    }
+
+    #[test]
+    fn particle_size_rotation_and_pivot_are_applied_before_effect_mapping() {
+        let quad = [[-1.0, -1.0], [-1.0, 1.0], [1.0, 1.0], [1.0, -1.0]];
+        let actual = particle_corners(quad, 0.2, -0.3, 0.4, 0.1, std::f64::consts::FRAC_PI_2);
+        let expected = [[0.3, -0.7], [0.1, -0.7], [0.1, 0.1], [0.3, 0.1]];
+        for (a, e) in actual.into_iter().zip(expected) {
+            for axis in 0..2 {
+                assert!((a[axis] - e[axis]).abs() < 1e-12);
+            }
+        }
+    }
 
     fn property(from: f64, to: f64) -> formats::ParticleProperty {
         formats::ParticleProperty {
@@ -280,6 +520,19 @@ mod tests {
             render_instances(&assets, &[(7, "one".into())].into(), &instances, 1.0).unwrap();
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].alpha, 1.0);
+        let trace = crate::watch_diagnostics::WatchTrace::new(Default::default()).unwrap();
+        assert_eq!(
+            render_instances_traced(
+                &assets,
+                &[(7, "one".into())].into(),
+                &instances,
+                1.0,
+                Some(&trace),
+                None
+            )
+            .unwrap(),
+            draws
+        );
         let mut rgb = vec![0, 0, 0];
         crate::runtime::DisplayList::composite_particle_sprites(
             &mut rgb,
@@ -298,6 +551,12 @@ mod tests {
             render_instances(&assets, &[(7, "one".into())].into(), &instances, 3.0)
                 .unwrap()
                 .is_empty()
+        );
+        let mut looped = instances[0].clone();
+        looped.is_looped = true;
+        assert_eq!(
+            render_instances(&assets, &[(7, "one".into())].into(), &[looped], 3.0).unwrap(),
+            draws
         );
     }
 }

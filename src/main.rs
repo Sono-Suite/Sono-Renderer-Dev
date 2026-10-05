@@ -275,6 +275,12 @@ enum Command {
     RunWatch {
         engine: PathBuf,
         level: PathBuf,
+        /// JSON TraceConfig filters for the authoritative Watch execution.
+        #[arg(long, requires = "watch_trace_output")]
+        watch_trace_config: Option<PathBuf>,
+        /// Bounded JSONL execution trace (default capacity 10000).
+        #[arg(long)]
+        watch_trace_output: Option<PathBuf>,
         #[arg(long)]
         resources: Option<PathBuf>,
         #[arg(long, default_value_t = 0.0)]
@@ -479,6 +485,8 @@ fn main() -> Result<()> {
         Command::RunWatch {
             engine,
             level,
+            watch_trace_config,
+            watch_trace_output,
             resources,
             time,
             level_options,
@@ -537,6 +545,27 @@ fn main() -> Result<()> {
                 (None, false) => None,
             };
             let mut runtime = renderer::watch_runtime::WatchRuntime::new(&package.watch, &level)?;
+            let execution_trace = if watch_trace_output.is_some() {
+                let config = watch_trace_config
+                    .as_ref()
+                    .map(|path| -> Result<_> { Ok(serde_json::from_slice(&std::fs::read(path)?)?) })
+                    .transpose()?
+                    .unwrap_or_default();
+                Some(renderer::watch_diagnostics::WatchTrace::new(config)?)
+            } else {
+                None
+            };
+            runtime.context.execution_trace = execution_trace.clone();
+            if let Some(trace) = &execution_trace {
+                trace
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Watch trace lock poisoned"))?
+                    .particle_names = renderer::offline::particle_effect_bindings(&package.watch)?;
+                trace
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Watch trace lock poisoned"))?
+                    .effect_names = renderer::offline::effect_clip_bindings(&package.watch)?;
+            }
             runtime.set_draw_tracing(trace_draws);
             match (diagnostic_entity, diagnostic_stage) {
                 (Some(entity_id), Some(stage)) => {
@@ -693,19 +722,14 @@ fn main() -> Result<()> {
                 }
                 (Some(_), None) | (None, _) => None,
             };
-            let report = runtime.frame(time)?;
-            let rhs_forensic_reports = runtime.rhs_forensic_reports();
-            if !rhs_forensic_reports.is_empty() {
-                println!(
-                    "RHS forensic callback replays (time={time}, callback=NormalHeadTapNote.UpdateParallel, root=node88326):"
-                );
-                for (entity_id, events) in rhs_forensic_reports {
-                    println!("  entity={entity_id}");
-                    for event in events {
-                        println!("    {event}");
-                    }
-                }
+            let execution = runtime.frame(time);
+            if let (Some(trace), Some(path)) = (&execution_trace, &watch_trace_output) {
+                trace
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Watch trace lock poisoned"))?
+                    .write_jsonl(path)?;
             }
+            let report = execution?;
             println!(
                 "Runtime Update [time, deltaTime, scaledTime, reserved]: {:?}; after callbacks={:?}; timescale={}",
                 report.runtime_update, report.runtime_update_after_callbacks, report.timescale
@@ -910,11 +934,13 @@ fn main() -> Result<()> {
                             .values()
                             .cloned()
                             .collect::<Vec<_>>();
-                        let draws = renderer::particles::render_instances(
+                        let draws = renderer::particles::render_instances_traced(
                             assets,
                             &particle_bindings_for_render,
                             &instances,
                             time,
+                            execution_trace.as_ref(),
+                            Some((width, height, &report.runtime_particle_transform)),
                         )?;
                         let mut rgb = renderer::offline::ppm_rgb_payload(&ppm, width, height)?;
                         renderer::runtime::DisplayList::composite_particle_sprites(
@@ -988,6 +1014,12 @@ fn main() -> Result<()> {
                     height,
                     path.display()
                 );
+            }
+            if let (Some(trace), Some(path)) = (&execution_trace, &watch_trace_output) {
+                trace
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Watch trace lock poisoned"))?
+                    .write_jsonl(path)?;
             }
             if let Some(path) = render_diagnostics_output {
                 let skin = skin_assets

@@ -2559,7 +2559,9 @@ mod tests {
         let slowed = stream_frames_pipelined(
             make_session(crate::render_ui::RendererUiConfig::default()),
             short_range,
-            SlowSink(Duration::from_millis(20)),
+            // The consumer must be slower than debug Watch evaluation for
+            // this control to exercise backpressure rather than just FIFO.
+            SlowSink(Duration::from_millis(200)),
             None,
             &package.watch,
             None,
@@ -2686,6 +2688,9 @@ mod tests {
             .map(|frame| (frame.global_frame_index, frame.rgb_sha1.clone()))
             .collect();
         assert_eq!(pipelined_hashes, sequential_hashes);
+        // Re-pinned after correcting Sonolus Pre/Post return semantics: the
+        // compiled scheduler now preserves one additional loop interval.
+        // Independent sequential and pipelined traversals must still agree.
         assert_eq!(
             output
                 .diagnostics
@@ -2700,7 +2705,7 @@ mod tests {
                 .iter()
                 .map(|frame| frame.callback_count as u64)
                 .sum::<u64>(),
-            10_898
+            10_890
         );
         assert_eq!(
             output
@@ -2708,7 +2713,7 @@ mod tests {
                 .iter()
                 .map(|frame| frame.vm_evaluations)
                 .sum::<u64>(),
-            12_783_093
+            12_870_999
         );
 
         let event_session = EventSession::new_configured(
@@ -2734,15 +2739,15 @@ mod tests {
             collect_event_only_requests(event_session, range, true, &AtomicU8::new(0)).unwrap();
         assert_eq!(
             hash_audio_requests(&events.requests).unwrap(),
-            "be53125a6dd38ad4b59dc7fc15b2ca3ca99c1808"
+            "2d8c261fbba9a28a77842a05665720e655d73f0f"
         );
         assert_eq!(
             count_audio_requests(&events.requests),
             SfxEventCounts {
                 audio_events: 0,
                 scheduled_effects: 615,
-                loop_starts: 89,
-                loop_stops: 89,
+                loop_starts: 90,
+                loop_stops: 90,
             }
         );
         // The authoritative serial Watch producer supplies exactly this timeline.
@@ -2755,15 +2760,15 @@ mod tests {
             hash_audio_requests(&output.audio_requests).unwrap()
         );
         assert_eq!(events.runtime_frames, 120);
-        assert_eq!(events.callbacks, 10_898);
-        assert_eq!(events.evaluations, 12_783_093);
+        assert_eq!(events.callbacks, 10_890);
+        assert_eq!(events.evaluations, 12_870_999);
         assert_eq!(events.checkpoints.len(), 1);
         let checkpoint = &events.checkpoints[0];
         assert_eq!((checkpoint.watch_start, checkpoint.watch_end), (0.0, 2.0));
         assert_eq!(checkpoint.runtime_frames, 120);
         assert_eq!(checkpoint.callbacks, events.callbacks);
         assert_eq!(checkpoint.evaluations, events.evaluations);
-        assert_eq!(checkpoint.sfx_events, [0, 615, 89, 89]);
+        assert_eq!(checkpoint.sfx_events, [0, 615, 90, 90]);
         assert_eq!(
             checkpoint.callback_stages.values().sum::<u64>(),
             events.callbacks

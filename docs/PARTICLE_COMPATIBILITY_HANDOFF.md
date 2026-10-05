@@ -1,5 +1,8 @@
 # Particle compatibility handoff
 
+> Superseded on 2026-10-05 by [the comprehensive particle audit](PARTICLE_FORENSIC_AUDIT.md).
+> New ELF-aware disassembly and caller dataflow establish that the old size conclusion below was incorrect. The new audit documents generic size, easing, and entry-timing fixes. Earlier scope restrictions below are historical; the user subsequently authorized the comprehensive investigation and selected the saved Horizon/Dreamer recording.
+
 Status: investigation stopped on 2026-10-03. No production particle-rendering defect established; no production change justified.
 
 The current private evidence handoff is `TestingSuite/Sonolus Inspection/1.1.4/findings/PARTICLE_RENDERING_STATIC_AUDIT.md` (ignored, local interoperability research). It records input hashes, tool provenance, evidence locations, observations, and confidence. Recovered client implementation artifacts must remain private and must not be copied, translated, or ported into renderer code.

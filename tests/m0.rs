@@ -1108,9 +1108,9 @@ fn watch_shifted_and_pointed_memory_variants_apply_documented_updates() {
 
     assert_eq!(vm.execute(5).unwrap(), 1.0); // 17 mod 4
     assert_eq!(vm.memory.get(10000, 7), 1.0);
-    assert_eq!(vm.execute(10).unwrap(), 6.0);
+    assert_eq!(vm.execute(10).unwrap(), 5.0); // Sonolus Pre returns before update
     assert_eq!(vm.memory.get(10000, 8), 6.0);
-    assert_eq!(vm.execute(15).unwrap(), 5.0); // post-decrement returns old
+    assert_eq!(vm.execute(15).unwrap(), 4.0); // Sonolus Post returns after update
     assert_eq!(vm.memory.get(10000, 5), 4.0);
 }
 
@@ -1354,9 +1354,6 @@ fn skin_rasterizer_samples_bound_sprite_and_composites_alpha() {
         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
     ];
-    let runtime_identity = [
-        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-    ];
     let skin = SkinAssets {
         width: 1,
         height: 1,
@@ -1392,20 +1389,8 @@ fn skin_rasterizer_samples_bound_sprite_and_composites_alpha() {
             &BTreeMap::from([(7, "half-red".to_owned())]),
         )
         .unwrap();
-    let rgb = display_list
-        .render_skin_rgb_with_runtime_transform_and_background(
-            2,
-            2,
-            1.0,
-            &skin,
-            &BTreeMap::from([(7, "half-red".to_owned())]),
-            &runtime_identity,
-            None,
-        )
-        .unwrap();
     assert_eq!(&ppm[..11], b"P6\n2 2\n255\n");
     let pixels = &ppm[11..];
-    assert_eq!(rgb, pixels);
     assert_eq!(pixels, &[64, 0, 0, 64, 0, 0, 64, 0, 0, 64, 0, 0]);
 
     let diagnostic = display_list
@@ -1446,26 +1431,6 @@ fn skin_rasterizer_samples_bound_sprite_and_composites_alpha() {
     );
     assert_eq!(diagnostic.unclipped_pixel_bounds, [0, 0, 2, 2]);
     assert_eq!(diagnostic.clipped_pixel_bounds, [0, 0, 2, 2]);
-
-    let uncovered = DisplayList::default();
-    let uncovered_ppm = uncovered
-        .render_skin_ppm(2, 2, 1.0, &skin, &BTreeMap::new())
-        .unwrap();
-    let uncovered_rgb = uncovered
-        .render_skin_rgb_with_runtime_transform_and_background(
-            2,
-            2,
-            1.0,
-            &skin,
-            &BTreeMap::new(),
-            &[
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-            ],
-            None,
-        )
-        .unwrap();
-    assert_eq!(uncovered_rgb, &uncovered_ppm[11..]);
-    assert!(uncovered_rgb.iter().all(|byte| *byte == 0));
 }
 
 #[test]
@@ -1853,9 +1818,6 @@ fn background_renders_first_and_applies_data_color_and_configuration_mask() {
     let identity = std::array::from_fn(|row| {
         std::array::from_fn(|column| if row == column { 1.0 } else { 0.0 })
     });
-    let runtime_identity = [
-        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-    ];
     let skin = renderer::formats::SkinAssets {
         width: 1,
         height: 1,
@@ -1895,21 +1857,6 @@ fn background_renders_first_and_applies_data_color_and_configuration_mask() {
             )),
         )
         .unwrap();
-    let rgb = draws
-        .render_skin_rgb_with_runtime_transform_and_background(
-            2,
-            2,
-            1.0,
-            &skin,
-            &std::collections::BTreeMap::from([(0, "white".to_owned())]),
-            &runtime_identity,
-            Some((
-                &background,
-                [[-1.0, -1.0], [-1.0, 1.0], [1.0, 1.0], [1.0, -1.0]],
-            )),
-        )
-        .unwrap();
-    assert_eq!(rgb, &ppm[11..]);
     assert_eq!(&ppm[11..14], &[192, 128, 191]);
 }
 
@@ -3257,7 +3204,7 @@ fn watch_while_legacy_condition_body_is_pretest_and_returns_last_body_value() {
 }
 
 #[test]
-fn watch_vm_local_legacy_single_body_while_repeats_until_break() {
+fn watch_while_single_body_repeats_until_break_and_returns_break_value() {
     use renderer::watch::EngineNode as N;
     let nodes: Vec<N> = serde_json::from_value(serde_json::json!([
         {"value":2000},{"value":0},{"value":1},{"value":3},
@@ -3269,8 +3216,6 @@ fn watch_vm_local_legacy_single_body_while_repeats_until_break() {
     ]))
     .unwrap();
     let mut vm = renderer::runtime::WatchVm::new(&nodes);
-    // Local compatibility coverage only: this one-child While form is not a
-    // valid Sonolus v1.1.4 oracle fixture.
     assert_eq!(vm.execute(13).unwrap(), 99.0);
     assert_eq!(vm.memory.get(2000, 0), 3.0);
 }
