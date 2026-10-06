@@ -5,6 +5,7 @@ param(
     [string[]]$Workloads = @("Larp", "ARMAGEDDON"),
     [ValidateSet("single", "auto", "2", "4", "8", "12")]
     [string[]]$Modes = @("single", "auto", "2", "4", "8", "12"),
+    [switch]$KeepVmAccounting,
     [switch]$CollectProfile,
     [string]$OutputPath = "artifacts\sono-renderer-followup5\watch-worker-benchmarks.json"
 )
@@ -36,10 +37,12 @@ foreach ($workload in $Workloads) {
             foreach ($argument in @(
                 "run-watch", $engine, $workloadInputs[$workload],
                 "--resources", $resources, "--time", "1",
-                "--no-ui", "--no-particles", "--no-sfx", "--no-bgm",
-                "--no-vm-accounting"
+                "--no-ui", "--no-particles", "--no-sfx", "--no-bgm"
             )) {
                 $arguments.Add([string]$argument)
+            }
+            if (-not $KeepVmAccounting) {
+                $arguments.Add("--no-vm-accounting")
             }
             switch ($mode) {
                 "single" { $arguments.Add("--single-threaded") }
@@ -110,6 +113,7 @@ foreach ($workload in $Workloads) {
                 process_seconds = $stopwatch.Elapsed.TotalSeconds
                 process_cpu_milliseconds = $cpuMilliseconds
                 peak_working_set_megabytes = [math]::Round($peakWorkingSetMegabytes, 2)
+                vm_accounting_enabled = [bool]$KeepVmAccounting
                 runtime_entities = [int]$workMatch.Groups[1].Value
                 active_entities = [int]$workMatch.Groups[2].Value
                 callbacks = [int]$workMatch.Groups[3].Value
