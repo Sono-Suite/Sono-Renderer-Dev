@@ -347,8 +347,10 @@ fn gpu() -> Result<Gpu> {
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                    has_dynamic_offset: true,
+                    min_binding_size: std::num::NonZeroU64::new(
+                        std::mem::size_of::<Params>() as u64
+                    ),
                 },
                 count: None,
             },
@@ -484,6 +486,96 @@ fn render(
         p.readback_buffer_setup = start.elapsed();
     }
     encode_start = profile.as_ref().map(|_| std::time::Instant::now());
+    let parameter_alignment = u64::from(gpu.device.limits().min_uniform_buffer_offset_alignment);
+    let parameter_size = std::mem::size_of::<Params>() as u64;
+    let parameter_stride = parameter_size.div_ceil(parameter_alignment) * parameter_alignment;
+    let parameter_buffer_size = parameter_stride
+        .checked_mul(draws.len() as u64)
+        .context("draw parameter buffer size overflow")?
+        .max(parameter_size);
+    let parameter_buffer_len = usize::try_from(parameter_buffer_size)
+        .context("draw parameter buffer does not fit host address space")?;
+    let mut parameter_bytes = vec![0; parameter_buffer_len];
+    let mut draw_bindings = Vec::with_capacity(draws.len());
+    for (draw_index, draw) in draws.iter().enumerate() {
+        let [x, y, w, h] = draw.rect;
+        let params = Params {
+            corners: {
+                let weights =
+                    if draw.skin_mode == crate::skin_render_mode::SkinRenderMode::Lightweight {
+                        crate::skin_render_mode::projective_weights(&draw.corners)
+                    } else {
+                        [0.0; 4]
+                    };
+                std::array::from_fn(|i| {
+                    [
+                        draw.corners[i][0] as f32,
+                        draw.corners[i][1] as f32,
+                        weights[i] as f32,
+                        0.0,
+                    ]
+                })
+            },
+            atlas: [x as f32, y as f32, w as f32, h as f32],
+            frame: [
+                width as f32,
+                height as f32,
+                aspect as f32,
+                draw.alpha as f32,
+            ],
+            tint: draw.tint.map(|v| v as f32),
+            sampling: [
+                if draw.interpolation || draw.background {
+                    1.0
+                } else {
+                    0.0
+                },
+                if draw.background { 1.0 } else { 0.0 },
+                if draw.mask { 1.0 } else { 0.0 },
+                if draw.skin_mode == crate::skin_render_mode::SkinRenderMode::Lightweight {
+                    1.0
+                } else {
+                    0.0
+                },
+            ],
+        };
+        let byte_offset = draw_index * parameter_stride as usize;
+        parameter_bytes[byte_offset..byte_offset + std::mem::size_of::<Params>()]
+            .copy_from_slice(bytemuck::bytes_of(&params));
+        let dynamic_offset = u32::try_from(draw_index as u64 * parameter_stride)
+            .context("draw parameter dynamic offset exceeds wgpu's u32 limit")?;
+        draw_bindings.push((draw.atlas, dynamic_offset));
+    }
+    let parameter_buffer = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ordered draw parameter array"),
+            contents: &parameter_bytes,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let atlas_bindings = resident
+        .iter()
+        .map(|view| {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ordered sprite atlas binding"),
+                layout: &gpu.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &parameter_buffer,
+                            offset: 0,
+                            size: std::num::NonZeroU64::new(parameter_size),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                ],
+            })
+        })
+        .collect::<Vec<_>>();
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -507,65 +599,8 @@ fn render(
             multiview_mask: None,
         });
         pass.set_pipeline(&gpu.pipeline);
-        for d in draws {
-            let [x, y, w, h] = d.rect;
-            let params = Params {
-                corners: {
-                    let weights =
-                        if d.skin_mode == crate::skin_render_mode::SkinRenderMode::Lightweight {
-                            crate::skin_render_mode::projective_weights(&d.corners)
-                        } else {
-                            [0.0; 4]
-                        };
-                    std::array::from_fn(|i| {
-                        [
-                            d.corners[i][0] as f32,
-                            d.corners[i][1] as f32,
-                            weights[i] as f32,
-                            0.0,
-                        ]
-                    })
-                },
-                atlas: [x as f32, y as f32, w as f32, h as f32],
-                frame: [width as f32, height as f32, aspect as f32, d.alpha as f32],
-                tint: d.tint.map(|v| v as f32),
-                sampling: [
-                    if d.interpolation || d.background {
-                        1.0
-                    } else {
-                        0.0
-                    },
-                    if d.background { 1.0 } else { 0.0 },
-                    if d.mask { 1.0 } else { 0.0 },
-                    if d.skin_mode == crate::skin_render_mode::SkinRenderMode::Lightweight {
-                        1.0
-                    } else {
-                        0.0
-                    },
-                ],
-            };
-            let ub = gpu
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("ordered draw parameters"),
-                    contents: bytemuck::bytes_of(&params),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-            let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("ordered sprite draw"),
-                layout: &gpu.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: ub.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&resident[d.atlas]),
-                    },
-                ],
-            });
-            pass.set_bind_group(0, &bind, &[]);
+        for (atlas, dynamic_offset) in draw_bindings {
+            pass.set_bind_group(0, &atlas_bindings[atlas], &[dynamic_offset]);
             pass.draw(0..6, 0..1);
         }
     }

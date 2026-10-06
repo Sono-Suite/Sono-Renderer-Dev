@@ -135,6 +135,51 @@ struct Job {
     result: mpsc::Receiver<Result<String>>,
     worker: JoinHandle<()>,
 }
+struct EngineJob {
+    result: mpsc::Receiver<EngineJobMessage>,
+    worker: JoinHandle<()>,
+}
+enum EngineJobMessage {
+    CheckingCache {
+        engine: PathBuf,
+        graph_nodes: usize,
+        eligible_operations: u64,
+    },
+    Compiling {
+        engine: PathBuf,
+        graph_nodes: usize,
+        eligible_operations: u64,
+    },
+    Complete {
+        engine: PathBuf,
+        result: std::result::Result<EngineLoaded, String>,
+    },
+}
+struct EngineLoaded {
+    options: Option<Vec<serde_json::Value>>,
+    nodes: Arc<Vec<crate::watch::EngineNode>>,
+    gcc: Option<std::result::Result<crate::sono_gcc::SonoGccPrecompileReport, String>>,
+}
+#[derive(Clone, Default)]
+enum GccUiStatus {
+    #[default]
+    Disabled,
+    Loading,
+    CheckingCache {
+        graph_nodes: usize,
+        eligible_operations: u64,
+    },
+    Compiling {
+        graph_nodes: usize,
+        eligible_operations: u64,
+    },
+    Ready(crate::sono_gcc::SonoGccPrecompileReport),
+    Partial(crate::sono_gcc::SonoGccPrecompileReport),
+    Failed {
+        graph_nodes: usize,
+        diagnostic: String,
+    },
+}
 struct Desktop {
     parent: Option<Arc<winit::window::Window>>,
     config: RenderConfig,
@@ -144,8 +189,11 @@ struct Desktop {
     summary: String,
     error: bool,
     options: Vec<serde_json::Value>,
-    option_job: Option<mpsc::Receiver<Result<Vec<serde_json::Value>>>>,
+    engine_job: Option<EngineJob>,
     options_engine: PathBuf,
+    loaded_watch: Option<(PathBuf, Arc<Vec<crate::watch::EngineNode>>)>,
+    gcc_status: GccUiStatus,
+    show_gcc_details: bool,
     arbitrary_index: usize,
     arbitrary_value: f64,
     close_pending: bool,
@@ -165,8 +213,11 @@ impl Default for Desktop {
             summary: "Select your project files to begin.".into(),
             error: false,
             options: Vec::new(),
-            option_job: None,
+            engine_job: None,
             options_engine: PathBuf::new(),
+            loaded_watch: None,
+            gcc_status: GccUiStatus::Disabled,
+            show_gcc_details: false,
             arbitrary_index: 0,
             arbitrary_value: 0.0,
             close_pending: false,
@@ -289,7 +340,7 @@ impl Desktop {
         });
         let token = control.clone();
         let live = self.live.clone();
-        let config = self.config.clone();
+        let config = Self::gui_export_config(&self.config);
         let wake = ctx.clone();
         let (tx, rx) = mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
@@ -336,6 +387,109 @@ impl Desktop {
         self.error = false;
         self.summary = "Export running".into();
     }
+
+    fn gui_export_config(config: &RenderConfig) -> RenderConfig {
+        let mut config = config.clone();
+        // Engine selection owns the background precompiler. A render started
+        // before it is ready uses WatchVm immediately instead of compiling
+        // synchronously on this export worker.
+        config.compile_sono_gcc_on_demand = false;
+        config
+    }
+
+    fn start_engine_job(&mut self, engine: PathBuf, compile_gcc: bool) {
+        if compile_gcc {
+            self.gcc_status = GccUiStatus::Loading;
+        }
+        let (tx, rx) = mpsc::sync_channel(2);
+        let worker_engine = engine.clone();
+        let worker = std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<EngineLoaded> {
+                let package = crate::formats::load_engine(&worker_engine)
+                    .map_err(|error| anyhow::anyhow!("loading engine package: {error:#}"))?;
+                let options = package.configuration["options"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let nodes = package.watch.nodes.clone();
+                let gcc = if compile_gcc {
+                    let coverage = crate::sono_gcc::inspect_coverage(&nodes);
+                    let _ = tx.send(EngineJobMessage::CheckingCache {
+                        engine: worker_engine.clone(),
+                        graph_nodes: coverage.graph_nodes,
+                        eligible_operations: coverage.eligible_operations,
+                    });
+                    let compile_engine = worker_engine.clone();
+                    let progress_tx = tx.clone();
+                    Some(
+                        crate::sono_gcc::precompile_with_progress(&nodes, move || {
+                            let _ = progress_tx.send(EngineJobMessage::Compiling {
+                                engine: compile_engine,
+                                graph_nodes: coverage.graph_nodes,
+                                eligible_operations: coverage.eligible_operations,
+                            });
+                        })
+                        .map_err(|error| format!("{error:#}")),
+                    )
+                } else {
+                    None
+                };
+                Ok(EngineLoaded {
+                    options: Some(options),
+                    nodes,
+                    gcc,
+                })
+            })()
+            .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(EngineJobMessage::Complete {
+                engine: worker_engine,
+                result,
+            });
+        });
+        self.engine_job = Some(EngineJob { result: rx, worker });
+    }
+
+    fn start_gcc_job(&mut self, engine: PathBuf, nodes: Arc<Vec<crate::watch::EngineNode>>) {
+        let coverage = crate::sono_gcc::inspect_coverage(&nodes);
+        self.gcc_status = GccUiStatus::CheckingCache {
+            graph_nodes: coverage.graph_nodes,
+            eligible_operations: coverage.eligible_operations,
+        };
+        let (tx, rx) = mpsc::sync_channel(2);
+        let worker_engine = engine.clone();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(EngineJobMessage::CheckingCache {
+                engine: worker_engine.clone(),
+                graph_nodes: coverage.graph_nodes,
+                eligible_operations: coverage.eligible_operations,
+            });
+            let compile_engine = worker_engine.clone();
+            let progress_tx = tx.clone();
+            let result = crate::sono_gcc::precompile_with_progress(&nodes, move || {
+                let _ = progress_tx.send(EngineJobMessage::Compiling {
+                    engine: compile_engine,
+                    graph_nodes: coverage.graph_nodes,
+                    eligible_operations: coverage.eligible_operations,
+                });
+            })
+            .map_err(|error| format!("{error:#}"))
+            .map(|report| EngineLoaded {
+                options: None,
+                nodes,
+                gcc: Some(Ok(report)),
+            });
+            let _ = tx.send(EngineJobMessage::Complete {
+                engine: worker_engine,
+                result,
+            });
+        });
+        self.engine_job = Some(EngineJob { result: rx, worker });
+    }
+
+    fn set_gcc_report(&mut self, report: crate::sono_gcc::SonoGccPrecompileReport) {
+        self.gcc_status = status_for_gcc_report(report);
+    }
+
     fn poll(&mut self) {
         if let Some(job) = &self.job {
             if let Ok(result) = job.result.try_recv() {
@@ -367,35 +521,131 @@ impl Desktop {
                 }
             }
         }
-        if let Some(rx) = &self.option_job {
-            if let Ok(result) = rx.try_recv() {
-                self.option_job = None;
-                match result {
-                    Ok(options) => self.options = options,
-                    Err(e) => self
-                        .live
-                        .lock()
-                        .unwrap()
-                        .log(format!("Option discovery: {e:#}")),
+        let mut completed = None;
+        if let Some(job) = &self.engine_job {
+            for message in job.result.try_iter() {
+                match message {
+                    EngineJobMessage::CheckingCache {
+                        engine,
+                        graph_nodes,
+                        eligible_operations,
+                    } if gcc_engine_message_applies(
+                        &engine,
+                        &self.config.engine,
+                        self.config.execution_mode,
+                    ) =>
+                    {
+                        self.gcc_status = GccUiStatus::CheckingCache {
+                            graph_nodes,
+                            eligible_operations,
+                        };
+                    }
+                    EngineJobMessage::Compiling {
+                        engine,
+                        graph_nodes,
+                        eligible_operations,
+                    } if gcc_engine_message_applies(
+                        &engine,
+                        &self.config.engine,
+                        self.config.execution_mode,
+                    ) =>
+                    {
+                        self.gcc_status = GccUiStatus::Compiling {
+                            graph_nodes,
+                            eligible_operations,
+                        };
+                    }
+                    EngineJobMessage::Complete { engine, result } => {
+                        completed = Some((engine, result));
+                    }
+                    EngineJobMessage::Compiling { .. } => {}
+                    EngineJobMessage::CheckingCache { .. } => {}
                 }
             }
         }
-        if self.config.engine != self.options_engine && self.option_job.is_none() {
+        if let Some((engine, result)) = completed {
+            let job = self.engine_job.take().unwrap();
+            let _ = job.worker.join();
+            if engine == self.config.engine {
+                match result {
+                    Ok(loaded) => {
+                        if let Some(options) = loaded.options {
+                            self.options = options;
+                        }
+                        self.loaded_watch = Some((engine.clone(), loaded.nodes));
+                        if self.config.execution_mode
+                            == crate::sono_gcc::WatchExecutionMode::SonoGcc
+                        {
+                            match loaded.gcc {
+                                Some(Ok(report)) => self.set_gcc_report(report),
+                                Some(Err(diagnostic)) => {
+                                    self.gcc_status = GccUiStatus::Failed {
+                                        graph_nodes: self
+                                            .loaded_watch
+                                            .as_ref()
+                                            .map_or(0, |(_, nodes)| nodes.len()),
+                                        diagnostic,
+                                    };
+                                }
+                                None => self.gcc_status = GccUiStatus::Loading,
+                            }
+                        } else {
+                            self.gcc_status = GccUiStatus::Disabled;
+                        }
+                    }
+                    Err(diagnostic) => {
+                        self.options.clear();
+                        if self.config.execution_mode
+                            == crate::sono_gcc::WatchExecutionMode::SonoGcc
+                        {
+                            self.gcc_status = GccUiStatus::Failed {
+                                graph_nodes: 0,
+                                diagnostic: diagnostic.clone(),
+                            };
+                        }
+                        self.live
+                            .lock()
+                            .unwrap()
+                            .log(format!("Engine/GCC preparation: {diagnostic}"));
+                    }
+                }
+            }
+        }
+
+        if self.config.engine != self.options_engine {
             self.options_engine = self.config.engine.clone();
             self.options.clear();
-            if self.options_engine.is_file() {
-                let engine = self.options_engine.clone();
-                let (tx, rx) = mpsc::sync_channel(1);
-                self.option_job = Some(rx);
-                std::thread::spawn(move || {
-                    let result = crate::formats::load_engine(&engine).map(|package| {
-                        package.configuration["options"]
-                            .as_array()
-                            .cloned()
-                            .unwrap_or_default()
-                    });
-                    let _ = tx.send(result);
-                });
+            self.loaded_watch = None;
+            self.gcc_status =
+                if self.config.execution_mode == crate::sono_gcc::WatchExecutionMode::SonoGcc {
+                    GccUiStatus::Loading
+                } else {
+                    GccUiStatus::Disabled
+                };
+            self.show_gcc_details = false;
+        }
+
+        let engine = self.config.engine.clone();
+        let wants_gcc = should_precompile(self.config.execution_mode);
+        if !wants_gcc {
+            self.gcc_status = GccUiStatus::Disabled;
+        }
+        if engine.is_file() && self.engine_job.is_none() {
+            if let Some((loaded_engine, nodes)) = &self.loaded_watch {
+                if *loaded_engine == engine {
+                    if wants_gcc
+                        && matches!(
+                            self.gcc_status,
+                            GccUiStatus::Disabled | GccUiStatus::Loading
+                        )
+                    {
+                        self.start_gcc_job(engine.clone(), nodes.clone());
+                    }
+                } else {
+                    self.start_engine_job(engine.clone(), wants_gcc);
+                }
+            } else {
+                self.start_engine_job(engine.clone(), wants_gcc);
             }
         }
     }
@@ -500,6 +750,29 @@ impl Desktop {
         ui.add_space(16.0);
         ui.heading("Video");
         ui.horizontal(|ui| {
+            ui.label("Watch execution");
+            ui.selectable_value(
+                &mut self.config.execution_mode,
+                crate::sono_gcc::WatchExecutionMode::Interpreter,
+                "Sono VM / Interpreter",
+            );
+            ui.selectable_value(
+                &mut self.config.execution_mode,
+                crate::sono_gcc::WatchExecutionMode::SonoGcc,
+                "Sono-GCC",
+            );
+        });
+        if self.config.execution_mode == crate::sono_gcc::WatchExecutionMode::SonoGcc {
+            ui.label("Sono-GCC compiles eligible scalar regions; other paths use Sono VM.");
+        }
+        ui.checkbox(
+            &mut self.config.parallel_watch_updates,
+            "Parallel Watch callback scheduling",
+        );
+        if !self.config.parallel_watch_updates {
+            ui.label("Uses ordered single-thread Watch execution for compatibility/debugging.");
+        }
+        ui.horizontal(|ui| {
             ui.label("Width");
             ui.add(egui::DragValue::new(&mut self.config.width).range(2..=8192));
             ui.label("Height");
@@ -541,7 +814,7 @@ impl Desktop {
     }
     fn options(&mut self, ui: &mut egui::Ui) {
         ui.heading("Engine options");
-        if self.option_job.is_some() {
+        if self.engine_job.is_some() && self.options.is_empty() {
             ui.spinner();
             ui.label("Reading engine metadata...");
         }
@@ -650,6 +923,200 @@ impl Desktop {
             self.config.level_options.len()
         ));
     }
+
+    fn gcc_status_ui(&mut self, ui: &mut egui::Ui) {
+        let gcc_enabled =
+            self.config.execution_mode == crate::sono_gcc::WatchExecutionMode::SonoGcc;
+        let (line, diagnostic, busy, failed) = if !gcc_enabled {
+            (
+                "Sono-GCC disabled; renders use Sono VM / Interpreter".to_owned(),
+                format!(
+                    "Engine: {}\nExecution mode: Sono VM / Interpreter\nBackground Sono-GCC compilation is disabled.",
+                    self.config.engine.display()
+                ),
+                false,
+                false,
+            )
+        } else if !self.config.engine.is_file() {
+            (
+                "Sono-GCC selected; choose a valid engine file".to_owned(),
+                format!(
+                    "Engine: {}\nStatus: engine path is empty or does not name a readable file.\nNo background compilation has started.",
+                    self.config.engine.display()
+                ),
+                false,
+                false,
+            )
+        } else {
+            match &self.gcc_status {
+                GccUiStatus::Disabled => (
+                    "Sono-GCC selected; waiting for engine Watch graph".to_owned(),
+                    format!(
+                        "Engine: {}\nExecution mode: Sono-GCC\nStatus: waiting for the exact Watch graph.",
+                        self.config.engine.display()
+                    ),
+                    false,
+                    false,
+                ),
+                GccUiStatus::Loading => (
+                    "Sono-GCC: loading engine and Watch graph".to_owned(),
+                    format!(
+                        "Engine: {}\nStatus: loading engine metadata and Watch graph. Rendering remains available through Sono VM.",
+                        self.config.engine.display()
+                    ),
+                    true,
+                    false,
+                ),
+                GccUiStatus::CheckingCache {
+                    graph_nodes,
+                    eligible_operations,
+                } => (
+                    format!(
+                        "Sono-GCC: checking exact-graph cache ({graph_nodes} graph nodes; {eligible_operations} eligible operation nodes)."
+                    ),
+                    format!(
+                        "Engine: {}\nStatus: checking process and persistent exact-graph caches\nWatch graph nodes: {graph_nodes}\nEligible operation nodes: {eligible_operations}\nA cache miss starts compilation in the background. Rendering during lookup or compilation remains available through Sono VM.",
+                        self.config.engine.display()
+                    ),
+                    true,
+                    false,
+                ),
+                GccUiStatus::Compiling {
+                    graph_nodes,
+                    eligible_operations,
+                } => (
+                    format!(
+                        "Sono-GCC: compiling eligible regions ({graph_nodes} graph nodes; {eligible_operations} eligible operation nodes). Rendering can continue with Sono VM."
+                    ),
+                    format!(
+                        "Engine: {}\nStatus: rustc compilation in progress\nWatch graph nodes: {graph_nodes}\nStatically eligible operation nodes: {eligible_operations}\nProgress detail: rustc does not expose reliable per-region progress, so no fabricated completed-region counter is shown.\nRender behavior: a render requested while this job is active uses automatic Sono VM fallback.",
+                        self.config.engine.display()
+                    ),
+                    true,
+                    false,
+                ),
+                GccUiStatus::Ready(report) => (
+                    format!(
+                        "Sono-GCC ready: {} regions, {} / {} eligible operation nodes compiled ({:?} cache).",
+                        report.compiled_regions,
+                        report.compiled_operations,
+                        report.eligible_operations,
+                        report.cache_hit
+                    ),
+                    gcc_report_details(&self.config.engine, report, "Ready"),
+                    false,
+                    false,
+                ),
+                GccUiStatus::Partial(report) => (
+                    format!(
+                        "Sono-GCC partial: {} / {} eligible operation nodes compiled; remaining paths use Sono VM.",
+                        report.compiled_operations, report.eligible_operations
+                    ),
+                    gcc_report_details(&self.config.engine, report, "Partial; VM fallback remains active"),
+                    false,
+                    false,
+                ),
+                GccUiStatus::Failed {
+                    graph_nodes,
+                    diagnostic,
+                } => (
+                    "Sono-GCC compilation unavailable; rendering will use Sono VM fallback".to_owned(),
+                    format!(
+                        "Engine: {}\nStatus: compilation failed; VM fallback remains active\nWatch graph nodes: {graph_nodes}\nCompiler/backend and runtime ABI: {:?}\nCache identity: unavailable if identity creation failed\nDiagnostic:\n{diagnostic}",
+                        self.config.engine.display(),
+                        crate::sono_gcc::compiler_identity()
+                    ),
+                    false,
+                    true,
+                ),
+            }
+        };
+        ui.horizontal(|ui| {
+            if busy {
+                ui.spinner();
+            }
+            ui.colored_label(
+                if failed {
+                    egui::Color32::LIGHT_RED
+                } else if busy {
+                    egui::Color32::YELLOW
+                } else {
+                    egui::Color32::LIGHT_BLUE
+                },
+                line,
+            );
+            if ui
+                .small_button(if self.show_gcc_details {
+                    "Hide details"
+                } else {
+                    "View details"
+                })
+                .clicked()
+            {
+                self.show_gcc_details = !self.show_gcc_details;
+            }
+            if ui.small_button("Copy details").clicked() {
+                ui.ctx().copy_text(diagnostic.clone());
+            }
+        });
+        if self.show_gcc_details {
+            egui::ScrollArea::vertical()
+                .max_height(120.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(diagnostic).monospace())
+                            .selectable(true)
+                            .wrap(),
+                    );
+                });
+        }
+    }
+}
+
+fn should_precompile(mode: crate::sono_gcc::WatchExecutionMode) -> bool {
+    mode == crate::sono_gcc::WatchExecutionMode::SonoGcc
+}
+
+fn gcc_engine_message_applies(
+    job_engine: &std::path::Path,
+    selected_engine: &std::path::Path,
+    mode: crate::sono_gcc::WatchExecutionMode,
+) -> bool {
+    job_engine == selected_engine && should_precompile(mode)
+}
+
+fn status_for_gcc_report(report: crate::sono_gcc::SonoGccPrecompileReport) -> GccUiStatus {
+    if report.compiled_operations < report.eligible_operations {
+        GccUiStatus::Partial(report)
+    } else {
+        GccUiStatus::Ready(report)
+    }
+}
+
+fn gcc_report_details(
+    engine: &std::path::Path,
+    report: &crate::sono_gcc::SonoGccPrecompileReport,
+    status: &str,
+) -> String {
+    format!(
+        "Engine: {}\nCompiler backend/runtime ABI: {:?}\nStatus: {status}\nExact graph/cache key: {}\nWatch graph nodes: {}\nCompiled regions: {}\nCompiled eligible operation nodes: {}\nEligible operation nodes: {}\nCache hit: {:?}\nTimings: lookup {:.3}s, compile {:.3}s, native load {:.3}s, cache write {:.3}s, graph identity {:.3}s, disk validation {:.3}s, metadata reconstruction {:.3}s\nCache persistence warning: {}\nFallback: unsupported and unsafe paths continue through Sono VM.",
+        engine.display(),
+        crate::sono_gcc::compiler_identity(),
+        report.cache_key,
+        report.graph_nodes,
+        report.compiled_regions,
+        report.compiled_operations,
+        report.eligible_operations,
+        report.cache_hit,
+        report.timings.cache_lookup.as_secs_f64(),
+        report.timings.compilation.as_secs_f64(),
+        report.timings.native_load.as_secs_f64(),
+        report.timings.cache_write.as_secs_f64(),
+        report.timings.graph_identity.as_secs_f64(),
+        report.timings.disk_validation.as_secs_f64(),
+        report.timings.metadata_reconstruction.as_secs_f64(),
+        report.cache_write_error.as_deref().unwrap_or("none")
+    )
 }
 fn option_label(text: &str) -> String {
     text.strip_prefix("##LOCALIZE:")
@@ -676,7 +1143,7 @@ impl eframe::App for Desktop {
         if self.close_pending && self.job.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if self.job.is_some() || self.option_job.is_some() {
+        if self.job.is_some() || self.engine_job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -737,6 +1204,7 @@ impl eframe::App for Desktop {
                 },
                 &self.summary,
             );
+            self.gcc_status_ui(ui);
             let live = self.live.lock().unwrap();
             if let Some(p) = &live.progress {
                 ui.horizontal(|ui| {
@@ -817,6 +1285,65 @@ mod tests {
             state.log(i.to_string());
         }
         assert_eq!(state.logs.len(), 200);
+    }
+    #[test]
+    fn background_gcc_only_starts_when_selected() {
+        assert!(!should_precompile(
+            crate::sono_gcc::WatchExecutionMode::Interpreter
+        ));
+        assert!(should_precompile(
+            crate::sono_gcc::WatchExecutionMode::SonoGcc
+        ));
+    }
+    #[test]
+    fn gui_export_defers_compile_to_background_warmup() {
+        let mut app = Desktop::default();
+        app.config.execution_mode = crate::sono_gcc::WatchExecutionMode::SonoGcc;
+        assert!(app.config.compile_sono_gcc_on_demand);
+        let export_config = Desktop::gui_export_config(&app.config);
+        assert!(!export_config.compile_sono_gcc_on_demand);
+    }
+    #[test]
+    fn engine_switch_and_vm_mode_discard_stale_gcc_progress() {
+        let engine_a = PathBuf::from("engine-a.zip");
+        let engine_b = PathBuf::from("engine-b.zip");
+        assert!(!gcc_engine_message_applies(
+            &engine_a,
+            &engine_b,
+            crate::sono_gcc::WatchExecutionMode::SonoGcc
+        ));
+        assert!(!gcc_engine_message_applies(
+            &engine_a,
+            &engine_a,
+            crate::sono_gcc::WatchExecutionMode::Interpreter
+        ));
+        assert!(gcc_engine_message_applies(
+            &engine_a,
+            &engine_a,
+            crate::sono_gcc::WatchExecutionMode::SonoGcc
+        ));
+    }
+    #[test]
+    fn precompile_report_distinguishes_partial_fallback_from_ready() {
+        let report =
+            |compiled_operations, eligible_operations| crate::sono_gcc::SonoGccPrecompileReport {
+                cache_key: "graph-key".into(),
+                cache_hit: crate::sono_gcc::CacheHit::None,
+                timings: crate::sono_gcc::CompileTimings::default(),
+                graph_nodes: 20,
+                compiled_regions: 4,
+                compiled_operations,
+                eligible_operations,
+                cache_write_error: None,
+            };
+        assert!(matches!(
+            status_for_gcc_report(report(8, 10)),
+            GccUiStatus::Partial(_)
+        ));
+        assert!(matches!(
+            status_for_gcc_report(report(10, 10)),
+            GccUiStatus::Ready(_)
+        ));
     }
     #[test]
     fn running_job_blocks_duplicate_start_and_reports_error_or_cancel() {

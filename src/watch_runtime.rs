@@ -7,12 +7,22 @@ use crate::{
         ParticleEffectEvent, ScheduledEffect, ScheduledLoopedEffect, ScheduledLoopedEffectStop,
         VmContext, WatchVm,
     },
+    sono_gcc::{SonoGccProgram, WatchExecutionMode},
     watch::{WatchArchetype, WatchData},
 };
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{self, Receiver, SyncSender},
+        Arc,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
 const ENTITY_MEMORY: i64 = 4000;
 const ENTITY_DATA: i64 = 4001;
@@ -29,6 +39,13 @@ const LEVEL_OPTION: i64 = 2002;
 const MIN_CALLBACK_EVALUATIONS: usize = 5_000_000;
 const EVALUATIONS_PER_LEVEL_ENTITY: usize = 4_096;
 const MAX_CALLBACK_EVALUATIONS: usize = 50_000_000;
+// The largest supplied active wave was 152 entities; classifying it to find
+// 107 safe callbacks still lost wall time. Skip scheduler analysis below 192.
+const MIN_PARALLEL_STAGE_ENTITIES: usize = 192;
+// A/B measurements on the supplied charts showed that batches up to 107
+// callbacks cost more to schedule than they saved. Keep these ordered unless
+// a contiguous batch exceeds the measured loss range.
+const MIN_PARALLEL_BATCH_CALLBACKS: usize = 128;
 
 fn callback_evaluation_limit(level_entity_count: usize) -> usize {
     MIN_CALLBACK_EVALUATIONS
@@ -36,7 +53,7 @@ fn callback_evaluation_limit(level_entity_count: usize) -> usize {
         .min(MAX_CALLBACK_EVALUATIONS)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LifecycleStage {
     Preprocess,
@@ -127,7 +144,33 @@ pub struct FrameRuntimeProfile {
     pub callbacks: u64,
     pub evaluations: u64,
     pub function_dispatches: u64,
+    pub sono_gcc_regions_executed: u64,
+    /// Scalar results evaluated by WatchVm and passed into native regions.
+    pub sono_gcc_vm_to_native_cut_calls: u64,
+    /// Regions that exceeded stack input storage and needed a heap buffer.
+    pub sono_gcc_overflow_input_regions: u64,
+    pub sono_gcc_region_dispatch: std::time::Duration,
+    pub sono_gcc_vm_cut_evaluation: std::time::Duration,
+    pub sono_gcc_native_execution: std::time::Duration,
     pub memory_entries_copied: u64,
+    /// UpdateParallel callbacks evaluated by the pool.
+    pub parallel_callbacks: u64,
+    /// Speculative callbacks discarded before ordered compatibility rerun.
+    pub parallel_speculative_callbacks: u64,
+    /// Callbacks rerun or kept on the ordered compatibility path.
+    pub parallel_ordered_callbacks: u64,
+    /// Batches dispatched to persistent Watch workers.
+    pub parallel_batches: u64,
+    /// Sum of worker counts used by dispatched batches.
+    pub parallel_worker_slots: u64,
+    /// Approximate active worker time summed across all workers.
+    pub parallel_worker_busy: std::time::Duration,
+    /// Worker slot time available across all dispatched batches.
+    pub parallel_worker_slot_time: std::time::Duration,
+    /// Coordinator time spent dispatching, waiting, and collecting batches.
+    pub parallel_batch_time: std::time::Duration,
+    /// Estimated dispatch/wait time after subtracting the longest worker span.
+    pub parallel_scheduler_wait: std::time::Duration,
     pub stepper_event_aggregation: std::time::Duration,
 }
 
@@ -150,7 +193,22 @@ impl FrameRuntimeProfile {
         self.callbacks += other.callbacks;
         self.evaluations += other.evaluations;
         self.function_dispatches += other.function_dispatches;
+        self.sono_gcc_regions_executed += other.sono_gcc_regions_executed;
+        self.sono_gcc_vm_to_native_cut_calls += other.sono_gcc_vm_to_native_cut_calls;
+        self.sono_gcc_overflow_input_regions += other.sono_gcc_overflow_input_regions;
+        self.sono_gcc_region_dispatch += other.sono_gcc_region_dispatch;
+        self.sono_gcc_vm_cut_evaluation += other.sono_gcc_vm_cut_evaluation;
+        self.sono_gcc_native_execution += other.sono_gcc_native_execution;
         self.memory_entries_copied += other.memory_entries_copied;
+        self.parallel_callbacks += other.parallel_callbacks;
+        self.parallel_speculative_callbacks += other.parallel_speculative_callbacks;
+        self.parallel_ordered_callbacks += other.parallel_ordered_callbacks;
+        self.parallel_batches += other.parallel_batches;
+        self.parallel_worker_slots += other.parallel_worker_slots;
+        self.parallel_worker_busy += other.parallel_worker_busy;
+        self.parallel_worker_slot_time += other.parallel_worker_slot_time;
+        self.parallel_batch_time += other.parallel_batch_time;
+        self.parallel_scheduler_wait += other.parallel_scheduler_wait;
         self.stepper_event_aggregation += other.stepper_event_aggregation;
     }
 }
@@ -160,6 +218,270 @@ pub struct WatchDiagnosticTarget {
     pub entity_id: usize,
     pub stage: LifecycleStage,
     pub event_capacity: usize,
+}
+
+#[derive(Clone)]
+struct ParallelCallbackTask {
+    active_index: usize,
+    entity_id: usize,
+    archetype_name: String,
+    node: usize,
+    has_entity_data: bool,
+    has_shared_memory: bool,
+    entity_memory: Memory,
+    entity_info: Option<[f64; 3]>,
+}
+
+struct ParallelCallbackBatch {
+    nodes: Arc<Vec<crate::watch::EngineNode>>,
+    tasks: Vec<ParallelCallbackTask>,
+    global_memory: Memory,
+    context: VmContext,
+    stage: LifecycleStage,
+    profiling: bool,
+    collect_vm_accounting: bool,
+    level_entity_count: usize,
+    sono_gcc_program: Option<Arc<SonoGccProgram>>,
+    export_control: crate::export_control::ExportControl,
+    next_task: AtomicUsize,
+    stop_after: AtomicUsize,
+}
+
+struct ParallelCallbackResult {
+    task_index: usize,
+    task: ParallelCallbackTask,
+    output: crate::runtime::WatchVmCallbackOutput,
+    vm_construction: Duration,
+    context_setup: Duration,
+    memory_setup: Duration,
+    execution: Duration,
+}
+
+struct ParallelWorkerResult {
+    worker_index: usize,
+    callbacks: Vec<ParallelCallbackResult>,
+    busy: Duration,
+}
+
+enum ParallelWorkerMessage {
+    Run(
+        Arc<ParallelCallbackBatch>,
+        mpsc::Sender<ParallelWorkerResult>,
+    ),
+    Shutdown,
+}
+
+struct ParallelWorker {
+    sender: SyncSender<ParallelWorkerMessage>,
+    handle: Option<JoinHandle<()>>,
+}
+
+struct ParallelWorkerPool {
+    workers: Vec<ParallelWorker>,
+}
+
+impl ParallelWorkerPool {
+    fn new(count: usize) -> Result<Self> {
+        let mut workers: Vec<ParallelWorker> = Vec::with_capacity(count);
+        for worker_index in 0..count {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let handle = match thread::Builder::new()
+                .name(format!("sono-watch-{worker_index}"))
+                .spawn(move || parallel_worker_loop(worker_index, receiver))
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    for worker in &workers {
+                        let _ = worker.sender.send(ParallelWorkerMessage::Shutdown);
+                    }
+                    for worker in &mut workers {
+                        if let Some(handle) = worker.handle.take() {
+                            let _ = handle.join();
+                        }
+                    }
+                    return Err(error.into());
+                }
+            };
+            workers.push(ParallelWorker {
+                sender,
+                handle: Some(handle),
+            });
+        }
+        Ok(Self { workers })
+    }
+
+    fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    fn run(
+        &self,
+        batch: Arc<ParallelCallbackBatch>,
+        active_workers: usize,
+    ) -> Result<(Vec<ParallelCallbackResult>, Duration, Duration, Duration)> {
+        let wall_start = std::time::Instant::now();
+        let (sender, receiver) = mpsc::channel();
+        for (worker_index, worker) in self.workers.iter().take(active_workers).enumerate() {
+            worker
+                .sender
+                .send(ParallelWorkerMessage::Run(batch.clone(), sender.clone()))
+                .with_context(|| format!("sending Watch work to worker {worker_index}"))?;
+        }
+        drop(sender);
+        let mut results = Vec::new();
+        let mut worker_busy = Duration::ZERO;
+        let mut longest_worker = Duration::ZERO;
+        let mut worker_ids = BTreeSet::new();
+        let mut responses = 0;
+        for response in receiver {
+            responses += 1;
+            if !worker_ids.insert(response.worker_index) {
+                bail!(
+                    "Watch worker {} returned twice for one batch",
+                    response.worker_index
+                );
+            }
+            worker_busy += response.busy;
+            longest_worker = longest_worker.max(response.busy);
+            results.extend(response.callbacks);
+        }
+        if responses != active_workers {
+            bail!("Watch worker pool returned {responses} of {active_workers} batch results");
+        }
+        results.sort_by_key(|result| result.task_index);
+        let wall = wall_start.elapsed();
+        Ok((
+            results,
+            worker_busy,
+            wall,
+            wall.saturating_sub(longest_worker),
+        ))
+    }
+}
+
+impl Drop for ParallelWorkerPool {
+    fn drop(&mut self) {
+        for worker in &self.workers {
+            let _ = worker.sender.send(ParallelWorkerMessage::Shutdown);
+        }
+        for worker in &mut self.workers {
+            if let Some(handle) = worker.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+fn parallel_worker_loop(worker_index: usize, receiver: Receiver<ParallelWorkerMessage>) {
+    while let Ok(message) = receiver.recv() {
+        let ParallelWorkerMessage::Run(batch, sender) = message else {
+            break;
+        };
+        let busy_start = std::time::Instant::now();
+        let mut callbacks = Vec::new();
+        loop {
+            if batch.export_control.is_cancelled() {
+                break;
+            }
+            let task_index = batch.next_task.fetch_add(1, Ordering::Relaxed);
+            if task_index >= batch.tasks.len()
+                || task_index > batch.stop_after.load(Ordering::Acquire)
+            {
+                break;
+            }
+            let task = batch.tasks[task_index].clone();
+            let result = execute_parallel_callback(&batch, task_index, task);
+            let unexpected_shared_write = result.output.result.is_ok()
+                && result.output.memory.differs_outside_overlay(
+                    &result.task.entity_memory,
+                    &[ENTITY_MEMORY, TEMPORARY_MEMORY],
+                );
+            if result.output.result.is_err() || unexpected_shared_write {
+                batch.stop_after.fetch_min(task_index, Ordering::AcqRel);
+            }
+            callbacks.push(result);
+        }
+        let busy = busy_start.elapsed();
+        if sender
+            .send(ParallelWorkerResult {
+                worker_index,
+                callbacks,
+                busy,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn execute_parallel_callback(
+    batch: &ParallelCallbackBatch,
+    task_index: usize,
+    task: ParallelCallbackTask,
+) -> ParallelCallbackResult {
+    let phase_start = batch.profiling.then(std::time::Instant::now);
+    let mut vm = WatchVm::new(batch.nodes.as_slice());
+    vm.set_profiling(batch.profiling);
+    vm.set_accounting(batch.collect_vm_accounting);
+    vm.set_sono_gcc_program(batch.sono_gcc_program.clone());
+    if let Some(start) = phase_start {
+        let vm_construction = start.elapsed();
+        let context_start = batch.profiling.then(std::time::Instant::now);
+        vm.set_evaluation_limit(callback_evaluation_limit(batch.level_entity_count));
+        vm.context = batch.context.clone();
+        vm.context.entity_data_array_writable = false;
+        vm.context.lifecycle_stage = Some(batch.stage as u8);
+        vm.context.entity_id = Some(task.entity_id);
+        vm.context.entity_archetype = Some(task.archetype_name.clone());
+        vm.context.callback_name = Some(format!("{:?}", batch.stage));
+        vm.context.callback_node = Some(task.node);
+        vm.context.has_entity_data = task.has_entity_data;
+        vm.context.has_entity_shared_memory = task.has_shared_memory;
+        vm.context.entity_info = task.entity_info;
+        let context_setup = context_start.map_or(Duration::ZERO, |start| start.elapsed());
+        let memory_start = batch.profiling.then(std::time::Instant::now);
+        vm.memory = Memory::callback_view(&batch.global_memory, &task.entity_memory);
+        vm.memory.retain_other_than(TEMPORARY_MEMORY);
+        let memory_setup = memory_start.map_or(Duration::ZERO, |start| start.elapsed());
+        let execute_start = batch.profiling.then(std::time::Instant::now);
+        let execution = vm.execute(task.node);
+        let execution_time = execute_start.map_or(Duration::ZERO, |start| start.elapsed());
+        let output = vm.into_callback_output(execution);
+        ParallelCallbackResult {
+            task_index,
+            task,
+            output,
+            vm_construction,
+            context_setup,
+            memory_setup,
+            execution: execution_time,
+        }
+    } else {
+        vm.set_evaluation_limit(callback_evaluation_limit(batch.level_entity_count));
+        vm.context = batch.context.clone();
+        vm.context.entity_data_array_writable = false;
+        vm.context.lifecycle_stage = Some(batch.stage as u8);
+        vm.context.entity_id = Some(task.entity_id);
+        vm.context.entity_archetype = Some(task.archetype_name.clone());
+        vm.context.callback_name = Some(format!("{:?}", batch.stage));
+        vm.context.callback_node = Some(task.node);
+        vm.context.has_entity_data = task.has_entity_data;
+        vm.context.has_entity_shared_memory = task.has_shared_memory;
+        vm.context.entity_info = task.entity_info;
+        vm.memory = Memory::callback_view(&batch.global_memory, &task.entity_memory);
+        vm.memory.retain_other_than(TEMPORARY_MEMORY);
+        let execution = vm.execute(task.node);
+        ParallelCallbackResult {
+            task_index,
+            task,
+            output: vm.into_callback_output(execution),
+            vm_construction: Duration::ZERO,
+            context_setup: Duration::ZERO,
+            memory_setup: Duration::ZERO,
+            execution: Duration::ZERO,
+        }
+    }
 }
 
 /// Watch host. Level entities are kept in source order; callback `order` only
@@ -193,12 +515,180 @@ pub struct WatchRuntime<'a> {
     trace_draws: bool,
     profiling: bool,
     collect_vm_accounting: bool,
+    execution_mode: WatchExecutionMode,
+    parallel_updates_enabled: bool,
+    parallel_worker_count: Option<usize>,
+    parallel_workers: Option<ParallelWorkerPool>,
+    ordered_parallel_callbacks: BTreeMap<(LifecycleStage, usize), bool>,
+    sono_gcc_program: Option<Arc<SonoGccProgram>>,
+    sono_gcc_compile_error: Option<String>,
+    sono_gcc_precompile_deferred: bool,
+    sono_gcc_compile_time: Duration,
+    sono_gcc_native_load_time: Duration,
+    sono_gcc_cache_lookup_time: Duration,
+    sono_gcc_graph_identity_time: Duration,
+    sono_gcc_disk_validation_time: Duration,
+    sono_gcc_metadata_reconstruction_time: Duration,
+    sono_gcc_cache_write_time: Duration,
+    sono_gcc_cache_key: Option<String>,
+    sono_gcc_cache_hit: crate::sono_gcc::CacheHit,
+    sono_gcc_cache_write_error: Option<String>,
+    sono_gcc_graph_nodes: usize,
+    sono_gcc_compiled_operations: u64,
+    sono_gcc_eligible_operations: u64,
+    sono_gcc_execution_reported: bool,
     frame_profile: FrameRuntimeProfile,
 }
 
 impl<'a> WatchRuntime<'a> {
     pub(crate) fn set_export_control(&mut self, control: crate::export_control::ExportControl) {
         self.export_control = control;
+        if self.execution_mode == WatchExecutionMode::SonoGcc {
+            self.export_control.log(self.execution_mode_status());
+        }
+    }
+
+    pub fn set_execution_mode(&mut self, mode: WatchExecutionMode) {
+        self.set_execution_mode_with_compile_policy(mode, true);
+    }
+
+    /// Configure UpdateParallel execution. `worker_count = None` uses the
+    /// machine's available parallelism. Disabling it keeps the legacy ordered
+    /// callback path and never creates a worker pool.
+    pub fn set_parallel_updates(
+        &mut self,
+        enabled: bool,
+        worker_count: Option<usize>,
+    ) -> Result<()> {
+        if worker_count.is_some_and(|count| !(1..=256).contains(&count)) {
+            bail!("Watch worker count must be in 1..=256");
+        }
+        if self.parallel_updates_enabled != enabled || self.parallel_worker_count != worker_count {
+            self.parallel_workers = None;
+        }
+        self.parallel_updates_enabled = enabled;
+        self.parallel_worker_count = worker_count;
+        Ok(())
+    }
+
+    pub fn parallel_updates_status(&self) -> String {
+        if !self.parallel_updates_enabled {
+            "ordered single-threaded Watch execution selected".to_owned()
+        } else {
+            let workers = self.parallel_worker_count.map_or_else(
+                || "automatic worker count".to_owned(),
+                |count| format!("{count} Watch workers"),
+            );
+            format!("parallel Watch UpdateParallel enabled ({workers})")
+        }
+    }
+
+    pub(crate) fn set_execution_mode_with_compile_policy(
+        &mut self,
+        mode: WatchExecutionMode,
+        compile_on_demand: bool,
+    ) {
+        if self.execution_mode == mode
+            && (mode == WatchExecutionMode::Interpreter
+                || self.sono_gcc_program.is_some()
+                || !compile_on_demand && !self.sono_gcc_precompile_deferred)
+        {
+            return;
+        }
+        self.execution_mode = mode;
+        self.sono_gcc_program = None;
+        self.sono_gcc_compile_error = None;
+        self.sono_gcc_precompile_deferred = false;
+        self.sono_gcc_compile_time = Duration::ZERO;
+        self.sono_gcc_native_load_time = Duration::ZERO;
+        self.sono_gcc_cache_lookup_time = Duration::ZERO;
+        self.sono_gcc_graph_identity_time = Duration::ZERO;
+        self.sono_gcc_disk_validation_time = Duration::ZERO;
+        self.sono_gcc_metadata_reconstruction_time = Duration::ZERO;
+        self.sono_gcc_cache_write_time = Duration::ZERO;
+        self.sono_gcc_cache_key = None;
+        self.sono_gcc_cache_hit = crate::sono_gcc::CacheHit::None;
+        self.sono_gcc_cache_write_error = None;
+        self.sono_gcc_graph_nodes = 0;
+        self.sono_gcc_compiled_operations = 0;
+        self.sono_gcc_eligible_operations = 0;
+        if mode == WatchExecutionMode::SonoGcc {
+            if self.context.execution_trace.is_some() || self.trace_draws {
+                self.sono_gcc_compile_error = Some(
+                    "Watch tracing requires interpreter execution to preserve node diagnostics"
+                        .to_owned(),
+                );
+            } else {
+                let result = if compile_on_demand {
+                    SonoGccProgram::compile_cached_detailed(&self.watch.nodes)
+                } else {
+                    let cached = SonoGccProgram::compile_if_process_cached(&self.watch.nodes);
+                    self.sono_gcc_precompile_deferred = cached.as_ref().is_ok_and(Option::is_none);
+                    cached.and_then(|cached| {
+                        cached.ok_or_else(|| {
+                            anyhow!("background precompilation has not loaded this graph yet")
+                        })
+                    })
+                };
+                match result {
+                    Ok(result) => {
+                        self.sono_gcc_compile_time = result.timings.compilation;
+                        self.sono_gcc_native_load_time = result.timings.native_load;
+                        self.sono_gcc_cache_lookup_time = result.timings.cache_lookup;
+                        self.sono_gcc_graph_identity_time = result.timings.graph_identity;
+                        self.sono_gcc_disk_validation_time = result.timings.disk_validation;
+                        self.sono_gcc_metadata_reconstruction_time =
+                            result.timings.metadata_reconstruction;
+                        self.sono_gcc_cache_write_time = result.timings.cache_write;
+                        self.sono_gcc_cache_key = Some(result.cache_key);
+                        self.sono_gcc_cache_hit = result.cache_hit;
+                        self.sono_gcc_cache_write_error = result.cache_write_error;
+                        self.sono_gcc_graph_nodes = result.graph_nodes;
+                        self.sono_gcc_compiled_operations = result.compiled_operations;
+                        self.sono_gcc_eligible_operations = result.eligible_operations;
+                        self.sono_gcc_program = Some(result.program);
+                    }
+                    Err(error) => self.sono_gcc_compile_error = Some(format!("{error:#}")),
+                }
+            }
+            self.export_control.log(self.execution_mode_status());
+        }
+    }
+
+    pub fn execution_mode_status(&self) -> String {
+        match self.execution_mode {
+            WatchExecutionMode::Interpreter => "Sono VM / interpreter selected".to_owned(),
+            WatchExecutionMode::SonoGcc => match (&self.sono_gcc_program, &self.sono_gcc_compile_error) {
+                (Some(program), _) => format!(
+                    "Sono-GCC ready ({}): {} regions, {} / {} eligible native operation nodes across {} graph nodes; compile {:.3}s, cache lookup {:.3}s, DLL load {:.3}s, cache write {:.3}s, graph identity {:.3}s, disk validation {:.3}s, metadata reconstruction {:.3}s; WatchVm executes ordered scalar cuts and retains runtime/effect semantics; other graph paths use Sono VM{} (cache key {})",
+                    match self.sono_gcc_cache_hit {
+                        crate::sono_gcc::CacheHit::None => "compiled".to_owned(),
+                        crate::sono_gcc::CacheHit::Process => "process cache hit".to_owned(),
+                        crate::sono_gcc::CacheHit::Persistent => "persistent cache hit".to_owned(),
+                    },
+                    program.region_count(),
+                    self.sono_gcc_compiled_operations,
+                    self.sono_gcc_eligible_operations,
+                    self.sono_gcc_graph_nodes,
+                    self.sono_gcc_compile_time.as_secs_f64(),
+                    self.sono_gcc_cache_lookup_time.as_secs_f64(),
+                    self.sono_gcc_native_load_time.as_secs_f64(),
+                    self.sono_gcc_cache_write_time.as_secs_f64(),
+                    self.sono_gcc_graph_identity_time.as_secs_f64(),
+                    self.sono_gcc_disk_validation_time.as_secs_f64(),
+                    self.sono_gcc_metadata_reconstruction_time.as_secs_f64(),
+                    self.sono_gcc_cache_write_error.as_ref().map_or_else(String::new, |error| format!("; cache persistence unavailable: {error}")),
+                    self.sono_gcc_cache_key.as_deref().unwrap_or("unknown")
+                ),
+                (_, Some(error)) if self.sono_gcc_precompile_deferred => format!(
+                    "Sono-GCC precompile pending; using Sono VM for this render: {error}"
+                ),
+                (_, Some(error)) => {
+                    format!("Sono-GCC unavailable; falling back to Sono VM: {error}")
+                }
+                _ => "Sono-GCC selected; native compilation has not completed; using Sono VM".to_owned(),
+            },
+        }
     }
     pub fn new(watch: &'a WatchData, level: &LevelData) -> Result<Self> {
         let mut archetype_defs = watch.archetypes.clone();
@@ -277,6 +767,28 @@ impl<'a> WatchRuntime<'a> {
             trace_draws: false,
             profiling: false,
             collect_vm_accounting: true,
+            execution_mode: WatchExecutionMode::Interpreter,
+            parallel_updates_enabled: true,
+            parallel_worker_count: None,
+            parallel_workers: None,
+            ordered_parallel_callbacks: BTreeMap::new(),
+            sono_gcc_program: None,
+            sono_gcc_compile_error: None,
+            sono_gcc_precompile_deferred: false,
+            sono_gcc_compile_time: Duration::ZERO,
+            sono_gcc_native_load_time: Duration::ZERO,
+            sono_gcc_cache_lookup_time: Duration::ZERO,
+            sono_gcc_graph_identity_time: Duration::ZERO,
+            sono_gcc_disk_validation_time: Duration::ZERO,
+            sono_gcc_metadata_reconstruction_time: Duration::ZERO,
+            sono_gcc_cache_write_time: Duration::ZERO,
+            sono_gcc_cache_key: None,
+            sono_gcc_cache_hit: crate::sono_gcc::CacheHit::None,
+            sono_gcc_cache_write_error: None,
+            sono_gcc_graph_nodes: 0,
+            sono_gcc_compiled_operations: 0,
+            sono_gcc_eligible_operations: 0,
+            sono_gcc_execution_reported: false,
             frame_profile: FrameRuntimeProfile::default(),
         };
         for index in 0..16 {
@@ -445,11 +957,8 @@ impl<'a> WatchRuntime<'a> {
                 bail!("diagnostic event capacity must be in 1..=4096");
             }
             if let Some(entity) = self.entities.get(target.entity_id) {
-                if callback(
-                    self.archetype_defs[entity.archetype_index].clone(),
-                    target.stage,
-                )
-                .is_none()
+                if callback_ref(&self.archetype_defs[entity.archetype_index], target.stage)
+                    .is_none()
                 {
                     bail!(
                         "diagnostic entity {} has no {:?} callback",
@@ -654,10 +1163,18 @@ impl<'a> WatchRuntime<'a> {
         }
         let mut order: Vec<usize> = (0..self.entities.len()).collect();
         order.sort_by_key(|&id| {
-            callback_order(&self.archetype_defs[self.entities[id].archetype_index].preprocess)
+            callback_order(
+                self.archetype_defs[self.entities[id].archetype_index]
+                    .preprocess
+                    .as_ref(),
+            )
         });
-        for id in order {
-            self.invoke_entity(id, LifecycleStage::Preprocess)?;
+        if self.parallel_scheduling_available() {
+            self.run_parallel_entity_stage(&order, LifecycleStage::Preprocess)?;
+        } else {
+            for id in order {
+                self.invoke_entity(id, LifecycleStage::Preprocess)?;
+            }
         }
         for entity in &mut self.entities {
             if !entity.has_entity_data {
@@ -784,9 +1301,16 @@ impl<'a> WatchRuntime<'a> {
             self.set_entity_info_active(*id, true);
         }
         self.pending.retain(|id| !entering.contains(id));
-        for id in entering {
-            self.invoke_entity(id, LifecycleStage::Initialize)?;
-            self.entities[id].initialized = true;
+        if self.parallel_scheduling_available() {
+            self.run_parallel_entity_stage(&entering, LifecycleStage::Initialize)?;
+            for id in entering {
+                self.entities[id].initialized = true;
+            }
+        } else {
+            for id in entering {
+                self.invoke_entity(id, LifecycleStage::Initialize)?;
+                self.entities[id].initialized = true;
+            }
         }
         if let Some(start) = phase_start {
             self.frame_profile.activation += start.elapsed();
@@ -852,6 +1376,13 @@ impl<'a> WatchRuntime<'a> {
             report.runtime_profile.frame += start.elapsed();
             report.runtime_profile.frame_count = 1;
         }
+        if self.execution_mode == WatchExecutionMode::SonoGcc && !self.sono_gcc_execution_reported {
+            self.export_control.log(format!(
+                "Sono-GCC first-frame execution: {} compiled scalar regions ran; all other paths stayed on Sono VM",
+                report.runtime_profile.sono_gcc_regions_executed
+            ));
+            self.sono_gcc_execution_reported = true;
+        }
         Ok(report)
     }
 
@@ -864,7 +1395,11 @@ impl<'a> WatchRuntime<'a> {
             .collect();
         let mut spawn_order = unscheduled.clone();
         spawn_order.sort_by_key(|&id| {
-            callback_order(&self.archetype_defs[self.entities[id].archetype_index].spawn_time)
+            callback_order(
+                self.archetype_defs[self.entities[id].archetype_index]
+                    .spawn_time
+                    .as_ref(),
+            )
         });
         let mut spawn_times = BTreeMap::new();
         for id in spawn_order {
@@ -876,7 +1411,11 @@ impl<'a> WatchRuntime<'a> {
 
         let mut despawn_order = unscheduled.clone();
         despawn_order.sort_by_key(|&id| {
-            callback_order(&self.archetype_defs[self.entities[id].archetype_index].despawn_time)
+            callback_order(
+                self.archetype_defs[self.entities[id].archetype_index]
+                    .despawn_time
+                    .as_ref(),
+            )
         });
         let mut despawn_times = BTreeMap::new();
         for id in despawn_order {
@@ -905,15 +1444,448 @@ impl<'a> WatchRuntime<'a> {
             .map(|entity| entity.id)
             .collect();
         active.sort_by_key(|&id| {
-            callback_order(&callback(
-                self.archetype_defs[self.entities[id].archetype_index].clone(),
+            callback_order(callback_ref(
+                &self.archetype_defs[self.entities[id].archetype_index],
                 stage,
             ))
         });
+        if stage != LifecycleStage::UpdateSequential && self.parallel_scheduling_available() {
+            return self.run_parallel_entity_stage(&active, stage);
+        }
         for id in active {
             self.invoke_entity(id, stage)?;
         }
         Ok(())
+    }
+
+    fn parallel_worker_limit(&self) -> usize {
+        self.parallel_worker_count.unwrap_or_else(|| {
+            thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+        })
+    }
+
+    fn parallel_scheduling_available(&self) -> bool {
+        self.parallel_updates_enabled
+            && self.parallel_worker_limit() > 1
+            && self.context.execution_trace.is_none()
+            && !self.trace_draws
+            && self.diagnostic_target.is_none()
+    }
+
+    fn entity_callback_node(&self, id: usize, stage: LifecycleStage) -> Result<Option<usize>> {
+        let entity = self.entities.get(id).context("entity id out of range")?;
+        let archetype = self
+            .archetype_defs
+            .get(entity.archetype_index)
+            .context("entity archetype index out of range")?;
+        let Some(callback) = callback_ref(archetype, stage) else {
+            return Ok(None);
+        };
+        callback_index(callback)
+            .with_context(|| format!("invalid {stage:?} callback for {}", archetype.name))
+            .map(Some)
+    }
+
+    /// Reject callbacks with shared host state that cannot be isolated safely.
+    /// Preprocess additionally permits only per-entity row access; direct array
+    /// access and indirect block addresses remain ordered because they may
+    /// observe another callback's writes.
+    fn callback_requires_ordered_parallel_execution(
+        &mut self,
+        root: usize,
+        stage: LifecycleStage,
+    ) -> bool {
+        if let Some(&requires_order) = self.ordered_parallel_callbacks.get(&(stage, root)) {
+            return requires_order;
+        }
+        const ORDERED_FUNCTIONS: &[&str] = &[
+            "PlayLooped",
+            "PlayLoopedScheduled",
+            "SpawnParticleEffect",
+            "MoveParticleEffect",
+            "DestroyParticleEffect",
+        ];
+        let mut pending = vec![root];
+        let mut seen = BTreeSet::new();
+        let mut requires_order = false;
+        while let Some(node_index) = pending.pop() {
+            if !seen.insert(node_index) {
+                continue;
+            }
+            let Some(node) = self.watch.nodes.get(node_index) else {
+                requires_order = true;
+                break;
+            };
+            if node
+                .func
+                .as_deref()
+                .is_some_and(|name| ORDERED_FUNCTIONS.contains(&name))
+            {
+                requires_order = true;
+                break;
+            }
+            if stage == LifecycleStage::Preprocess
+                && self.preprocess_node_requires_ordered_execution(node)
+            {
+                requires_order = true;
+                break;
+            }
+            for argument in &node.args {
+                match argument.as_u64() {
+                    Some(child) => pending.push(child as usize),
+                    None => {
+                        requires_order = true;
+                        break;
+                    }
+                }
+            }
+            if requires_order {
+                break;
+            }
+        }
+        self.ordered_parallel_callbacks
+            .insert((stage, root), requires_order);
+        requires_order
+    }
+
+    fn preprocess_node_requires_ordered_execution(&self, node: &crate::watch::EngineNode) -> bool {
+        let Some(name) = node.func.as_deref() else {
+            return false;
+        };
+        let reads_address = matches!(name, "Get" | "GetShifted" | "GetPointed");
+        let writes_address = matches!(
+            name,
+            "Set"
+                | "SetAdd"
+                | "SetSubtract"
+                | "SetMultiply"
+                | "SetDivide"
+                | "SetMod"
+                | "SetRem"
+                | "SetPower"
+                | "SetShifted"
+                | "SetAddShifted"
+                | "SetSubtractShifted"
+                | "SetMultiplyShifted"
+                | "SetDivideShifted"
+                | "SetModShifted"
+                | "SetRemShifted"
+                | "SetPowerShifted"
+                | "IncrementPre"
+                | "IncrementPost"
+                | "DecrementPre"
+                | "DecrementPost"
+                | "IncrementPreShifted"
+                | "IncrementPostShifted"
+                | "DecrementPreShifted"
+                | "DecrementPostShifted"
+        );
+        if matches!(name, "GetPointed") || name.ends_with("Pointed") || name == "Copy" {
+            return true;
+        }
+        if !reads_address && !writes_address {
+            return false;
+        }
+        let Some(block_node) = node
+            .args
+            .first()
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|index| self.watch.nodes.get(index as usize))
+        else {
+            return true;
+        };
+        let Some(block_value) = block_node
+            .value
+            .as_ref()
+            .and_then(serde_json::Value::as_f64)
+        else {
+            return true;
+        };
+        let Some(block) = block_value
+            .is_finite()
+            .then_some(block_value)
+            .filter(|value| value.fract() == 0.0)
+            .map(|value| value as i64)
+        else {
+            return true;
+        };
+        if reads_address {
+            matches!(block, 4101 | 4102)
+        } else {
+            matches!(block, 1004 | 4001 | 4002 | 4101 | 4102)
+        }
+    }
+
+    fn run_parallel_entity_stage(&mut self, active: &[usize], stage: LifecycleStage) -> Result<()> {
+        if active.len() < MIN_PARALLEL_STAGE_ENTITIES {
+            for &id in active {
+                self.invoke_entity(id, stage)?;
+            }
+            return Ok(());
+        }
+        let mut position = 0;
+        while position < active.len() {
+            let mut tasks = Vec::new();
+            while position < active.len() {
+                let id = active[position];
+                let Some(node) = self.entity_callback_node(id, stage)? else {
+                    if stage == LifecycleStage::Initialize {
+                        self.entities[id].initialized = true;
+                    }
+                    position += 1;
+                    break;
+                };
+                if self.callback_requires_ordered_parallel_execution(node, stage) {
+                    if tasks.is_empty() {
+                        if self.profiling {
+                            self.frame_profile.parallel_ordered_callbacks += 1;
+                        }
+                        self.invoke_entity(id, stage)?;
+                        position += 1;
+                    }
+                    break;
+                }
+                let entity = &self.entities[id];
+                tasks.push(ParallelCallbackTask {
+                    active_index: position,
+                    entity_id: id,
+                    archetype_name: entity.archetype.clone(),
+                    node,
+                    has_entity_data: entity.has_entity_data,
+                    has_shared_memory: entity.has_shared_memory,
+                    entity_memory: entity.memory.clone(),
+                    entity_info: (!entity.spawned).then_some([
+                        id as f64,
+                        entity.archetype_index as f64,
+                        if entity.active { 1.0 } else { 0.0 },
+                    ]),
+                });
+                position += 1;
+            }
+
+            if tasks.is_empty() {
+                continue;
+            }
+            if tasks.len() == 1 {
+                if self.profiling {
+                    self.frame_profile.parallel_ordered_callbacks += 1;
+                }
+                self.invoke_entity(tasks[0].entity_id, stage)?;
+                continue;
+            }
+            if tasks.len() < MIN_PARALLEL_BATCH_CALLBACKS {
+                if self.profiling {
+                    self.frame_profile.parallel_ordered_callbacks += tasks.len() as u64;
+                }
+                for task in tasks {
+                    self.invoke_entity(task.entity_id, stage)?;
+                }
+                continue;
+            }
+            if self.execute_parallel_callback_batch(tasks, active, stage)? {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one contiguous pure callback range concurrently, then commit in
+    /// source order. Returns true when a dynamic shared-memory write requires
+    /// the remainder of the stage to use the ordered compatibility executor.
+    fn execute_parallel_callback_batch(
+        &mut self,
+        tasks: Vec<ParallelCallbackTask>,
+        active: &[usize],
+        stage: LifecycleStage,
+    ) -> Result<bool> {
+        let requested_workers = self.parallel_worker_limit();
+        let target_workers = tasks.len().min(requested_workers);
+        if self
+            .parallel_workers
+            .as_ref()
+            .is_none_or(|pool| pool.worker_count() < target_workers)
+        {
+            self.parallel_workers = None;
+            self.parallel_workers = Some(
+                ParallelWorkerPool::new(target_workers)
+                    .context("starting persistent Watch worker pool")?,
+            );
+        }
+        let active_workers = tasks.len().min(
+            self.parallel_workers
+                .as_ref()
+                .map(ParallelWorkerPool::worker_count)
+                .unwrap_or(0),
+        );
+        if active_workers <= 1 {
+            for task in tasks {
+                if self.profiling {
+                    self.frame_profile.parallel_ordered_callbacks += 1;
+                }
+                self.invoke_entity(task.entity_id, stage)?;
+            }
+            return Ok(false);
+        }
+
+        let batch = Arc::new(ParallelCallbackBatch {
+            nodes: self.watch.nodes.clone(),
+            tasks,
+            global_memory: self.global_memory.clone(),
+            context: self.context.clone(),
+            stage,
+            profiling: self.profiling,
+            collect_vm_accounting: self.collect_vm_accounting,
+            level_entity_count: self.level_entity_count,
+            sono_gcc_program: self.sono_gcc_program.clone(),
+            export_control: self.export_control.clone(),
+            next_task: AtomicUsize::new(0),
+            stop_after: AtomicUsize::new(usize::MAX),
+        });
+        let (mut results, worker_busy, batch_wall, scheduler_wait) = self
+            .parallel_workers
+            .as_ref()
+            .context("Watch worker pool disappeared")?
+            .run(batch.clone(), active_workers)?;
+        if self.profiling {
+            self.frame_profile.parallel_batches += 1;
+            self.frame_profile.parallel_worker_slots += active_workers as u64;
+            self.frame_profile.parallel_worker_busy += worker_busy;
+            self.frame_profile.parallel_worker_slot_time +=
+                batch_wall.saturating_mul(active_workers as u32);
+            self.frame_profile.parallel_batch_time += batch_wall;
+            self.frame_profile.parallel_scheduler_wait += scheduler_wait;
+        }
+        self.export_control.check()?;
+
+        for result in results.drain(..) {
+            let task_index = result.task_index;
+            let task = &batch.tasks[task_index];
+            let unexpected_global_write = result.output.result.is_ok()
+                && result.output.memory.differs_outside_overlay(
+                    &task.entity_memory,
+                    &[ENTITY_MEMORY, TEMPORARY_MEMORY],
+                );
+            if unexpected_global_write {
+                self.accumulate_parallel_callback_profile(&result, true);
+                let active_index = result.task.active_index;
+                if self.profiling {
+                    self.frame_profile.parallel_ordered_callbacks +=
+                        (active.len() - active_index) as u64;
+                }
+                self.invoke_entity(result.task.entity_id, stage)?;
+                for &id in &active[active_index + 1..] {
+                    self.invoke_entity(id, stage)?;
+                }
+                return Ok(true);
+            }
+            self.commit_parallel_callback(result, stage)?;
+        }
+        Ok(false)
+    }
+
+    fn accumulate_parallel_callback_profile(
+        &mut self,
+        callback: &ParallelCallbackResult,
+        speculative: bool,
+    ) {
+        let output = &callback.output;
+        self.frame_profile.sono_gcc_regions_executed += output.sono_gcc_regions_executed;
+        self.frame_profile.sono_gcc_vm_to_native_cut_calls +=
+            output.sono_gcc_vm_to_native_cut_calls;
+        self.frame_profile.sono_gcc_overflow_input_regions +=
+            output.sono_gcc_overflow_input_regions;
+        self.frame_profile.sono_gcc_region_dispatch += output.sono_gcc_profile_times.0;
+        self.frame_profile.sono_gcc_vm_cut_evaluation += output.sono_gcc_profile_times.1;
+        self.frame_profile.sono_gcc_native_execution += output.sono_gcc_profile_times.2;
+        if self.profiling {
+            self.frame_profile.callbacks += 1;
+            self.frame_profile.callback_vm_construction += callback.vm_construction;
+            self.frame_profile.callback_context_setup += callback.context_setup;
+            self.frame_profile.callback_memory_setup += callback.memory_setup;
+            self.frame_profile.callback_execute += callback.execution;
+            self.frame_profile.evaluations += output.evaluations as u64;
+            self.frame_profile.function_dispatches += output.function_dispatches;
+            self.frame_profile.memory_entries_copied += output.memory.copied_entries();
+            self.frame_profile.parallel_callbacks += 1;
+            if speculative {
+                self.frame_profile.parallel_speculative_callbacks += 1;
+            }
+        }
+    }
+
+    fn commit_parallel_callback(
+        &mut self,
+        callback: ParallelCallbackResult,
+        stage: LifecycleStage,
+    ) -> Result<f64> {
+        self.accumulate_parallel_callback_profile(&callback, false);
+        let task = callback.task;
+        let output = callback.output;
+        let result = match output.result {
+            Ok(value) => value,
+            Err(error) => {
+                let callback_error = error.context(format!(
+                    "entity {} ({}) {stage:?} callback node {}",
+                    task.entity_id, task.archetype_name, task.node
+                ));
+                self.frame_vm_evaluations += output.evaluations as u64;
+                self.frame_spawn_requests += output.spawn_queue.len() as u64;
+                for (name, count) in output.function_counts {
+                    *self.frame_function_counts.entry(name).or_default() += count;
+                }
+                return Err(callback_error);
+            }
+        };
+
+        let commit_start = self.profiling.then(std::time::Instant::now);
+        let requests = output.spawn_queue;
+        self.frame_vm_evaluations += output.evaluations as u64;
+        self.frame_spawn_requests += requests.len() as u64;
+        if self.entities[task.entity_id].has_entity_data && stage == LifecycleStage::Preprocess {
+            self.entities[task.entity_id].entity_data = self.entity_data_row(task.entity_id);
+        }
+        let (global_memory, entity_memory) = output.memory.into_watch_entity_parts(
+            ENTITY_MEMORY,
+            &[ENTITY_DATA, ENTITY_SHARED_MEMORY, TEMPORARY_MEMORY],
+        );
+        self.global_memory = global_memory;
+        self.entities[task.entity_id].memory = entity_memory;
+        self.callback_log.push(CallbackRecord {
+            entity_id: Some(task.entity_id),
+            archetype: task.archetype_name,
+            stage,
+            node: task.node,
+        });
+        self.frame_display_list
+            .sprites
+            .extend(output.display_list.sprites);
+        self.frame_scheduled_effects
+            .extend(output.scheduled_effects);
+        self.frame_scheduled_looped_effects
+            .extend(output.scheduled_looped_effects);
+        self.frame_scheduled_looped_effect_stops
+            .extend(output.scheduled_looped_effect_stops);
+        self.frame_audio_events.extend(output.audio_events);
+        self.frame_destroyed_particle_effects
+            .extend(output.destroyed_particle_effects);
+        self.frame_particle_events.extend(output.particle_events);
+        self.frame_debug_events.extend(output.debug_events);
+        for (name, count) in output.function_counts {
+            *self.frame_function_counts.entry(name).or_default() += count;
+        }
+        self.frame_skin_checks.extend(output.skin_checks);
+        for request in requests {
+            self.enqueue_spawn(request.archetype_id, request.data)?;
+        }
+        if stage == LifecycleStage::Initialize {
+            self.entities[task.entity_id].initialized = true;
+        }
+        if let Some(start) = commit_start {
+            self.frame_profile.callback_commit += start.elapsed();
+        }
+        Ok(result)
     }
 
     fn invoke_entity(&mut self, id: usize, stage: LifecycleStage) -> Result<f64> {
@@ -924,8 +1896,10 @@ impl<'a> WatchRuntime<'a> {
             .context("entity id out of range")?
             .archetype_index;
         let archetype = &self.archetype_defs[archetype_index];
-        let callback = callback(archetype.clone(), stage);
-        let Some(value) = callback else {
+        let Some(value) = callback_ref(archetype, stage).cloned() else {
+            if stage == LifecycleStage::Initialize {
+                self.entities[id].initialized = true;
+            }
             return Ok(0.0);
         };
         let node = callback_index(&value)
@@ -943,6 +1917,7 @@ impl<'a> WatchRuntime<'a> {
         let mut vm = WatchVm::new(&self.watch.nodes);
         vm.set_profiling(self.profiling);
         vm.set_accounting(self.collect_vm_accounting);
+        vm.set_sono_gcc_program(self.sono_gcc_program.clone());
         if let Some(start) = phase_start {
             self.frame_profile.callback_vm_construction += start.elapsed();
         }
@@ -973,19 +1948,23 @@ impl<'a> WatchRuntime<'a> {
             self.frame_profile.callback_context_setup += start.elapsed();
         }
         let phase_start = self.profiling.then(std::time::Instant::now);
-        if self.profiling {
-            self.frame_profile.memory_entries_copied +=
-                self.global_memory.len() as u64 + self.entities[id].memory.len() as u64;
-        }
-        vm.memory = self.global_memory.clone();
-        vm.memory.retain_other_than(TEMPORARY_MEMORY);
-        vm.memory.overlay(&self.entities[id].memory);
+        vm.memory = Memory::callback_view(&self.global_memory, &self.entities[id].memory);
         vm.memory.retain_other_than(TEMPORARY_MEMORY);
         if let Some(start) = phase_start {
             self.frame_profile.callback_memory_setup += start.elapsed();
         }
         let phase_start = self.profiling.then(std::time::Instant::now);
         let execution = vm.execute(node);
+        if self.profiling {
+            self.frame_profile.memory_entries_copied += vm.memory.copied_entries();
+        }
+        self.frame_profile.sono_gcc_regions_executed += vm.sono_gcc_regions_executed();
+        self.frame_profile.sono_gcc_vm_to_native_cut_calls += vm.sono_gcc_vm_to_native_cut_calls();
+        self.frame_profile.sono_gcc_overflow_input_regions += vm.sono_gcc_overflow_input_regions();
+        let (dispatch, cuts, native) = vm.sono_gcc_profile_times();
+        self.frame_profile.sono_gcc_region_dispatch += dispatch;
+        self.frame_profile.sono_gcc_vm_cut_evaluation += cuts;
+        self.frame_profile.sono_gcc_native_execution += native;
         if self.profiling {
             if let Some(start) = phase_start {
                 self.frame_profile.callback_execute += start.elapsed();
@@ -1060,6 +2039,9 @@ impl<'a> WatchRuntime<'a> {
         for request in requests {
             self.enqueue_spawn(request.archetype_id, request.data)?;
         }
+        if stage == LifecycleStage::Initialize {
+            self.entities[id].initialized = true;
+        }
         if let Some(start) = commit_start {
             self.frame_profile.callback_commit += start.elapsed();
         }
@@ -1075,6 +2057,7 @@ impl<'a> WatchRuntime<'a> {
         let mut vm = WatchVm::new(&self.watch.nodes);
         vm.set_profiling(self.profiling);
         vm.set_accounting(self.collect_vm_accounting);
+        vm.set_sono_gcc_program(self.sono_gcc_program.clone());
         if let Some(start) = phase_start {
             self.frame_profile.callback_vm_construction += start.elapsed();
         }
@@ -1088,16 +2071,23 @@ impl<'a> WatchRuntime<'a> {
             self.frame_profile.callback_context_setup += start.elapsed();
         }
         let phase_start = self.profiling.then(std::time::Instant::now);
-        if self.profiling {
-            self.frame_profile.memory_entries_copied += self.global_memory.len() as u64;
-        }
-        vm.memory = self.global_memory.clone();
+        vm.memory = Memory::fork(&self.global_memory);
         vm.memory.retain_other_than(TEMPORARY_MEMORY);
         if let Some(start) = phase_start {
             self.frame_profile.callback_memory_setup += start.elapsed();
         }
         let phase_start = self.profiling.then(std::time::Instant::now);
         let execution = vm.execute(node);
+        if self.profiling {
+            self.frame_profile.memory_entries_copied += vm.memory.copied_entries();
+        }
+        self.frame_profile.sono_gcc_regions_executed += vm.sono_gcc_regions_executed();
+        self.frame_profile.sono_gcc_vm_to_native_cut_calls += vm.sono_gcc_vm_to_native_cut_calls();
+        self.frame_profile.sono_gcc_overflow_input_regions += vm.sono_gcc_overflow_input_regions();
+        let (dispatch, cuts, native) = vm.sono_gcc_profile_times();
+        self.frame_profile.sono_gcc_region_dispatch += dispatch;
+        self.frame_profile.sono_gcc_vm_cut_evaluation += cuts;
+        self.frame_profile.sono_gcc_native_execution += native;
         if self.profiling {
             if let Some(start) = phase_start {
                 self.frame_profile.callback_execute += start.elapsed();
@@ -1110,8 +2100,7 @@ impl<'a> WatchRuntime<'a> {
         let requests = std::mem::take(&mut vm.spawn_queue);
         self.frame_vm_evaluations += vm.evaluation_count() as u64;
         self.frame_spawn_requests += requests.len() as u64;
-        self.global_memory = vm.memory;
-        self.global_memory.retain_other_than(TEMPORARY_MEMORY);
+        self.global_memory = vm.memory.into_global_memory(&[TEMPORARY_MEMORY]);
         self.callback_log.push(CallbackRecord {
             entity_id: None,
             archetype: "<global>".into(),
@@ -1325,15 +2314,15 @@ fn map_imports(
     Ok(result)
 }
 
-fn callback(archetype: WatchArchetype, stage: LifecycleStage) -> Option<Value> {
+fn callback_ref(archetype: &WatchArchetype, stage: LifecycleStage) -> Option<&Value> {
     match stage {
-        LifecycleStage::Preprocess => archetype.preprocess,
-        LifecycleStage::SpawnTime => archetype.spawn_time,
-        LifecycleStage::DespawnTime => archetype.despawn_time,
-        LifecycleStage::Initialize => archetype.initialize,
-        LifecycleStage::UpdateSequential => archetype.update_sequential,
-        LifecycleStage::UpdateParallel => archetype.update_parallel,
-        LifecycleStage::Terminate => archetype.terminate,
+        LifecycleStage::Preprocess => archetype.preprocess.as_ref(),
+        LifecycleStage::SpawnTime => archetype.spawn_time.as_ref(),
+        LifecycleStage::DespawnTime => archetype.despawn_time.as_ref(),
+        LifecycleStage::Initialize => archetype.initialize.as_ref(),
+        LifecycleStage::UpdateSequential => archetype.update_sequential.as_ref(),
+        LifecycleStage::UpdateParallel => archetype.update_parallel.as_ref(),
+        LifecycleStage::Terminate => archetype.terminate.as_ref(),
         LifecycleStage::UpdateSpawn => None,
     }
 }
@@ -1346,9 +2335,8 @@ fn callback_index(value: &Value) -> Result<usize> {
         .context("callback has no valid node index")
 }
 
-fn callback_order(callback: &Option<Value>) -> i64 {
+fn callback_order(callback: Option<&Value>) -> i64 {
     callback
-        .as_ref()
         .and_then(|v| v.get("order"))
         .and_then(Value::as_i64)
         .unwrap_or(0)
@@ -1364,6 +2352,21 @@ fn in_spawn_range(entity: &WatchEntity, timeline: f64) -> bool {
 mod ui_configuration_tests {
     use super::*;
 
+    fn fixture(callback: usize, nodes: Value, entities: usize) -> (WatchData, LevelData) {
+        let watch = serde_json::from_value(serde_json::json!({
+            "archetypes":[{"name":"Worker","updateParallel":{"index":callback}}],
+            "nodes":nodes
+        }))
+        .unwrap();
+        let level = serde_json::from_value(serde_json::json!({
+            "entities":(0..entities).map(|_| serde_json::json!({
+                "archetype":"Worker","data":[]
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap();
+        (watch, level)
+    }
+
     #[test]
     fn callback_evaluation_budget_scales_with_level_size_and_has_a_ceiling() {
         assert_eq!(callback_evaluation_limit(0), MIN_CALLBACK_EVALUATIONS);
@@ -1373,6 +2376,119 @@ mod ui_configuration_tests {
             callback_evaluation_limit(usize::MAX),
             MAX_CALLBACK_EVALUATIONS
         );
+    }
+
+    #[test]
+    fn independent_preprocess_callbacks_run_in_parallel_and_commit_in_entity_order() {
+        let watch: WatchData = serde_json::from_value(serde_json::json!({
+            "archetypes":[{"name":"Worker","preprocess":{"index":5}}],
+            "nodes":[
+                {"value":4000}, {"value":1}, {"value":4003}, {"value":0},
+                {"func":"Get","args":[2,3]},
+                {"func":"Set","args":[0,1,4]}
+            ]
+        }))
+        .unwrap();
+        let level: LevelData = serde_json::from_value(serde_json::json!({
+            "entities":(0..256).map(|_| serde_json::json!({
+                "archetype":"Worker","data":[]
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap();
+
+        let mut serial = WatchRuntime::new(&watch, &level).unwrap();
+        serial.set_parallel_updates(false, None).unwrap();
+        serial.preprocess().unwrap();
+        assert!(serial.parallel_workers.is_none());
+
+        let mut parallel = WatchRuntime::new(&watch, &level).unwrap();
+        parallel.set_parallel_updates(true, Some(4)).unwrap();
+        parallel.set_profiling(true);
+        parallel.preprocess().unwrap();
+
+        assert_eq!(parallel.callback_log, serial.callback_log);
+        assert_eq!(
+            parallel.global_memory.get(4000, 1),
+            serial.global_memory.get(4000, 1)
+        );
+        for id in 0..256 {
+            assert_eq!(parallel.entities[id].memory.get(4000, 1), id as f64);
+            assert_eq!(
+                parallel.entities[id].memory.get(4000, 1),
+                serial.entities[id].memory.get(4000, 1)
+            );
+        }
+        assert_eq!(parallel.frame_profile.parallel_callbacks, 256);
+        assert_eq!(parallel.frame_profile.parallel_batches, 1);
+        assert!(parallel.parallel_workers.is_some());
+    }
+
+    #[test]
+    fn preprocess_host_array_writes_remain_ordered() {
+        let watch: WatchData = serde_json::from_value(serde_json::json!({
+            "archetypes":[{"name":"Worker","preprocess":{"index":3}}],
+            "nodes":[
+                {"value":4001}, {"value":0}, {"value":42},
+                {"func":"Set","args":[0,1,2]}
+            ]
+        }))
+        .unwrap();
+        let level: LevelData = serde_json::from_value(serde_json::json!({
+            "entities":[
+                {"archetype":"Worker","data":[]},
+                {"archetype":"Worker","data":[]},
+                {"archetype":"Worker","data":[]}
+            ]
+        }))
+        .unwrap();
+        let mut runtime = WatchRuntime::new(&watch, &level).unwrap();
+        runtime.set_profiling(true);
+        runtime.preprocess().unwrap();
+
+        assert!(runtime.parallel_workers.is_none());
+        assert_eq!(runtime.frame_profile.parallel_callbacks, 0);
+        let array = runtime.context.entity_data_array.read().unwrap();
+        for entity_id in 0..3 {
+            assert_eq!(array[entity_id * 32], 42.0);
+            assert!(array[entity_id * 32 + 1..entity_id * 32 + 32]
+                .iter()
+                .all(|value| *value == 0.0));
+        }
+    }
+
+    #[test]
+    fn parallel_initialize_error_preserves_committed_prefix_and_discards_suffix() {
+        let watch: WatchData = serde_json::from_value(serde_json::json!({
+            "archetypes":[{"name":"Worker","initialize":{"index":7}}],
+            "nodes":[
+                {"value":4003}, {"value":0}, {"func":"Get","args":[0,1]},
+                {"value":128}, {"func":"Less","args":[2,3]},
+                {"value":1}, {"func":"IntentionalTestFailure","args":[]},
+                {"func":"If","args":[4,5,6]}
+            ]
+        }))
+        .unwrap();
+        let level: LevelData = serde_json::from_value(serde_json::json!({
+            "entities":(0..256).map(|_| serde_json::json!({
+                "archetype":"Worker","data":[]
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap();
+
+        let mut serial = WatchRuntime::new(&watch, &level).unwrap();
+        serial.set_parallel_updates(false, None).unwrap();
+        let serial_error = serial.frame(0.0).unwrap_err().to_string();
+
+        let mut parallel = WatchRuntime::new(&watch, &level).unwrap();
+        parallel.set_parallel_updates(true, Some(4)).unwrap();
+        let parallel_error = parallel.frame(0.0).unwrap_err().to_string();
+
+        assert!(serial_error.contains("entity 128 (Worker) Initialize callback node 7"));
+        assert!(parallel_error.contains("entity 128 (Worker) Initialize callback node 7"));
+        for id in 0..256 {
+            assert_eq!(serial.entities[id].initialized, id < 128);
+            assert_eq!(parallel.entities[id].initialized, id < 128);
+        }
     }
 
     #[test]
@@ -1401,5 +2517,155 @@ mod ui_configuration_tests {
                 &serde_json::json!({"ui":{"menuVisibility":{"scale":"bad","alpha":1}}})
             )
             .is_err());
+    }
+
+    #[test]
+    fn parallel_update_matches_ordered_results_and_single_thread_opt_out_stays_lazy() {
+        let (watch, level) = fixture(
+            5,
+            serde_json::json!([
+                {"value":7},
+                {"value":1},
+                {"func":"Play","args":[0,1]},
+                {"value":3},
+                {"func":"DebugLog","args":[3]},
+                {"func":"Execute","args":[2,4]}
+            ]),
+            256,
+        );
+        let mut serial = WatchRuntime::new(&watch, &level).unwrap();
+        serial.set_parallel_updates(false, None).unwrap();
+        serial.set_profiling(true);
+        let serial_report = serial.frame(0.0).unwrap();
+        assert!(serial.parallel_workers.is_none());
+
+        let mut parallel = WatchRuntime::new(&watch, &level).unwrap();
+        parallel.set_parallel_updates(true, Some(3)).unwrap();
+        parallel.set_profiling(true);
+        let parallel_report = parallel.frame(0.0).unwrap();
+
+        assert_eq!(parallel_report.callbacks, serial_report.callbacks);
+        assert_eq!(parallel_report.audio_events, serial_report.audio_events);
+        assert_eq!(parallel_report.debug_events, serial_report.debug_events);
+        assert_eq!(
+            parallel_report.function_counts,
+            serial_report.function_counts
+        );
+        assert_eq!(parallel_report.vm_evaluations, serial_report.vm_evaluations);
+        assert_eq!(parallel_report.display_list, serial_report.display_list);
+        assert_eq!(
+            parallel_report.runtime_update_after_callbacks,
+            serial_report.runtime_update_after_callbacks
+        );
+        assert!(parallel_report.runtime_profile.parallel_callbacks >= 8);
+        assert!(parallel_report.runtime_profile.parallel_batches > 0);
+        assert!(parallel_report.runtime_profile.parallel_worker_busy > Duration::ZERO);
+        assert!(parallel_report.runtime_profile.parallel_worker_slots <= 3);
+    }
+
+    #[test]
+    fn dynamic_global_memory_writes_fall_back_to_ordered_execution() {
+        let (watch, level) = fixture(
+            3,
+            serde_json::json!([
+                {"value":2000},
+                {"value":0},
+                {"value":1},
+                {"func":"Set","args":[0,1,2]}
+            ]),
+            256,
+        );
+        let mut serial = WatchRuntime::new(&watch, &level).unwrap();
+        serial.set_parallel_updates(false, None).unwrap();
+        let serial_report = serial.frame(0.0).unwrap();
+
+        let mut parallel = WatchRuntime::new(&watch, &level).unwrap();
+        parallel.set_parallel_updates(true, Some(3)).unwrap();
+        parallel.set_profiling(true);
+        let parallel_report = parallel.frame(0.0).unwrap();
+
+        assert_eq!(
+            parallel.global_memory.get(2000, 0),
+            serial.global_memory.get(2000, 0)
+        );
+        assert_eq!(parallel_report.callbacks, serial_report.callbacks);
+        assert_eq!(
+            parallel_report.function_counts,
+            serial_report.function_counts
+        );
+        assert_eq!(parallel_report.vm_evaluations, serial_report.vm_evaluations);
+        assert_eq!(parallel_report.display_list, serial_report.display_list);
+        assert!(
+            parallel_report
+                .runtime_profile
+                .parallel_speculative_callbacks
+                > 0
+        );
+        assert_eq!(
+            parallel_report.runtime_profile.parallel_ordered_callbacks,
+            256
+        );
+    }
+
+    #[test]
+    fn shared_loop_ids_are_assigned_in_callback_order_without_a_worker_pool() {
+        let (watch, level) = fixture(
+            1,
+            serde_json::json!([
+                {"value":7},
+                {"func":"PlayLooped","args":[0]}
+            ]),
+            5,
+        );
+        let mut runtime = WatchRuntime::new(&watch, &level).unwrap();
+        runtime.set_profiling(true);
+        let report = runtime.frame(0.0).unwrap();
+        let ids: Vec<_> = report
+            .audio_events
+            .iter()
+            .filter_map(|event| match event {
+                AudioEffectEvent::StartLoop { instance_id, .. } => Some(*instance_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+        assert_eq!(report.runtime_profile.parallel_batches, 0);
+        assert!(runtime.parallel_workers.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deferred_gcc_selection_uses_vm_when_background_program_is_not_ready() {
+        let mut watch: WatchData = serde_json::from_value(serde_json::json!({
+            "archetypes":[],
+            "nodes":[{"value":1},{"value":2},{"func":"Add","args":[0,1]}]
+        }))
+        .unwrap();
+        Arc::make_mut(&mut watch.nodes).push(
+            serde_json::from_value(serde_json::json!({
+                "value": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as f64
+            }))
+            .unwrap(),
+        );
+        let level: LevelData = serde_json::from_value(serde_json::json!({"entities":[]})).unwrap();
+        let mut runtime = WatchRuntime::new(&watch, &level).unwrap();
+        runtime.set_execution_mode_with_compile_policy(WatchExecutionMode::SonoGcc, false);
+        assert!(runtime.sono_gcc_program.is_none());
+        assert!(runtime.sono_gcc_precompile_deferred);
+        assert!(runtime
+            .execution_mode_status()
+            .contains("precompile pending; using Sono VM"));
+
+        crate::sono_gcc::precompile_with_progress(&watch.nodes, || {}).unwrap();
+        runtime.set_execution_mode_with_compile_policy(WatchExecutionMode::SonoGcc, false);
+        assert!(runtime.sono_gcc_program.is_some());
+        assert!(!runtime.sono_gcc_precompile_deferred);
+        assert_eq!(
+            runtime.sono_gcc_cache_hit,
+            crate::sono_gcc::CacheHit::Process
+        );
     }
 }

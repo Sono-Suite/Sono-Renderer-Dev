@@ -16,6 +16,21 @@ enum BackendArg {
     Wgpu,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ExecutionModeArg {
+    Interpreter,
+    SonoGcc,
+}
+
+impl From<ExecutionModeArg> for renderer::sono_gcc::WatchExecutionMode {
+    fn from(value: ExecutionModeArg) -> Self {
+        match value {
+            ExecutionModeArg::Interpreter => Self::Interpreter,
+            ExecutionModeArg::SonoGcc => Self::SonoGcc,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Args)]
 struct RenderLayerArgs {
     #[arg(long, conflicts_with = "no_ui")]
@@ -255,6 +270,10 @@ enum Command {
     InspectEngine {
         engine: PathBuf,
     },
+    /// Compile and persist Sono-GCC code for an engine without rendering.
+    CompileEngine {
+        engine: PathBuf,
+    },
     InspectLevel {
         level: PathBuf,
     },
@@ -285,6 +304,21 @@ enum Command {
         resources: Option<PathBuf>,
         #[arg(long, default_value_t = 0.0)]
         time: f64,
+        /// Watch execution mode (sono-gcc safely falls back for unsupported paths).
+        #[arg(long = "vm", value_enum, default_value_t = ExecutionModeArg::Interpreter)]
+        execution_mode: ExecutionModeArg,
+        /// Disable parallel UpdateParallel workers and use ordered single-thread Watch execution.
+        #[arg(long, conflicts_with = "watch_workers")]
+        single_threaded: bool,
+        /// Limit persistent Watch workers (default: available machine parallelism).
+        #[arg(long, value_name = "COUNT", conflicts_with = "single_threaded")]
+        watch_workers: Option<usize>,
+        /// Collect per-stage Watch CPU profile counters and timings.
+        #[arg(long)]
+        profile: bool,
+        /// Skip per-operation BTreeMap accounting for production-like CPU benchmarks.
+        #[arg(long)]
+        no_vm_accounting: bool,
         /// Override a Level Option after EngineConfiguration defaults are bound (repeatable: INDEX=VALUE).
         #[arg(long = "level-option", value_name = "INDEX=VALUE", action = clap::ArgAction::Append)]
         level_options: Vec<String>,
@@ -364,6 +398,15 @@ enum Command {
         /// Pixel backend used by shared preview and video rendering.
         #[arg(long, value_enum, default_value_t = BackendArg::Wgpu)]
         backend: BackendArg,
+        /// Watch execution mode: interpreter (default) or sono-gcc.
+        #[arg(long = "vm", value_enum, default_value_t = ExecutionModeArg::Interpreter)]
+        execution_mode: ExecutionModeArg,
+        /// Disable parallel UpdateParallel workers and use ordered single-thread Watch execution.
+        #[arg(long, conflicts_with = "watch_workers")]
+        single_threaded: bool,
+        /// Limit persistent Watch workers (default: available machine parallelism).
+        #[arg(long, value_name = "COUNT", conflicts_with = "single_threaded")]
+        watch_workers: Option<usize>,
         /// Collect render-video pipeline timings and workload counters.
         #[arg(long)]
         profile: bool,
@@ -456,6 +499,39 @@ fn main() -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&compatibility::inspect_engine(&engine)?)?
         ),
+        Command::CompileEngine { engine } => {
+            let package = formats::load_engine(&engine)?;
+            let result = renderer::sono_gcc::precompile(&package.watch.nodes)?;
+            println!(
+                "Sono-GCC cache {}: {} regions, {} / {} eligible native operation nodes, {} Watch graph nodes",
+                match result.cache_hit {
+                    renderer::sono_gcc::CacheHit::None => "compiled and stored",
+                    renderer::sono_gcc::CacheHit::Process => "process cache hit",
+                    renderer::sono_gcc::CacheHit::Persistent => "persistent cache hit",
+                },
+                result.compiled_regions,
+                result.compiled_operations,
+                result.eligible_operations,
+                result.graph_nodes
+            );
+            println!("cache key: {}", result.cache_key);
+            println!(
+                "timings: lookup {:.3}s, compile {:.3}s (region codegen {:.3}s, rustc {:.3}s), DLL load {:.3}s, cache write {:.3}s, graph identity {:.3}s, disk validation {:.3}s, metadata reconstruction {:.3}s, operation summary {:.3}s",
+                result.timings.cache_lookup.as_secs_f64(),
+                result.timings.compilation.as_secs_f64(),
+                result.timings.region_codegen.as_secs_f64(),
+                result.timings.rustc_compile.as_secs_f64(),
+                result.timings.native_load.as_secs_f64(),
+                result.timings.cache_write.as_secs_f64(),
+                result.timings.graph_identity.as_secs_f64(),
+                result.timings.disk_validation.as_secs_f64(),
+                result.timings.metadata_reconstruction.as_secs_f64(),
+                result.timings.operation_summary.as_secs_f64()
+            );
+            if let Some(error) = result.cache_write_error {
+                println!("persistent cache warning: {error}");
+            }
+        }
         Command::InspectLevel { level } => println!(
             "{}",
             serde_json::to_string_pretty(&formats::load_level(&level)?)?
@@ -489,6 +565,11 @@ fn main() -> Result<()> {
             watch_trace_output,
             resources,
             time,
+            execution_mode,
+            single_threaded,
+            watch_workers,
+            profile,
+            no_vm_accounting,
             level_options,
             width,
             height,
@@ -567,6 +648,12 @@ fn main() -> Result<()> {
                     .effect_names = renderer::offline::effect_clip_bindings(&package.watch)?;
             }
             runtime.set_draw_tracing(trace_draws);
+            runtime.set_execution_mode(execution_mode.into());
+            runtime.set_parallel_updates(!single_threaded, watch_workers)?;
+            runtime.set_profiling(profile);
+            runtime.set_vm_accounting(!no_vm_accounting);
+            println!("Watch execution: {}", runtime.execution_mode_status());
+            println!("Watch scheduling: {}", runtime.parallel_updates_status());
             match (diagnostic_entity, diagnostic_stage) {
                 (Some(entity_id), Some(stage)) => {
                     let stage = parse_lifecycle_stage(&stage)?;
@@ -722,7 +809,9 @@ fn main() -> Result<()> {
                 }
                 (Some(_), None) | (None, _) => None,
             };
+            let frame_started = std::time::Instant::now();
             let execution = runtime.frame(time);
+            let frame_elapsed = frame_started.elapsed();
             if let (Some(trace), Some(path)) = (&execution_trace, &watch_trace_output) {
                 trace
                     .lock()
@@ -730,6 +819,36 @@ fn main() -> Result<()> {
                     .write_jsonl(path)?;
             }
             let report = execution?;
+            println!(
+                "Watch frame execution elapsed: {:.3}s",
+                frame_elapsed.as_secs_f64()
+            );
+            if profile {
+                let profile = &report.runtime_profile;
+                println!(
+                    "Watch CPU profile: frame={:.3}ms preprocess={:.3}ms updateSpawn={:.3}ms scheduling={:.3}ms activation={:.3}ms updateSequential={:.3}ms updateParallel={:.3}ms report={:.3}ms; callbacks={} evals={} dispatches={} copiedMemoryEntries={}; parallelCallbacks={} orderedCallbacks={} speculativeCallbacks={} batches={} workerSlots={} workerBusy={:.3}ms workerSlotTime={:.3}ms schedulerWait~={:.3}ms",
+                    profile.frame.as_secs_f64() * 1000.0,
+                    profile.preprocess.as_secs_f64() * 1000.0,
+                    profile.update_spawn.as_secs_f64() * 1000.0,
+                    profile.scheduling.as_secs_f64() * 1000.0,
+                    profile.activation.as_secs_f64() * 1000.0,
+                    profile.update_sequential.as_secs_f64() * 1000.0,
+                    profile.update_parallel.as_secs_f64() * 1000.0,
+                    profile.report_materialization.as_secs_f64() * 1000.0,
+                    profile.callbacks,
+                    profile.evaluations,
+                    profile.function_dispatches,
+                    profile.memory_entries_copied,
+                    profile.parallel_callbacks,
+                    profile.parallel_ordered_callbacks,
+                    profile.parallel_speculative_callbacks,
+                    profile.parallel_batches,
+                    profile.parallel_worker_slots,
+                    profile.parallel_worker_busy.as_secs_f64() * 1000.0,
+                    profile.parallel_worker_slot_time.as_secs_f64() * 1000.0,
+                    profile.parallel_scheduler_wait.as_secs_f64() * 1000.0,
+                );
+            }
             println!(
                 "Runtime Update [time, deltaTime, scaledTime, reserved]: {:?}; after callbacks={:?}; timescale={}",
                 report.runtime_update, report.runtime_update_after_callbacks, report.timescale
@@ -771,6 +890,18 @@ fn main() -> Result<()> {
             println!("runtime entities: {}", runtime.entities.len());
             println!("callbacks executed: {}", report.callbacks.len());
             println!("VM node evaluations: {}", report.vm_evaluations);
+            println!(
+                "Sono-GCC regions executed this frame: {}",
+                report.runtime_profile.sono_gcc_regions_executed
+            );
+            println!(
+                "Sono-GCC VM-to-native scalar cut calls this frame: {}",
+                report.runtime_profile.sono_gcc_vm_to_native_cut_calls
+            );
+            println!(
+                "Sono-GCC regions needing heap cut-input storage this frame: {}",
+                report.runtime_profile.sono_gcc_overflow_input_regions
+            );
             println!("timeline: {:?}", report.timeline);
             println!("callbacks by stage: {}", serde_json::to_string(&stages)?);
             println!("new spawned entities: {}", report.spawned.len());
@@ -818,10 +949,14 @@ fn main() -> Result<()> {
                     .filter(|(_, present)| !*present)
                     .count()
             );
-            println!(
-                "executed Watch operations: {}",
-                serde_json::to_string(&report.function_counts)?
-            );
+            if no_vm_accounting {
+                println!("executed Watch operations: disabled by --no-vm-accounting");
+            } else {
+                println!(
+                    "executed Watch operations: {}",
+                    serde_json::to_string(&report.function_counts)?
+                );
+            }
             println!("Watch debug events:");
             for event in &report.debug_events {
                 match event {
@@ -1073,6 +1208,9 @@ fn main() -> Result<()> {
             level_options,
             render_layers,
             backend,
+            execution_mode,
+            single_threaded,
+            watch_workers,
             profile,
             profile_frames,
             validate_determinism,
@@ -1117,6 +1255,10 @@ fn main() -> Result<()> {
                     BackendArg::Cpu => renderer::render::RenderBackend::Cpu,
                     BackendArg::Wgpu => renderer::render::RenderBackend::Wgpu,
                 },
+                execution_mode: execution_mode.into(),
+                parallel_watch_updates: !single_threaded,
+                watch_workers,
+                compile_sono_gcc_on_demand: true,
                 profile,
                 profile_frames,
                 validate_determinism,
@@ -1127,6 +1269,15 @@ fn main() -> Result<()> {
             };
             let report =
                 config.render_video_with_progress(renderer::export_progress::terminal_sink())?;
+            println!("Watch execution: {}", report.watch_execution_status);
+            println!(
+                "Sono-GCC scalar regions executed during rendering: {}",
+                report.stream_sono_gcc_regions_executed
+            );
+            println!(
+                "Sono-GCC VM-to-native scalar cut calls during rendering: {}",
+                report.stream_sono_gcc_vm_to_native_cut_calls
+            );
             println!("wrote MP4 to {}", output.display());
             println!(
                 "submitted deterministic frames: {}",
@@ -1294,6 +1445,7 @@ fn parse_level_option_override(value: &str) -> Result<(usize, f64)> {
 mod cli_tests {
     use super::parse_level_option_override;
     use clap::Parser;
+    use std::path::PathBuf;
 
     #[test]
     fn whole_chart_accepts_optional_start_and_conflicts_with_duration() {
@@ -1388,6 +1540,120 @@ mod cli_tests {
             }
             _ => panic!("expected render-video command"),
         }
+    }
+
+    #[test]
+    fn execution_mode_flag_is_explicit_and_defaults_to_interpreter() {
+        let video = [
+            "renderer",
+            "render-video",
+            "engine.zip",
+            "resources.scp",
+            "level.json",
+            "music.mp3",
+            "out.mp4",
+        ];
+        assert!(matches!(
+            super::Cli::try_parse_from(video).unwrap().command,
+            super::Command::RenderVideo {
+                execution_mode: super::ExecutionModeArg::Interpreter,
+                ..
+            }
+        ));
+        assert!(matches!(
+            super::Cli::try_parse_from([video.as_slice(), &["--vm", "sono-gcc"]].concat())
+                .unwrap()
+                .command,
+            super::Command::RenderVideo {
+                execution_mode: super::ExecutionModeArg::SonoGcc,
+                ..
+            }
+        ));
+
+        let watch = ["renderer", "run-watch", "engine.zip", "level.json"];
+        assert!(matches!(
+            super::Cli::try_parse_from(watch).unwrap().command,
+            super::Command::RunWatch {
+                execution_mode: super::ExecutionModeArg::Interpreter,
+                ..
+            }
+        ));
+        assert!(matches!(
+            super::Cli::try_parse_from([watch.as_slice(), &["--vm", "sono-gcc"]].concat())
+                .unwrap()
+                .command,
+            super::Command::RunWatch {
+                execution_mode: super::ExecutionModeArg::SonoGcc,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn watch_scheduler_defaults_parallel_and_has_explicit_legacy_opt_out() {
+        let watch = ["renderer", "run-watch", "engine.zip", "level.json"];
+        assert!(matches!(
+            super::Cli::try_parse_from(watch).unwrap().command,
+            super::Command::RunWatch {
+                single_threaded: false,
+                watch_workers: None,
+                profile: false,
+                no_vm_accounting: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            super::Cli::try_parse_from(
+                [watch.as_slice(), &["--single-threaded", "--profile"]].concat()
+            )
+            .unwrap()
+            .command,
+            super::Command::RunWatch {
+                single_threaded: true,
+                profile: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            super::Cli::try_parse_from([watch.as_slice(), &["--watch-workers", "3"]].concat())
+                .unwrap()
+                .command,
+            super::Command::RunWatch {
+                single_threaded: false,
+                watch_workers: Some(3),
+                ..
+            }
+        ));
+        assert!(matches!(
+            super::Cli::try_parse_from([watch.as_slice(), &["--no-vm-accounting"]].concat())
+                .unwrap()
+                .command,
+            super::Command::RunWatch {
+                no_vm_accounting: true,
+                ..
+            }
+        ));
+        assert!(super::Cli::try_parse_from([
+            "renderer",
+            "run-watch",
+            "engine.zip",
+            "level.json",
+            "--single-threaded",
+            "--watch-workers",
+            "2"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn compile_engine_is_an_explicit_cache_prewarm_command() {
+        assert!(matches!(
+            super::Cli::try_parse_from(["renderer", "compile-engine", "engine.zip"])
+                .unwrap()
+                .command,
+            super::Command::CompileEngine { engine }
+                if engine == PathBuf::from("engine.zip")
+        ));
     }
 
     #[test]

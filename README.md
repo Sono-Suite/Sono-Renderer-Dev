@@ -15,6 +15,74 @@ cargo run --release -- render-video <engine.zip> <resources.scp> <level.json.gz>
 cargo run --release -- render-video <engine.zip> <resources.scp> <level.json.gz> <music-file> <output.mp4> --whole-chart
 ```
 
+## Watch execution modes
+
+Sono VM / interpreter remains the default. `render-video` and `run-watch` accept
+`--vm interpreter` or `--vm sono-gcc` (also `--vm=...`). The existing GUI has
+the same setting under **Video / Watch execution**.
+
+```text
+cargo run --release -- render-video <engine.zip> <resources.scp> <level.json.gz> <music-file> <output.mp4> --vm interpreter
+cargo run --release -- render-video <engine.zip> <resources.scp> <level.json.gz> <music-file> <output.mp4> --vm sono-gcc
+cargo run --release -- run-watch <engine.zip> <level.json.gz> --vm sono-gcc
+```
+
+## Watch CPU scheduling
+
+Parallel Watch scheduling is the default. Independent callback batches use a
+persistent bounded worker pool and merge their results in source order. Small
+batches and callbacks that touch shared state stay on the ordered path. Use
+`--watch-workers` to cap worker count, or `--single-threaded` to disable the
+scheduler and avoid creating workers:
+
+```text
+cargo run --release -- run-watch <engine.zip> <level.json.gz> --watch-workers 4
+cargo run --release -- run-watch <engine.zip> <level.json.gz> --single-threaded
+cargo run --release -- render-video <engine.zip> <resources.scp> <level.json.gz> <music-file> <output.mp4> --single-threaded
+```
+
+The GUI has the same scheduler checkbox. `run-watch` also accepts
+`--no-vm-accounting` for production-like CPU measurements without per-operation
+diagnostic counters; normal runs keep those counters enabled.
+
+Sono-GCC is an opt-in hybrid path. It compiles 75 kinds of eligible scalar
+operations directly, including arithmetic, math, interpolation, and 32 easing
+variants. The other 86 Watch operation kinds can cross an ordered scalar cut:
+WatchVm evaluates the operation with authoritative semantics, then a native
+parent can consume its exact `f64` result. The cut does not move the operation
+into native code or call back from the DLL into WatchVm. Graphs without a safe
+native parent, or beyond static region limits, continue entirely in WatchVm.
+Elastic easing remains interpreted because native code changed a NaN payload
+in differential testing. Watch tracing also forces interpreter execution for
+traced callbacks.
+
+Native DLL generation currently requires Windows and an available Rust
+compiler (`rustc`). Compile or load failures fall back to the interpreter;
+unsupported graph paths always remain there. Selecting an engine while
+Sono-GCC is enabled starts background graph loading and precompilation. The GUI
+reports cache lookup, compilation, partial coverage, and fallback status;
+rendering remains available while compilation runs. GUI precompilation,
+`compile-engine <engine.zip>`, and rendering share the exact-graph cache across
+processes when the cache directory is writable. Cache identity includes the
+graph, backend/runtime ABI, compiler identity, target, and build flags.
+
+```text
+cargo run --release -- compile-engine <engine.zip>
+```
+
+The current operation inventory and per-operation implementation/test status
+are in [the coverage matrix](SONO_GCC_COVERAGE.md). The implementation report
+records real-engine parity, cache timings, scalar-cut counts, and remaining limits.
+The [performance report](SONO_GCC_PERFORMANCE_REPORT.md) contains repeatable
+real-chart benchmarks, cache-hit breakdowns, and the current export bottleneck.
+
+In the latest repeated release benchmarks, GCC reduced isolated Watch time on
+five of six real fixtures and tied at millisecond resolution on LIMBO. The
+20-frame Larp SFX export remained 7.4% slower end to end under GCC, so Sono-GCC
+is intentionally not the default. See the [implementation report](SONO_GCC_IMPLEMENTATION_REPORT.md)
+for the tested operation subset and parity matrix, and the [performance report](SONO_GCC_PERFORMANCE_REPORT.md)
+for current timings and benchmark details.
+
 no documentation lol have fun good luck with cli :sob:
 
 legal jargan lol:

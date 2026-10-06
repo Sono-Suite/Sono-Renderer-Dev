@@ -77,6 +77,18 @@ pub struct RenderConfig {
     #[serde(default)]
     pub backend: RenderBackend,
     #[serde(default)]
+    pub execution_mode: crate::sono_gcc::WatchExecutionMode,
+    /// Run independent Watch UpdateParallel callbacks on persistent workers.
+    #[serde(default = "default_parallel_watch_updates")]
+    pub parallel_watch_updates: bool,
+    /// Explicit worker limit; None uses available machine parallelism.
+    #[serde(default)]
+    pub watch_workers: Option<usize>,
+    /// Allow render setup to compile on a cache miss. The GUI disables this
+    /// because its engine-selection worker owns background precompilation.
+    #[serde(default = "default_compile_sono_gcc_on_demand")]
+    pub compile_sono_gcc_on_demand: bool,
+    #[serde(default)]
     pub profile: bool,
     #[serde(default)]
     pub profile_frames: bool,
@@ -124,6 +136,9 @@ fn default_mv_background() -> f64 {
 fn default_duration() -> f64 {
     2.0
 }
+fn default_compile_sono_gcc_on_demand() -> bool {
+    true
+}
 fn default_fps() -> u32 {
     12
 }
@@ -142,6 +157,10 @@ fn default_frame_pipeline() -> bool {
     true
 }
 
+fn default_parallel_watch_updates() -> bool {
+    true
+}
+
 impl RenderConfig {
     /// Load the engine through the same archive/directory loader used by the
     /// existing inspection and video-export paths.
@@ -155,6 +174,12 @@ impl RenderConfig {
         }
         if self.fps == 0 || self.fps > 240 {
             bail!("FPS must be in 1..=240");
+        }
+        if self
+            .watch_workers
+            .is_some_and(|count| !(1..=256).contains(&count))
+        {
+            bail!("Watch worker count must be in 1..=256");
         }
         if !self.start_time.is_finite() || self.start_time < 0.0 {
             bail!("start time must be finite and nonnegative");
@@ -233,6 +258,11 @@ impl RenderConfig {
             self.trace_entity_id.is_some(),
             &self.resource_overrides,
         )?;
+        session.set_execution_mode_with_compile_policy(
+            self.execution_mode,
+            self.compile_sono_gcc_on_demand,
+        );
+        session.set_parallel_updates(self.parallel_watch_updates, self.watch_workers)?;
         if let Some(path) = self.mv.as_deref().filter(|_| self.mv_enabled) {
             let range = crate::offline::FrameRange::new(time, 1.0 / f64::from(self.fps), self.fps)?;
             let timeline = crate::export_timeline::ExportTimeline::new(
@@ -330,6 +360,13 @@ mod tests {
         assert_eq!((config.fps, config.width, config.height), (12, 640, 360));
         assert_eq!(config.layers, RenderLayers::default());
         assert_eq!(config.backend, RenderBackend::Wgpu);
+        assert_eq!(
+            config.execution_mode,
+            crate::sono_gcc::WatchExecutionMode::Interpreter
+        );
+        assert!(config.parallel_watch_updates);
+        assert_eq!(config.watch_workers, None);
+        assert!(config.compile_sono_gcc_on_demand);
         assert!(!config.concurrent_sfx_prepass);
         assert!(config.frame_pipeline);
         assert!(!config.ui.enabled);

@@ -1309,7 +1309,18 @@ fn sprite_color(id: u32) -> [u8; 3] {
 
 #[derive(Debug, Clone, Default)]
 pub struct Memory {
-    values: BTreeMap<(i64, usize), f64>,
+    /// Entries written in this layer. Runtime snapshots and callback-local
+    /// changes share immutable maps; a Set copies only the current layer.
+    values: Arc<BTreeMap<(i64, usize), f64>>,
+    /// Immutable lower-priority memory view. Callback memory layers place the
+    /// current entity's memory above the frame's global snapshot.
+    base: Option<Arc<Memory>>,
+    /// Blocks hidden from this layer and all of its parents.
+    hidden_blocks: BTreeSet<i64>,
+    /// Number of entries copied by copy-on-write changes to this layer.
+    copied_entries: u64,
+    /// Original entity layer, reused at commit when the callback leaves it intact.
+    entity_baseline: Option<Arc<BTreeMap<(i64, usize), f64>>>,
 }
 
 impl Memory {
@@ -1317,35 +1328,202 @@ impl Memory {
         Self::default()
     }
     pub fn get(&self, block: i64, index: usize) -> f64 {
-        self.values.get(&(block, index)).copied().unwrap_or(0.0)
+        self.values
+            .get(&(block, index))
+            .copied()
+            .or_else(|| {
+                (!self.hidden_blocks.contains(&block))
+                    .then(|| self.base.as_ref().map(|base| base.get(block, index)))
+                    .flatten()
+            })
+            .unwrap_or(0.0)
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.values.len()
+        let Some(base) = &self.base else {
+            return self.values.len();
+        };
+        let hidden = self
+            .hidden_blocks
+            .iter()
+            .map(|block| base.block_len(*block))
+            .sum::<usize>();
+        let base_len = base.len().saturating_sub(hidden);
+        base_len
+            + self
+                .values
+                .keys()
+                .filter(|(block, index)| {
+                    self.hidden_blocks.contains(block) || !base.contains(*block, *index)
+                })
+                .count()
     }
 
     pub fn set(&mut self, block: i64, index: usize, value: f64) {
-        self.values.insert((block, index), value);
+        if self
+            .values
+            .get(&(block, index))
+            .is_some_and(|current| current.to_bits() == value.to_bits())
+        {
+            return;
+        }
+        if Arc::strong_count(&self.values) > 1 {
+            self.copied_entries += self.values.len() as u64;
+        }
+        Arc::make_mut(&mut self.values).insert((block, index), value);
+    }
+
+    pub(crate) fn copied_entries(&self) -> u64 {
+        self.copied_entries
     }
 
     pub fn entries_for_block(&self, block: i64) -> Vec<(usize, f64)> {
-        self.values
-            .iter()
-            .filter_map(|(&(key, index), &value)| (key == block).then_some((index, value)))
-            .collect()
+        let mut entries = if self.hidden_blocks.contains(&block) {
+            BTreeMap::new()
+        } else {
+            self.base.as_ref().map_or_else(BTreeMap::new, |base| {
+                base.entries_for_block(block).into_iter().collect()
+            })
+        };
+        entries.extend(
+            self.values
+                .range((block, 0)..=(block, usize::MAX))
+                .map(|(&(_, index), &value)| (index, value)),
+        );
+        entries.into_iter().collect()
     }
 
     pub fn retain_other_than(&mut self, block: i64) {
-        self.values.retain(|(key, _), _| *key != block);
+        if self
+            .values
+            .range((block, 0)..=(block, usize::MAX))
+            .next()
+            .is_some()
+        {
+            if Arc::strong_count(&self.values) > 1 {
+                self.copied_entries += self.values.len() as u64;
+            }
+            Arc::make_mut(&mut self.values).retain(|(key, _), _| *key != block);
+        }
+        if self.base.is_some() {
+            self.hidden_blocks.insert(block);
+        }
     }
 
     pub fn retain_only(&mut self, block: i64) {
-        self.values.retain(|(key, _), _| *key == block);
+        let values = self
+            .materialize()
+            .into_iter()
+            .filter(|((key, _), _)| *key == block)
+            .collect();
+        *self = Self {
+            values: Arc::new(values),
+            ..Self::default()
+        };
     }
 
     pub fn overlay(&mut self, source: &Memory) {
-        self.values
-            .extend(source.values.iter().map(|(k, v)| (*k, *v)));
+        let base = Arc::new(self.clone());
+        let values = if source.base.is_none() && source.hidden_blocks.is_empty() {
+            source.values.clone()
+        } else {
+            Arc::new(source.materialize())
+        };
+        *self = Self {
+            values,
+            base: Some(base),
+            hidden_blocks: BTreeSet::new(),
+            copied_entries: 0,
+            entity_baseline: None,
+        };
+    }
+
+    /// Create a cheap immutable snapshot for a callback that can update global
+    /// state. Its writes stay in a small local layer until deterministic commit.
+    pub(crate) fn fork(base: &Memory) -> Self {
+        Self {
+            base: Some(Arc::new(base.clone())),
+            ..Self::default()
+        }
+    }
+
+    /// Place per-entity memory over the frame's shared global memory without
+    /// copying either map. Callback writes are isolated in the entity layer.
+    pub(crate) fn callback_view(global: &Memory, entity: &Memory) -> Self {
+        let values = if entity.base.is_none() && entity.hidden_blocks.is_empty() {
+            entity.values.clone()
+        } else {
+            Arc::new(entity.materialize())
+        };
+        let entity_baseline = Some(Arc::clone(&values));
+        Self {
+            values,
+            base: Some(Arc::new(global.clone())),
+            hidden_blocks: BTreeSet::new(),
+            copied_entries: 0,
+            entity_baseline,
+        }
+    }
+
+    /// Detect callback writes to state outside its entity/temporary blocks.
+    /// This is used to keep legacy global-memory behavior ordered.
+    pub(crate) fn differs_outside_overlay(
+        &self,
+        original_overlay: &Memory,
+        allowed_blocks: &[i64],
+    ) -> bool {
+        let before = original_overlay.materialize();
+        let after = &self.values;
+        before
+            .keys()
+            .chain(after.keys())
+            .filter(|(block, _)| !allowed_blocks.contains(block))
+            .any(|key| !same_entry(before.get(key), after.get(key)))
+    }
+
+    /// Commit a global callback's local writes while retaining its immutable
+    /// parent map. Callers may discard temporary blocks before committing.
+    pub(crate) fn into_global_memory(self, excluded_blocks: &[i64]) -> Self {
+        let Self {
+            values,
+            base,
+            mut hidden_blocks,
+            entity_baseline: _,
+            ..
+        } = self;
+        for block in excluded_blocks {
+            hidden_blocks.insert(*block);
+        }
+        let local_values = values
+            .iter()
+            .filter(|((block, _), _)| !hidden_blocks.contains(block))
+            .map(|(key, value)| (*key, *value))
+            .collect::<BTreeMap<_, _>>();
+        match base {
+            None => Self {
+                values: Arc::new(local_values),
+                base: None,
+                hidden_blocks: BTreeSet::new(),
+                copied_entries: 0,
+                entity_baseline: None,
+            },
+            Some(base) => {
+                let hides_existing = hidden_blocks
+                    .iter()
+                    .any(|block| base.block_len(*block) != 0);
+                if local_values.is_empty() && !hides_existing {
+                    return (*base).clone();
+                }
+                Self {
+                    values: Arc::new(local_values),
+                    base: Some(base),
+                    hidden_blocks,
+                    copied_entries: 0,
+                    entity_baseline: None,
+                }
+                .compact_if_deep()
+            }
+        }
     }
 
     pub(crate) fn into_watch_entity_parts(
@@ -1353,16 +1531,142 @@ impl Memory {
         entity_memory_block: i64,
         excluded_global_blocks: &[i64],
     ) -> (Self, Self) {
-        let mut entity_and_later = self.values.split_off(&(entity_memory_block, 0));
-        let mut later = entity_and_later.split_off(&(entity_memory_block.saturating_add(1), 0));
-        later.retain(|(block, _), _| !excluded_global_blocks.contains(block));
-        self.values.append(&mut later);
-        (
-            self,
+        if self.base.is_none() {
+            let mut values =
+                Arc::try_unwrap(self.values).unwrap_or_else(|values| (*values).clone());
+            let mut entity_and_later = values.split_off(&(entity_memory_block, 0));
+            let mut later = entity_and_later.split_off(&(entity_memory_block.saturating_add(1), 0));
+            later.retain(|(block, _), _| !excluded_global_blocks.contains(block));
+            values.append(&mut later);
+            return (
+                Self {
+                    values: Arc::new(values),
+                    ..Self::default()
+                },
+                Self {
+                    values: Arc::new(entity_and_later),
+                    ..Self::default()
+                },
+            );
+        }
+
+        let entity_baseline = self.entity_baseline.take();
+        let entity_unchanged = entity_baseline
+            .as_ref()
+            .is_some_and(|baseline| Arc::ptr_eq(baseline, &self.values));
+        let mut global_values = BTreeMap::new();
+        let mut entity_values = BTreeMap::new();
+        for (&(block, index), &value) in self.values.iter() {
+            if self.hidden_blocks.contains(&block) {
+                continue;
+            }
+            if block == entity_memory_block {
+                if !entity_unchanged {
+                    entity_values.insert((block, index), value);
+                }
+            } else if block < entity_memory_block || !excluded_global_blocks.contains(&block) {
+                global_values.insert((block, index), value);
+            }
+        }
+        let base = self.base.take().expect("checked above");
+        let mut hidden_blocks = self.hidden_blocks;
+        hidden_blocks.insert(entity_memory_block);
+        hidden_blocks.extend(excluded_global_blocks.iter().copied());
+        let hides_existing = hidden_blocks
+            .iter()
+            .any(|block| base.block_len(*block) != 0);
+        let global = if global_values.is_empty() && !hides_existing {
+            (*base).clone()
+        } else {
             Self {
-                values: entity_and_later,
+                values: Arc::new(global_values),
+                base: Some(base),
+                hidden_blocks,
+                copied_entries: 0,
+                entity_baseline: None,
+            }
+            .compact_if_deep()
+        };
+        let entity_values = if entity_unchanged {
+            entity_baseline.expect("unchanged entity layer has its baseline")
+        } else {
+            Arc::new(entity_values)
+        };
+        (
+            global,
+            Self {
+                values: entity_values,
+                ..Self::default()
             },
         )
+    }
+
+    fn contains(&self, block: i64, index: usize) -> bool {
+        self.values.contains_key(&(block, index))
+            || (!self.hidden_blocks.contains(&block)
+                && self
+                    .base
+                    .as_ref()
+                    .is_some_and(|base| base.contains(block, index)))
+    }
+
+    fn block_len(&self, block: i64) -> usize {
+        let hidden = self.hidden_blocks.contains(&block);
+        let base_len = if hidden {
+            0
+        } else {
+            self.base.as_ref().map_or(0, |base| base.block_len(block))
+        };
+        let local = self
+            .values
+            .range((block, 0)..=(block, usize::MAX))
+            .filter(|((key, index), _)| {
+                hidden
+                    || self
+                        .base
+                        .as_ref()
+                        .is_none_or(|base| !base.contains(*key, *index))
+            })
+            .count();
+        base_len + local
+    }
+
+    fn materialize(&self) -> BTreeMap<(i64, usize), f64> {
+        let mut values = self
+            .base
+            .as_ref()
+            .map_or_else(BTreeMap::new, |base| base.materialize());
+        if !self.hidden_blocks.is_empty() {
+            values.retain(|(block, _), _| !self.hidden_blocks.contains(block));
+        }
+        values.extend(self.values.iter().map(|(key, value)| (*key, *value)));
+        values
+    }
+
+    fn compact_if_deep(self) -> Self {
+        const MAX_MEMORY_LAYER_DEPTH: usize = 16;
+        let mut depth = 0;
+        let mut parent = self.base.as_deref();
+        while let Some(memory) = parent {
+            depth += 1;
+            parent = memory.base.as_deref();
+        }
+        if depth <= MAX_MEMORY_LAYER_DEPTH {
+            self
+        } else {
+            Self {
+                values: Arc::new(self.materialize()),
+                ..Self::default()
+            }
+        }
+    }
+}
+
+fn same_entry(left: Option<&f64>, right: Option<&f64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.to_bits() == right.to_bits(),
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -1396,12 +1700,50 @@ pub struct WatchVm<'a> {
     capture_draw_argument_values: bool,
     profiling: bool,
     collect_accounting: bool,
+    sono_gcc_program: Option<Arc<crate::sono_gcc::SonoGccProgram>>,
+    sono_gcc_function_counts: [u64; crate::sono_gcc::NATIVE_FUNCTION_COUNT],
+    sono_gcc_touched_functions: [u8; crate::sono_gcc::NATIVE_FUNCTION_COUNT],
+    sono_gcc_touched_function_count: usize,
+    sono_gcc_regions_executed: u64,
+    sono_gcc_vm_to_native_cut_calls: u64,
+    sono_gcc_overflow_input_regions: u64,
+    sono_gcc_region_dispatch_time: std::time::Duration,
+    sono_gcc_vm_cut_evaluation_time: std::time::Duration,
+    sono_gcc_native_execution_time: std::time::Duration,
     pub(crate) profile_function_dispatches: u64,
     draw_argument_values: BTreeMap<usize, f64>,
     draw_argument_value_texts: BTreeMap<usize, String>,
     draw_memory_reads: Vec<MemoryReadTrace>,
     draw_memory_operations: Vec<MemoryOperationTrace>,
     last_memory_writes: BTreeMap<(i64, usize), (usize, f64)>,
+}
+
+/// Owned results from one completed callback. This lets a persistent worker
+/// execute a VM that borrows a shared graph and return only commit-ready data.
+pub(crate) struct WatchVmCallbackOutput {
+    pub result: Result<f64>,
+    pub memory: Memory,
+    pub display_list: DisplayList,
+    pub spawn_queue: Vec<SpawnRequest>,
+    pub scheduled_effects: Vec<ScheduledEffect>,
+    pub scheduled_looped_effects: Vec<ScheduledLoopedEffect>,
+    pub scheduled_looped_effect_stops: Vec<ScheduledLoopedEffectStop>,
+    pub audio_events: Vec<AudioEffectEvent>,
+    pub destroyed_particle_effects: Vec<DestroyedParticleEffect>,
+    pub particle_events: Vec<ParticleEffectEvent>,
+    pub debug_events: Vec<DebugEvent>,
+    pub function_counts: BTreeMap<String, u64>,
+    pub skin_checks: Vec<(i64, bool)>,
+    pub evaluations: usize,
+    pub function_dispatches: u64,
+    pub sono_gcc_regions_executed: u64,
+    pub sono_gcc_vm_to_native_cut_calls: u64,
+    pub sono_gcc_overflow_input_regions: u64,
+    pub sono_gcc_profile_times: (
+        std::time::Duration,
+        std::time::Duration,
+        std::time::Duration,
+    ),
 }
 
 struct VmDiagnostics {
@@ -1496,6 +1838,16 @@ impl<'a> WatchVm<'a> {
             capture_draw_argument_values: false,
             profiling: false,
             collect_accounting: true,
+            sono_gcc_program: None,
+            sono_gcc_function_counts: [0; crate::sono_gcc::NATIVE_FUNCTION_COUNT],
+            sono_gcc_touched_functions: [0; crate::sono_gcc::NATIVE_FUNCTION_COUNT],
+            sono_gcc_touched_function_count: 0,
+            sono_gcc_regions_executed: 0,
+            sono_gcc_vm_to_native_cut_calls: 0,
+            sono_gcc_overflow_input_regions: 0,
+            sono_gcc_region_dispatch_time: std::time::Duration::ZERO,
+            sono_gcc_vm_cut_evaluation_time: std::time::Duration::ZERO,
+            sono_gcc_native_execution_time: std::time::Duration::ZERO,
             profile_function_dispatches: 0,
             draw_argument_values: BTreeMap::new(),
             draw_argument_value_texts: BTreeMap::new(),
@@ -1516,6 +1868,64 @@ impl<'a> WatchVm<'a> {
 
     pub(crate) fn set_accounting(&mut self, enabled: bool) {
         self.collect_accounting = enabled;
+    }
+
+    pub(crate) fn set_sono_gcc_program(
+        &mut self,
+        program: Option<Arc<crate::sono_gcc::SonoGccProgram>>,
+    ) {
+        self.sono_gcc_program = program;
+    }
+
+    pub(crate) fn sono_gcc_regions_executed(&self) -> u64 {
+        self.sono_gcc_regions_executed
+    }
+
+    pub(crate) fn sono_gcc_vm_to_native_cut_calls(&self) -> u64 {
+        self.sono_gcc_vm_to_native_cut_calls
+    }
+
+    pub(crate) fn sono_gcc_overflow_input_regions(&self) -> u64 {
+        self.sono_gcc_overflow_input_regions
+    }
+
+    pub(crate) fn sono_gcc_profile_times(
+        &self,
+    ) -> (
+        std::time::Duration,
+        std::time::Duration,
+        std::time::Duration,
+    ) {
+        (
+            self.sono_gcc_region_dispatch_time,
+            self.sono_gcc_vm_cut_evaluation_time,
+            self.sono_gcc_native_execution_time,
+        )
+    }
+
+    pub(crate) fn into_callback_output(self, result: Result<f64>) -> WatchVmCallbackOutput {
+        let sono_gcc_profile_times = self.sono_gcc_profile_times();
+        WatchVmCallbackOutput {
+            result,
+            memory: self.memory,
+            display_list: self.display_list,
+            spawn_queue: self.spawn_queue,
+            scheduled_effects: self.scheduled_effects,
+            scheduled_looped_effects: self.scheduled_looped_effects,
+            scheduled_looped_effect_stops: self.scheduled_looped_effect_stops,
+            audio_events: self.audio_events,
+            destroyed_particle_effects: self.destroyed_particle_effects,
+            particle_events: self.particle_events,
+            debug_events: self.debug_events,
+            function_counts: self.function_counts,
+            skin_checks: self.skin_checks,
+            evaluations: self.evaluations,
+            function_dispatches: self.profile_function_dispatches,
+            sono_gcc_regions_executed: self.sono_gcc_regions_executed,
+            sono_gcc_vm_to_native_cut_calls: self.sono_gcc_vm_to_native_cut_calls,
+            sono_gcc_overflow_input_regions: self.sono_gcc_overflow_input_regions,
+            sono_gcc_profile_times,
+        }
     }
 
     /// Capture a bounded VM trace from the start of the next execution.
@@ -1703,7 +2113,19 @@ impl<'a> WatchVm<'a> {
         self.evaluations = 0;
         self.depth = 0;
         self.break_signal = None;
-        self.eval(entry)
+        let result = self.eval(entry);
+        if self.collect_accounting {
+            for touched in &self.sono_gcc_touched_functions[..self.sono_gcc_touched_function_count]
+            {
+                let index = usize::from(*touched);
+                let count = self.sono_gcc_function_counts[index];
+                let name = crate::sono_gcc::native_function_name(index);
+                *self.function_counts.entry(name.to_owned()).or_default() += count;
+                self.sono_gcc_function_counts[index] = 0;
+            }
+            self.sono_gcc_touched_function_count = 0;
+        }
+        result
     }
 
     pub fn evaluation_count(&self) -> usize {
@@ -1711,6 +2133,9 @@ impl<'a> WatchVm<'a> {
     }
 
     fn eval(&mut self, index: usize) -> Result<f64> {
+        if let Some(result) = self.try_sono_gcc_region(index) {
+            return result;
+        }
         self.evaluations += 1;
         if self.evaluations > self.max_evaluations {
             bail!("Watch execution exceeded the evaluation limit");
@@ -1803,6 +2228,95 @@ impl<'a> WatchVm<'a> {
             }
         }
         result
+    }
+
+    fn try_sono_gcc_region(&mut self, index: usize) -> Option<Result<f64>> {
+        if self.context.execution_trace.is_some()
+            || self.diagnostics.is_some()
+            || self.trace_draws
+            || self.capture_draw_argument_values
+        {
+            return None;
+        }
+        let dispatch_started = self.profiling.then(std::time::Instant::now);
+        let region = self.sono_gcc_program.as_ref()?.region(index)?;
+        let base_depth = self.depth;
+        if self
+            .evaluations
+            .checked_add(region.metrics.evaluations)
+            .is_none_or(|total| total > self.max_evaluations)
+            || base_depth.saturating_add(region.metrics.max_depth) >= MAX_CALL_DEPTH
+        {
+            if let Some(started) = dispatch_started {
+                self.sono_gcc_region_dispatch_time += started.elapsed();
+            }
+            return None;
+        }
+
+        let mut inline_inputs = [0.0_f64; crate::sono_gcc::INLINE_REGION_INPUTS];
+        let mut overflow_inputs = Vec::new();
+        let inputs: &mut [f64] = if region.cut_nodes.len() <= inline_inputs.len() {
+            &mut inline_inputs[..region.cut_nodes.len()]
+        } else {
+            self.sono_gcc_overflow_input_regions += 1;
+            overflow_inputs.resize(region.cut_nodes.len(), 0.0);
+            &mut overflow_inputs
+        };
+        let cut_started = self.profiling.then(std::time::Instant::now);
+        let mut cut_error = None;
+        for ((&node, &relative_depth), value) in region
+            .cut_nodes
+            .iter()
+            .zip(&region.cut_depths)
+            .zip(inputs.iter_mut())
+        {
+            self.sono_gcc_vm_to_native_cut_calls += 1;
+            self.depth = base_depth + relative_depth;
+            let result = self.eval(node);
+            self.depth = base_depth;
+            match result {
+                Ok(result) => *value = result,
+                Err(error) => {
+                    cut_error = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(started) = cut_started {
+            self.sono_gcc_vm_cut_evaluation_time += started.elapsed();
+        }
+        if let Some(error) = cut_error {
+            if let Some(started) = dispatch_started {
+                self.sono_gcc_region_dispatch_time += started.elapsed();
+            }
+            return Some(Err(error));
+        }
+
+        self.evaluations += region.metrics.compiled_evaluations;
+        if self.profiling {
+            self.profile_function_dispatches += region.function_dispatch_count;
+        }
+        if self.collect_accounting {
+            for &(operation, count) in &region.function_counts {
+                let index = usize::from(operation);
+                if self.sono_gcc_function_counts[index] == 0 {
+                    self.sono_gcc_touched_functions[self.sono_gcc_touched_function_count] =
+                        operation;
+                    self.sono_gcc_touched_function_count += 1;
+                }
+                self.sono_gcc_function_counts[index] += count;
+            }
+        }
+        self.sono_gcc_regions_executed += 1;
+        let native_started = self.profiling.then(std::time::Instant::now);
+        let result = region.run(inputs);
+        if let Some(started) = native_started {
+            self.sono_gcc_native_execution_time += started.elapsed();
+        }
+        if let Some(started) = dispatch_started {
+            self.sono_gcc_region_dispatch_time += started.elapsed();
+        }
+        Some(Ok(result))
     }
 
     fn arg(&mut self, node_index: usize, arg_index: usize) -> Result<f64> {
@@ -3585,6 +4099,31 @@ fn index_of(value: f64) -> Result<usize> {
 #[cfg(test)]
 mod memory_partition_tests {
     use super::Memory;
+
+    #[test]
+    fn callback_temp_mask_hides_snapshot_and_allows_local_loop_state() {
+        let mut global = Memory::new();
+        global.set(20, 3, 7.5);
+        global.set(10000, 3, 99.0);
+        let mut entity = Memory::new();
+        entity.set(4000, 2, -4.5);
+
+        let mut callback = Memory::callback_view(&global, &entity);
+        callback.retain_other_than(10000);
+        assert_eq!(callback.get(10000, 3), 0.0);
+        assert_eq!(callback.get(20, 3), 7.5);
+        assert_eq!(callback.get(4000, 2), -4.5);
+
+        callback.set(10000, 3, 1.0);
+        assert_eq!(callback.get(10000, 3), 1.0);
+        callback.set(10000, 3, callback.get(10000, 3) + 1.0);
+        assert_eq!(callback.get(10000, 3), 2.0);
+
+        let (next_global, next_entity) = callback.into_watch_entity_parts(4000, &[10000]);
+        assert_eq!(next_global.get(20, 3), 7.5);
+        assert_eq!(next_global.get(10000, 3), 0.0);
+        assert_eq!(next_entity.get(4000, 2), -4.5);
+    }
 
     #[test]
     fn entity_commit_split_matches_previous_clone_and_filter_rules() {

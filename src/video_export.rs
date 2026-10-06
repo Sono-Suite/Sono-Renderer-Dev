@@ -16,6 +16,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
@@ -54,6 +55,9 @@ pub struct ExportReport {
     pub stream_runtime_frames: u64,
     pub stream_callbacks: u64,
     pub stream_evaluations: u64,
+    pub watch_execution_status: String,
+    pub stream_sono_gcc_regions_executed: u64,
+    pub stream_sono_gcc_vm_to_native_cut_calls: u64,
     pub concurrent_sfx_prepass_used: bool,
     pub rgb_spool_bytes: u64,
     pub frame_pipeline: Option<FramePipelineStats>,
@@ -68,6 +72,7 @@ pub struct ExportReport {
 pub struct FramePipelineStats {
     pub queue_capacity: usize,
     pub queue_high_water: usize,
+    pub render_workers: usize,
     pub producer_watch_ms: f64,
     pub producer_snapshot_ms: f64,
     pub producer_blocked_ms: f64,
@@ -100,6 +105,8 @@ pub struct FrameDiagnostic {
     pub timescale: f64,
     pub callback_count: usize,
     pub vm_evaluations: u64,
+    pub sono_gcc_regions_executed: u64,
+    pub sono_gcc_vm_to_native_cut_calls: u64,
     pub runtime_frame_count: u64,
     pub runtime_entity_count: usize,
     pub active_entity_count: usize,
@@ -157,6 +164,10 @@ pub struct ExportRequest<'a> {
     pub bgm_enabled: bool,
     pub ui: &'a crate::render_ui::RendererUiConfig,
     pub backend: crate::render::RenderBackend,
+    pub execution_mode: crate::sono_gcc::WatchExecutionMode,
+    pub parallel_watch_updates: bool,
+    pub watch_workers: Option<usize>,
+    pub compile_sono_gcc_on_demand: bool,
     pub profile: bool,
     pub profile_frames: bool,
     pub validate_determinism: bool,
@@ -236,6 +247,10 @@ pub fn export_config_controlled(
             bgm_enabled: config.layers.bgm,
             ui: &config.ui,
             backend: config.backend,
+            execution_mode: config.execution_mode,
+            parallel_watch_updates: config.parallel_watch_updates,
+            watch_workers: config.watch_workers,
+            compile_sono_gcc_on_demand: config.compile_sono_gcc_on_demand,
             profile: config.profile,
             profile_frames: config.profile_frames,
             validate_determinism: config.validate_determinism,
@@ -444,6 +459,11 @@ fn export_using_tools_controlled(
             false,
             request.resource_overrides,
         )?;
+        discovery.set_execution_mode_with_compile_policy(
+            request.execution_mode,
+            request.compile_sono_gcc_on_demand,
+        );
+        discovery.set_parallel_updates(request.parallel_watch_updates, request.watch_workers)?;
         discovery.set_export_control(control.clone());
         let end = crate::export_end::discover(
             discovery,
@@ -479,6 +499,7 @@ fn export_using_tools_controlled(
     progress.phase(ExportPhase::Preparing, Some(range.frame_count));
 
     let watch_traversals = std::cell::Cell::new(0);
+    let watch_execution_status = std::cell::RefCell::new(String::new());
     let make_session = || {
         let mut session = FrameSession::new_configured_with_sources(
             &package.watch,
@@ -503,6 +524,16 @@ fn export_using_tools_controlled(
             request.trace_entity_id.is_some(),
             request.resource_overrides,
         )?;
+        session.set_execution_mode_with_compile_policy(
+            request.execution_mode,
+            request.compile_sono_gcc_on_demand,
+        );
+        session.set_parallel_updates(request.parallel_watch_updates, request.watch_workers)?;
+        *watch_execution_status.borrow_mut() = format!(
+            "{}; {}",
+            session.execution_mode_status(),
+            session.parallel_updates_status()
+        );
         session.set_export_control(control.clone());
         if let Some(path) = request.mv {
             session.configure_mv(&installation, path, timeline)?;
@@ -697,9 +728,10 @@ fn export_using_tools_controlled(
                             }
                         }
                         eprintln!(
-                            "Frame pipeline: queue capacity {}/{}, Watch {:.1}ms, snapshot {:.1}ms, producer blocked {:.1}ms, queue residence {:.1}ms, consumer waiting {:.1}ms, render {:.1}ms, FFmpeg output {:.1}ms, first-frame latency {:.1}ms",
+                            "Frame pipeline: queue capacity {}/{}, render workers {}, Watch {:.1}ms, snapshot {:.1}ms, producer blocked {:.1}ms, queue residence {:.1}ms, consumer waiting {:.1}ms, render {:.1}ms, FFmpeg output {:.1}ms, first-frame latency {:.1}ms",
                             result.stats.queue_high_water,
                             result.stats.queue_capacity,
+                            result.stats.render_workers,
                             result.stats.producer_watch_ms,
                             result.stats.producer_snapshot_ms,
                             result.stats.producer_blocked_ms,
@@ -936,6 +968,14 @@ fn export_using_tools_controlled(
         .map(|frame| frame.callback_count as u64)
         .sum();
     let stream_evaluations = actual_frames.iter().map(|frame| frame.vm_evaluations).sum();
+    let stream_sono_gcc_regions_executed = actual_frames
+        .iter()
+        .map(|frame| frame.sono_gcc_regions_executed)
+        .sum();
+    let stream_sono_gcc_vm_to_native_cut_calls = actual_frames
+        .iter()
+        .map(|frame| frame.sono_gcc_vm_to_native_cut_calls)
+        .sum();
     let deterministic_frame_hashes_match = expected_frames
         .as_ref()
         .map(|expected| compare_frame_diagnostics(expected, &actual_frames));
@@ -943,6 +983,7 @@ fn export_using_tools_controlled(
         p.record("Total export", start.elapsed());
         p.print(start.elapsed());
     }
+    let watch_execution_status = watch_execution_status.borrow().clone();
     control.check()?;
     final_file
         .persist(request.output)
@@ -981,6 +1022,9 @@ fn export_using_tools_controlled(
         stream_runtime_frames,
         stream_callbacks,
         stream_evaluations,
+        watch_execution_status,
+        stream_sono_gcc_regions_executed,
+        stream_sono_gcc_vm_to_native_cut_calls,
         concurrent_sfx_prepass_used,
         rgb_spool_bytes: if concurrent_sfx_prepass_used {
             rgb_spool_bytes
@@ -1112,6 +1156,7 @@ fn frame_hashes_match(first: &FrameDiagnostic, second: &FrameDiagnostic) -> bool
 }
 
 const FRAME_QUEUE_CAPACITY: usize = 2;
+const MAX_GPU_RENDER_WORKERS: usize = 4;
 
 struct PreparedJob {
     local_index: u64,
@@ -1119,6 +1164,62 @@ struct PreparedJob {
     timeline: f64,
     ready_at: Instant,
     frame: PreparedFrame,
+}
+
+struct PendingRenderJob {
+    local_index: u64,
+    global_index: u64,
+    timeline: f64,
+    ready_at: Instant,
+}
+
+struct CompletedRenderJob {
+    job: PendingRenderJob,
+    render_started: Instant,
+    render_time: Duration,
+    result: Result<RenderedFrame>,
+}
+
+fn render_worker_loop(
+    receiver: std::sync::mpsc::Receiver<PreparedJob>,
+    sender: std::sync::mpsc::SyncSender<CompletedRenderJob>,
+    resources: std::sync::Arc<crate::offline::FrameRenderResources>,
+    profile_enabled: bool,
+) {
+    while let Ok(job) = receiver.recv() {
+        let PreparedJob {
+            local_index,
+            global_index,
+            timeline,
+            ready_at,
+            frame,
+        } = job;
+        let metadata = PendingRenderJob {
+            local_index,
+            global_index,
+            timeline,
+            ready_at,
+        };
+        let render_started = Instant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::offline::render_prepared_frame(resources.clone(), profile_enabled, frame)
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("GPU render worker panicked")));
+        let render_time = render_started.elapsed();
+        let failed = result.is_err();
+        if sender
+            .send(CompletedRenderJob {
+                job: metadata,
+                render_started,
+                render_time,
+                result,
+            })
+            .is_err()
+            || failed
+        {
+            break;
+        }
+    }
 }
 
 struct PipelineFrameRecord {
@@ -1160,6 +1261,15 @@ fn stream_frames_pipelined(
         bail!("determinism validation returned an unexpected number of frames");
     }
     let resources = session.render_resources();
+    let render_workers = if resources.backend() == crate::render::RenderBackend::Wgpu {
+        std::env::var("SONO_WGPU_IN_FLIGHT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, MAX_GPU_RENDER_WORKERS)
+    } else {
+        1
+    };
     let (sender, receiver) = std::sync::mpsc::sync_channel::<PreparedJob>(FRAME_QUEUE_CAPACITY);
     let outstanding = AtomicUsize::new(0);
     let high_water = AtomicUsize::new(0);
@@ -1172,91 +1282,191 @@ fn stream_frames_pipelined(
     std::thread::scope(|scope| {
         let worker = scope.spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut records = Vec::with_capacity(range.frame_count as usize);
-                let mut diagnostics = Vec::with_capacity(range.frame_count as usize);
-                let mut consumer_waiting = Duration::ZERO;
-                let mut queue_residence = Duration::ZERO;
-                let mut render_total = Duration::ZERO;
-                let mut output_total = Duration::ZERO;
-                let mut first_frame_latency = Duration::ZERO;
-                loop {
-                    let wait_start = Instant::now();
-                    let job = match receiver.recv() {
-                        Ok(job) => job,
-                        Err(_) => break,
-                    };
-                    consumer_waiting += wait_start.elapsed();
-                    worker_outstanding.fetch_sub(1, Ordering::AcqRel);
-                    if worker_cancelled.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let wall_start = job.ready_at;
-                    let render_start = Instant::now();
-                    let mut rendered = crate::offline::render_prepared_frame(
-                        resources.clone(),
-                        profile_enabled,
-                        job.frame,
-                    )?;
-                    let render_time = render_start.elapsed();
-                    render_total += render_time;
-                    queue_residence += render_start.duration_since(job.ready_at);
-                    if let Some(frame_profile) = rendered.profile.as_mut() {
-                        frame_profile.total = frame_profile.vm
-                            + frame_profile.preparation
-                            + frame_profile.backend_wall
-                            + frame_profile.runtime_ui;
-                    }
-                    let diagnostic_start = Instant::now();
-                    let diagnostic = frame_diagnostic(
-                        job.local_index,
-                        job.global_index,
-                        job.timeline,
-                        &rendered,
-                        worker_watch,
-                        target_entity_id,
-                    );
-                    let diagnostics_time = diagnostic_start.elapsed();
-                    if let Some(expected) =
-                        expected_frames.map(|frames| &frames[job.local_index as usize])
-                    {
-                        if !frame_hashes_match(expected, &diagnostic) {
-                            bail!(
-                                "frame {} changed between deterministic passes",
-                                job.global_index
-                            );
+                std::thread::scope(|render_scope| {
+                    let mut records = Vec::with_capacity(range.frame_count as usize);
+                    let mut diagnostics = Vec::with_capacity(range.frame_count as usize);
+                    let mut consumer_waiting = Duration::ZERO;
+                    let mut queue_residence = Duration::ZERO;
+                    let mut render_total = Duration::ZERO;
+                    let mut output_total = Duration::ZERO;
+                    let mut first_frame_latency = Duration::ZERO;
+                    let mut emit = |job: PendingRenderJob,
+                                    render_started: Instant,
+                                    render_time: Duration,
+                                    result: Result<RenderedFrame>|
+                     -> Result<()> {
+                        let mut rendered = result?;
+                        render_total += render_time;
+                        queue_residence += render_started.duration_since(job.ready_at);
+                        if let Some(frame_profile) = rendered.profile.as_mut() {
+                            frame_profile.total = frame_profile.vm
+                                + frame_profile.preparation
+                                + frame_profile.backend_wall
+                                + frame_profile.runtime_ui;
                         }
+                        let diagnostic_start = Instant::now();
+                        let diagnostic = frame_diagnostic(
+                            job.local_index,
+                            job.global_index,
+                            job.timeline,
+                            &rendered,
+                            worker_watch,
+                            target_entity_id,
+                        );
+                        let diagnostics_time = diagnostic_start.elapsed();
+                        if let Some(expected) =
+                            expected_frames.map(|frames| &frames[job.local_index as usize])
+                        {
+                            if !frame_hashes_match(expected, &diagnostic) {
+                                bail!(
+                                    "frame {} changed between deterministic passes",
+                                    job.global_index
+                                );
+                            }
+                        }
+                        let output_start = Instant::now();
+                        stdin.write_all(&rendered.rgb).with_context(|| {
+                            format!("writing raw RGB frame {} to FFmpeg", job.global_index)
+                        })?;
+                        let output_time = output_start.elapsed();
+                        output_total += output_time;
+                        if records.is_empty() {
+                            first_frame_latency = pipeline_start.elapsed();
+                        }
+                        records.push(PipelineFrameRecord {
+                            global_index: job.global_index,
+                            timeline: job.timeline,
+                            profile: rendered.profile,
+                            diagnostics: diagnostics_time,
+                            output: output_time,
+                            wall: job.ready_at.elapsed(),
+                        });
+                        diagnostics.push(diagnostic);
+                        Ok(())
+                    };
+                    if render_workers == 1 {
+                        loop {
+                            let wait_start = Instant::now();
+                            let job = match receiver.recv() {
+                                Ok(job) => job,
+                                Err(_) => {
+                                    consumer_waiting += wait_start.elapsed();
+                                    break;
+                                }
+                            };
+                            consumer_waiting += wait_start.elapsed();
+                            worker_outstanding.fetch_sub(1, Ordering::AcqRel);
+                            if worker_cancelled.load(Ordering::Acquire) {
+                                break;
+                            }
+                            let render_started = Instant::now();
+                            let result = crate::offline::render_prepared_frame(
+                                resources.clone(),
+                                profile_enabled,
+                                job.frame,
+                            );
+                            let render_time = render_started.elapsed();
+                            emit(
+                                PendingRenderJob {
+                                    local_index: job.local_index,
+                                    global_index: job.global_index,
+                                    timeline: job.timeline,
+                                    ready_at: job.ready_at,
+                                },
+                                render_started,
+                                render_time,
+                                result,
+                            )?;
+                        }
+                    } else {
+                        let (result_sender, result_receiver) =
+                            std::sync::mpsc::sync_channel::<CompletedRenderJob>(render_workers);
+                        let mut worker_senders = Vec::with_capacity(render_workers);
+                        for _ in 0..render_workers {
+                            let (job_sender, job_receiver) = std::sync::mpsc::sync_channel(0);
+                            worker_senders.push(job_sender);
+                            let result_sender = result_sender.clone();
+                            let render_resources = resources.clone();
+                            render_scope.spawn(move || {
+                                render_worker_loop(
+                                    job_receiver,
+                                    result_sender,
+                                    render_resources,
+                                    profile_enabled,
+                                )
+                            });
+                        }
+                        drop(result_sender);
+                        let mut completed = BTreeMap::new();
+                        let mut next_to_write = 0u64;
+                        let mut submitted = 0u64;
+                        let mut worker_index = 0usize;
+                        let mut source_closed = false;
+                        while next_to_write < range.frame_count {
+                            if worker_cancelled.load(Ordering::Acquire) {
+                                source_closed = true;
+                            }
+                            while !source_closed
+                                && submitted.saturating_sub(next_to_write) < render_workers as u64
+                            {
+                                let wait_start = Instant::now();
+                                let job = match receiver.recv() {
+                                    Ok(job) => job,
+                                    Err(_) => {
+                                        consumer_waiting += wait_start.elapsed();
+                                        source_closed = true;
+                                        break;
+                                    }
+                                };
+                                consumer_waiting += wait_start.elapsed();
+                                worker_outstanding.fetch_sub(1, Ordering::AcqRel);
+                                if worker_cancelled.load(Ordering::Acquire) {
+                                    source_closed = true;
+                                    break;
+                                }
+                                worker_senders[worker_index].send(job).map_err(|_| {
+                                    anyhow::anyhow!("GPU render worker closed its input queue")
+                                })?;
+                                worker_index = (worker_index + 1) % render_workers;
+                                submitted += 1;
+                            }
+
+                            if submitted == next_to_write {
+                                if source_closed {
+                                    break;
+                                }
+                                continue;
+                            }
+                            let finished = result_receiver
+                                .recv()
+                                .context("receiving completed GPU frame")?;
+                            completed.insert(finished.job.local_index, finished);
+                            while let Some(finished) = completed.remove(&next_to_write) {
+                                emit(
+                                    finished.job,
+                                    finished.render_started,
+                                    finished.render_time,
+                                    finished.result,
+                                )?;
+                                next_to_write += 1;
+                            }
+                        }
+                        drop(worker_senders);
                     }
-                    let output_start = Instant::now();
-                    stdin.write_all(&rendered.rgb).with_context(|| {
-                        format!("writing raw RGB frame {} to FFmpeg", job.global_index)
-                    })?;
-                    let output_time = output_start.elapsed();
-                    output_total += output_time;
-                    if records.is_empty() {
-                        first_frame_latency = pipeline_start.elapsed();
-                    }
-                    records.push(PipelineFrameRecord {
-                        global_index: job.global_index,
-                        timeline: job.timeline,
-                        profile: rendered.profile,
-                        diagnostics: diagnostics_time,
-                        output: output_time,
-                        wall: wall_start.elapsed(),
-                    });
-                    diagnostics.push(diagnostic);
-                }
-                stdin
-                    .flush()
-                    .context("flushing pipelined RGB frames to FFmpeg")?;
-                drop(stdin);
-                Ok(PipelineWorkerResult {
-                    diagnostics,
-                    records,
-                    consumer_waiting,
-                    queue_residence,
-                    render: render_total,
-                    output: output_total,
-                    first_frame_latency,
+                    drop(emit);
+                    stdin
+                        .flush()
+                        .context("flushing pipelined RGB frames to FFmpeg")?;
+                    drop(stdin);
+                    Ok(PipelineWorkerResult {
+                        diagnostics,
+                        records,
+                        consumer_waiting,
+                        queue_residence,
+                        render: render_total,
+                        output: output_total,
+                        first_frame_latency,
+                    })
                 })
             }))
             .unwrap_or_else(|_| Err(anyhow::anyhow!("frame render/output worker panicked")));
@@ -1351,6 +1561,7 @@ fn stream_frames_pipelined(
                     stats: FramePipelineStats {
                         queue_capacity: FRAME_QUEUE_CAPACITY,
                         queue_high_water: high_water.load(Ordering::Acquire),
+                        render_workers,
                         producer_watch_ms: watch_time.as_secs_f64() * 1000.0,
                         producer_snapshot_ms: snapshot_time.as_secs_f64() * 1000.0,
                         producer_blocked_ms: blocked_time.as_secs_f64() * 1000.0,
@@ -1451,6 +1662,11 @@ fn frame_diagnostic(
         timescale: frame.report.timescale,
         callback_count: frame.report.callbacks.len(),
         vm_evaluations: frame.report.vm_evaluations,
+        sono_gcc_regions_executed: frame.report.runtime_profile.sono_gcc_regions_executed,
+        sono_gcc_vm_to_native_cut_calls: frame
+            .report
+            .runtime_profile
+            .sono_gcc_vm_to_native_cut_calls,
         runtime_frame_count: if frame.report.runtime_profile.frame_count > 0 {
             frame.report.runtime_profile.frame_count
         } else if output_index == 0 {
@@ -1925,6 +2141,10 @@ mod tests {
                         bgm_enabled: true,
                         ui: &ui,
                         backend,
+                        execution_mode: crate::sono_gcc::WatchExecutionMode::Interpreter,
+                        parallel_watch_updates: true,
+                        watch_workers: None,
+                        compile_sono_gcc_on_demand: true,
                         profile: true,
                         profile_frames: false,
                         validate_determinism: validate,
@@ -2052,6 +2272,10 @@ mod tests {
                 bgm_enabled: false,
                 ui: &ui,
                 backend: crate::render::RenderBackend::Cpu,
+                execution_mode: crate::sono_gcc::WatchExecutionMode::Interpreter,
+                parallel_watch_updates: true,
+                watch_workers: None,
+                compile_sono_gcc_on_demand: true,
                 profile: false,
                 profile_frames: false,
                 validate_determinism: false,
@@ -2098,6 +2322,10 @@ mod tests {
                     bgm_enabled: true,
                     ui: &ui,
                     backend: crate::render::RenderBackend::Cpu,
+                    execution_mode: crate::sono_gcc::WatchExecutionMode::Interpreter,
+                    parallel_watch_updates: true,
+                    watch_workers: None,
+                    compile_sono_gcc_on_demand: true,
                     profile: false,
                     profile_frames: false,
                     validate_determinism: false,
@@ -2150,6 +2378,10 @@ mod tests {
                 bgm_enabled: false,
                 ui: &ui,
                 backend: crate::render::RenderBackend::Cpu,
+                execution_mode: crate::sono_gcc::WatchExecutionMode::Interpreter,
+                parallel_watch_updates: true,
+                watch_workers: None,
+                compile_sono_gcc_on_demand: true,
                 profile: false,
                 profile_frames: false,
                 validate_determinism: false,
@@ -2189,6 +2421,8 @@ mod tests {
             timescale: 1.0,
             callback_count: 0,
             vm_evaluations: 0,
+            sono_gcc_regions_executed: 0,
+            sono_gcc_vm_to_native_cut_calls: 0,
             runtime_frame_count: 0,
             runtime_entity_count: 0,
             active_entity_count: 0,

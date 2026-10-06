@@ -18,6 +18,7 @@ pub mod render;
 pub mod render_ui;
 pub mod runtime;
 pub mod skin_render_mode;
+pub mod sono_gcc;
 pub mod video_export;
 pub mod watch;
 pub mod watch_diagnostics;

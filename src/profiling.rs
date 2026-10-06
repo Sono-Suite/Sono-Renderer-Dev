@@ -58,17 +58,28 @@ pub(crate) struct ProfileCollector {
     stream_runtime_frames: u64,
     stream_watch_callbacks: u64,
     stream_watch_evaluations: u64,
+    stream_sono_gcc_regions: u64,
     stream_function_dispatches: u64,
     stream_memory_entries: u64,
+    parallel_callbacks: u64,
+    parallel_speculative_callbacks: u64,
+    parallel_ordered_callbacks: u64,
+    parallel_batches: u64,
+    parallel_worker_slots: u64,
+    parallel_worker_busy: Duration,
+    parallel_worker_slot_time: Duration,
+    parallel_scheduler_wait: Duration,
     preflight_runtime_frames: u64,
     preflight_watch_callbacks: u64,
     preflight_watch_evaluations: u64,
+    preflight_sono_gcc_regions: u64,
     preflight_function_dispatches: u64,
     preflight_memory_entries: u64,
     event_only_runtime_frames: u64,
     event_only_output_frames: u64,
     event_only_watch_callbacks: u64,
     event_only_watch_evaluations: u64,
+    event_only_sono_gcc_regions: u64,
 }
 impl ProfileCollector {
     pub(crate) fn new(
@@ -96,17 +107,28 @@ impl ProfileCollector {
             stream_runtime_frames: 0,
             stream_watch_callbacks: 0,
             stream_watch_evaluations: 0,
+            stream_sono_gcc_regions: 0,
             stream_function_dispatches: 0,
             stream_memory_entries: 0,
+            parallel_callbacks: 0,
+            parallel_speculative_callbacks: 0,
+            parallel_ordered_callbacks: 0,
+            parallel_batches: 0,
+            parallel_worker_slots: 0,
+            parallel_worker_busy: Duration::ZERO,
+            parallel_worker_slot_time: Duration::ZERO,
+            parallel_scheduler_wait: Duration::ZERO,
             preflight_runtime_frames: 0,
             preflight_watch_callbacks: 0,
             preflight_watch_evaluations: 0,
+            preflight_sono_gcc_regions: 0,
             preflight_function_dispatches: 0,
             preflight_memory_entries: 0,
             event_only_runtime_frames: 0,
             event_only_output_frames: 0,
             event_only_watch_callbacks: 0,
             event_only_watch_evaluations: 0,
+            event_only_sono_gcc_regions: 0,
         }
     }
     pub(crate) fn begin_render(&mut self) {
@@ -179,6 +201,26 @@ impl ProfileCollector {
             profile.runtime.callback_memory_setup,
         );
         self.record("Callback evaluator", profile.runtime.callback_execute);
+        self.record(
+            "Watch parallel worker busy",
+            profile.runtime.parallel_worker_busy,
+        );
+        self.record(
+            "Watch parallel scheduler wait",
+            profile.runtime.parallel_scheduler_wait,
+        );
+        self.record(
+            "Sono-GCC region dispatch",
+            profile.runtime.sono_gcc_region_dispatch,
+        );
+        self.record(
+            "Sono-GCC VM scalar cut evaluation",
+            profile.runtime.sono_gcc_vm_cut_evaluation,
+        );
+        self.record(
+            "Sono-GCC native region execution",
+            profile.runtime.sono_gcc_native_execution,
+        );
         self.record("Callback commit", profile.runtime.callback_commit);
         self.record("Watch runtime construction", profile.runtime_construction);
         self.record(
@@ -267,8 +309,17 @@ impl ProfileCollector {
         self.stream_runtime_frames += profile.runtime.frame_count;
         self.stream_watch_callbacks += profile.runtime.callbacks;
         self.stream_watch_evaluations += profile.runtime.evaluations;
+        self.stream_sono_gcc_regions += profile.runtime.sono_gcc_regions_executed;
         self.stream_function_dispatches += profile.runtime.function_dispatches;
         self.stream_memory_entries += profile.runtime.memory_entries_copied;
+        self.parallel_callbacks += profile.runtime.parallel_callbacks;
+        self.parallel_speculative_callbacks += profile.runtime.parallel_speculative_callbacks;
+        self.parallel_ordered_callbacks += profile.runtime.parallel_ordered_callbacks;
+        self.parallel_batches += profile.runtime.parallel_batches;
+        self.parallel_worker_slots += profile.runtime.parallel_worker_slots;
+        self.parallel_worker_busy += profile.runtime.parallel_worker_busy;
+        self.parallel_worker_slot_time += profile.runtime.parallel_worker_slot_time;
+        self.parallel_scheduler_wait += profile.runtime.parallel_scheduler_wait;
         self.record("Draw preparation", profile.preparation);
         if self.backend == "wgpu" {
             self.record("GPU draw preparation", profile.gpu_draw_preparation);
@@ -469,6 +520,7 @@ impl ProfileCollector {
         self.preflight_runtime_frames += profile.runtime.frame_count;
         self.preflight_watch_callbacks += profile.runtime.callbacks;
         self.preflight_watch_evaluations += profile.runtime.evaluations;
+        self.preflight_sono_gcc_regions += profile.runtime.sono_gcc_regions_executed;
         self.preflight_function_dispatches += profile.runtime.function_dispatches;
         self.preflight_memory_entries += profile.runtime.memory_entries_copied;
         if self.adapter.is_none() {
@@ -495,6 +547,7 @@ impl ProfileCollector {
         self.event_only_output_frames += 1;
         self.event_only_watch_callbacks += runtime.callbacks;
         self.event_only_watch_evaluations += runtime.evaluations;
+        self.event_only_sono_gcc_regions += runtime.sono_gcc_regions_executed;
     }
     pub(crate) fn finish_stream_frame_profile(
         &mut self,
@@ -567,6 +620,29 @@ impl ProfileCollector {
         }
         let n = self.frame_count.max(1) as f64;
         eprintln!("GPU execution timestamp: not collected (no additional query/readback added)\nEntities/frame: {:.1}\nSkin draws/frame: {:.1}\nParticle draws/frame: {:.1}\nGPU draws/frame: {:.1}\nAtlas uploads/cache misses: {}\nReadback/frame: {:.0} bytes\nStreaming runtime frames/callbacks/evaluations: {}/{} / {}\nEvent-only output frames/runtime frames/callbacks/evaluations: {}/{}/{}/{}\nEvent-only prepass GPU frames: 0\nFull-validation runtime frames/callbacks/evaluations: {}/{} / {}",self.entities as f64/n,self.skin_draws as f64/n,self.particles as f64/n,self.gpu_draws as f64/n,self.atlas_uploads,self.readback_bytes as f64/n,self.stream_runtime_frames,self.stream_watch_callbacks,self.stream_watch_evaluations,self.event_only_output_frames,self.event_only_runtime_frames,self.event_only_watch_callbacks,self.event_only_watch_evaluations,self.preflight_runtime_frames,self.preflight_watch_callbacks,self.preflight_watch_evaluations);
+        let worker_utilization = self.parallel_worker_busy.as_secs_f64()
+            / self
+                .parallel_worker_slot_time
+                .as_secs_f64()
+                .max(f64::MIN_POSITIVE)
+            * 100.0;
+        eprintln!(
+            "Watch scheduling: {} parallel callbacks, {} speculative reruns, {} ordered callbacks, {} batches, {} worker slots; summed worker busy {:.3}s / slot time {:.3}s ({worker_utilization:.1}% estimated utilization), scheduler wait estimate {:.3}s",
+            self.parallel_callbacks,
+            self.parallel_speculative_callbacks,
+            self.parallel_ordered_callbacks,
+            self.parallel_batches,
+            self.parallel_worker_slots,
+            self.parallel_worker_busy.as_secs_f64(),
+            self.parallel_worker_slot_time.as_secs_f64(),
+            self.parallel_scheduler_wait.as_secs_f64(),
+        );
+        eprintln!(
+            "Sono-GCC scalar regions executed: stream={} event-only={} full-validation={}",
+            self.stream_sono_gcc_regions,
+            self.event_only_sono_gcc_regions,
+            self.preflight_sono_gcc_regions
+        );
         let render = self
             .timings
             .get("Render phase")

@@ -121,6 +121,12 @@ pub(crate) struct FrameRenderResources {
     gpu: Option<&'static crate::gpu_render::GpuRenderer>,
 }
 
+impl FrameRenderResources {
+    pub(crate) fn backend(&self) -> crate::render::RenderBackend {
+        self.backend
+    }
+}
+
 /// Owned frame snapshot. It can be rasterized after the producer advances the
 /// Watch runtime to later frames.
 #[cfg_attr(test, derive(Clone))]
@@ -264,6 +270,23 @@ impl<'a> WatchFrameStepper<'a> {
         &mut self.runtime
     }
 
+    pub(crate) fn set_execution_mode_with_compile_policy(
+        &mut self,
+        mode: crate::sono_gcc::WatchExecutionMode,
+        compile_on_demand: bool,
+    ) {
+        self.runtime
+            .set_execution_mode_with_compile_policy(mode, compile_on_demand);
+    }
+
+    pub(crate) fn set_parallel_updates(
+        &mut self,
+        enabled: bool,
+        worker_count: Option<usize>,
+    ) -> Result<()> {
+        self.runtime.set_parallel_updates(enabled, worker_count)
+    }
+
     pub fn advance_to(&mut self, frame_index: u64) -> Result<FrameReport> {
         if self
             .last_frame_index
@@ -322,6 +345,23 @@ pub struct EventSession<'a> {
 impl<'a> EventSession<'a> {
     pub(crate) fn set_export_control(&mut self, control: crate::export_control::ExportControl) {
         self.stepper.runtime_mut().set_export_control(control);
+    }
+
+    pub(crate) fn set_execution_mode_with_compile_policy(
+        &mut self,
+        mode: crate::sono_gcc::WatchExecutionMode,
+        compile_on_demand: bool,
+    ) {
+        self.stepper
+            .set_execution_mode_with_compile_policy(mode, compile_on_demand);
+    }
+
+    pub(crate) fn set_parallel_updates(
+        &mut self,
+        enabled: bool,
+        worker_count: Option<usize>,
+    ) -> Result<()> {
+        self.stepper.set_parallel_updates(enabled, worker_count)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -477,6 +517,31 @@ impl<'a> FrameSession<'a> {
     }
     pub(crate) fn set_export_control(&mut self, control: crate::export_control::ExportControl) {
         self.stepper.runtime_mut().set_export_control(control);
+    }
+
+    pub(crate) fn set_execution_mode_with_compile_policy(
+        &mut self,
+        mode: crate::sono_gcc::WatchExecutionMode,
+        compile_on_demand: bool,
+    ) {
+        self.stepper
+            .set_execution_mode_with_compile_policy(mode, compile_on_demand);
+    }
+
+    pub(crate) fn set_parallel_updates(
+        &mut self,
+        enabled: bool,
+        worker_count: Option<usize>,
+    ) -> Result<()> {
+        self.stepper.set_parallel_updates(enabled, worker_count)
+    }
+
+    pub(crate) fn execution_mode_status(&self) -> String {
+        self.stepper.runtime.execution_mode_status()
+    }
+
+    pub(crate) fn parallel_updates_status(&self) -> String {
+        self.stepper.runtime.parallel_updates_status()
     }
 
     pub fn new(

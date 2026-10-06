@@ -1,13 +1,16 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchData {
     #[serde(default)]
     pub archetypes: Vec<WatchArchetype>,
     #[serde(default)]
-    pub nodes: Vec<EngineNode>,
+    /// Immutable graph storage is shared by renderer workers and GUI
+    /// precompilation without copying the complete Watch graph.
+    pub nodes: Arc<Vec<EngineNode>>,
     #[serde(default, deserialize_with = "deserialize_skin")]
     pub skin: Value,
     #[serde(default)]
@@ -137,7 +140,7 @@ pub fn inventory(data: &WatchData) -> WatchInventory {
             _ => {}
         }
     }
-    for node in &data.nodes {
+    for node in data.nodes.iter() {
         if let Some(func) = &node.func {
             functions.push(func.clone());
             if [
