@@ -2,61 +2,20 @@
 
 Please scroll down to find the AI disclosure section.
 
-An engine agnostic Sonolus Watch-mode renderer in development. The repository provides package parsing, Watch VM and entity lifecycle execution, skin/background/particle rendering, CPU and WGPU backends, and MP4 export with BGM and SFX through managed FFmpeg. Compatibility remains incomplete.
+This is a Sonolus renderer, with compatibility suited for Next Sekai, Next Rush, and Horizon charts.
 
-## Native desktop application
+This project works by simulating the Watch mode function on Sonolus. By simulating the Watch mode, this project is able to generate flawless recordings of MVs using any given engine zip file, SCP file, etc.
 
-Double-click `target/release/renderer.exe`, launch it with no arguments, or use `renderer gui`. The native egui/eframe window provides OS Open/Save dialogs, named engine options, Whole Chart or a manual range, CPU/WGPU settings, responsive export progress, logs, and cooperative Cancel. The CLI remains available with its existing subcommands.
+If you wish to get a .scp and engine zip, please reference Sono-Server, as Sono-Server has prepackaged .scp files and engine folders! Just zip an engine folder, and you're good :P
 
-`--mv-background 0..100` controls **MV brightness toward black before gameplay is composited** (default 100). This is a Sono-Renderer presentation policy, not a proven native Sonolus percentage convention. `--no-mv` disables a selected MV without changing BGM/SFX. Neither setting changes `media time = Watch time + bgmOffset`. Optional `--particle-resources collection.scp` and `--particle-name NAME` select a separate particle resource; the skin collection is the fallback.
-
-See [native GUI workflow and validation](docs/NATIVE_GUI_MILESTONE.md).
-
-## Build and inspect
-
-```text
-cargo run -- inspect-engine <engine-directory>
-cargo run -- inspect-level <level-directory-or-level.data>
-cargo run -- inspect-resources <collection.scp>
-cargo run -- compatibility <engine-directory> <collection.scp> <level-directory-or-level.data>
-cargo run -- validate-project <engine.zip> <resources.scp> <level.json.gz> <music-file> [--cover <image>] [--mv <video>]
-cargo run -- ffmpeg-info
-```
-
-The normal project input model takes the engine ZIP, resource package,
-`level.json.gz`, and music as separate inputs. Cover and custom MV are optional.
-`validate-project` parses the engine, SCP index, and level data and verifies the
-required and supplied optional files are accessible. It does not decode or
-validate the media content. Export decodes BGM and supported PCM16 WAV SFX.
-
-## Video export
+This project has a basic GUI, but also supports command line inputs:
 
 ```text
 cargo run --release -- render-video <engine.zip> <resources.scp> <level.json.gz> <music-file> <output.mp4> --start-time 0 --duration 10 --fps 60 --width 1920 --height 1080
 cargo run --release -- render-video <engine.zip> <resources.scp> <level.json.gz> <music-file> <output.mp4> --whole-chart
 ```
 
-`--whole-chart` defaults to start zero, accepts an explicit `--start-time`, and conflicts with `--duration`. Its end is explicitly **inferred** from preprocessed schedules and audio bounds when the engine graph supports cheap discovery; it is not an exact Sonolus completion signal. Indeterminate cases require an explicit duration. Bounded exports retain the existing default start of 14 seconds and duration of 2 seconds. WGPU and the frame pipeline remain defaults; `--backend cpu` and `--sequential-frames` are available.
-
-Exports show live phase/frame/percentage/elapsed/throughput/ETA progress. Redirected progress uses sparse plain stderr lines. Library callers can consume typed progress events through `RenderConfig::render_video_with_progress`.
-
-Add `--mv <video>` for a video background sampled at the same media time as BGM. MV audio is ignored; the selected background returns outside the video interval. MV works with whole-chart exports and both rendering backends. Normal exports run Watch once, collect SFX during rendering, then mix audio and stream-copy the encoded video into the final MP4. See [single Watch exports and inference limits](docs/SINGLE_WATCH_EXPORT.md), [MV timing, presentation policy, and validation](docs/MV_EXPORT.md) and [export timing, end policy, progress API, and validation](docs/EXPORT_LIFECYCLE_MILESTONE.md). The [particle compatibility handoff](docs/PARTICLE_COMPATIBILITY_HANDOFF.md) records the stopped investigation.
-
-`ffmpeg-info` resolves and validates FFmpeg and FFprobe. The application prefers
-`../addons/ffmpeg.exe` and `../addons/ffprobe.exe`, located relative to the
-application root (the repository root for Cargo development builds). Valid
-shared binaries are used in place. If either one is missing or invalid, the
-application reuses a valid managed copy or downloads the pinned Windows FFmpeg
-8.1 distribution, verifies its SHA-256, extracts it into
-`dependencies/ffmpeg/8.1`, and validates both executables. This command prints
-the selected source and executable paths. It does not use or modify system
-PATH. Linux uses native executable names and can reuse an existing managed
-installation, but automatic Linux download/extraction is not implemented yet.
-Normal inspection commands do not provision FFmpeg.
-
-Engine directories may use the server fixture names (`engine.json`, `EngineWatchData`, `EngineConfiguration`, `EngineRom`) or conventional lower-case equivalents. ZIP packages are read directly. Gzip is detected by its magic header. Standalone JSON or gzip-compressed LevelData is supported directly; legacy level directories and ZIP packages remain available to the inspector. SCP resource hashes are checked against repository entries.
-
-See [M0 format and architecture notes](docs/M0-design.md) for fixture observations, schema references, module boundaries, and unresolved format questions.
+no documentation lol have fun good luck with cli :sob:
 
 legal jargan lol:
 
