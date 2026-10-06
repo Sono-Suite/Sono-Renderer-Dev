@@ -570,6 +570,10 @@ fn export_using_tools_controlled(
         &request.fps.to_string(),
     ]);
     command.args(["-i", "pipe:0"]);
+    // An MP4 track timescale equal to this integer FPS represents every frame
+    // duration exactly. FFmpeg's default timescale can round rates such as 239
+    // FPS (for short clips, 27 frames were probed as 240 FPS).
+    let video_track_timescale = request.fps.to_string();
     command.args([
         "-vf",
         "format=yuv420p",
@@ -585,6 +589,8 @@ fn export_using_tools_controlled(
         "18",
         "-pix_fmt",
         "yuv420p",
+        "-video_track_timescale",
+        &video_track_timescale,
         "-movflags",
         "+faststart",
     ]);
@@ -2017,6 +2023,48 @@ mod tests {
                     .starts_with("sono-")));
             }
         }
+
+        // Keep the short, non-divisor frame-rate case covered end to end. The
+        // default MP4 track timescale rounded this 27-frame 239 FPS clip to
+        // 240 FPS and correctly failed the strict FFprobe validation.
+        let short_239_output = fixture.path().join("short-239-fps.mp4");
+        let short_239_report = export_using_tools(
+            ExportRequest {
+                engine: &engine,
+                resources: &resources,
+                level: &level_path,
+                music: &music,
+                mv: None,
+                mv_background: 100.0,
+                resource_overrides: &crate::render::ResourceOverrides::default(),
+                output: &short_239_output,
+                start_time: 0.0,
+                duration: 0.11,
+                whole_chart: false,
+                fps: 239,
+                width: 16,
+                height: 24,
+                trace_entity_id: None,
+                level_option_overrides: &[],
+                skin_name: None,
+                particles_enabled: false,
+                sfx_enabled: false,
+                bgm_enabled: false,
+                ui: &ui,
+                backend: crate::render::RenderBackend::Cpu,
+                profile: false,
+                profile_frames: false,
+                validate_determinism: false,
+                concurrent_sfx_prepass: false,
+                frame_pipeline: true,
+            },
+            Box::new(|_| {}),
+            || Ok(tools.clone()),
+        )
+        .unwrap();
+        assert_eq!(short_239_report.submitted_frames, 27);
+        assert!(short_239_output.is_file());
+
         for phase in [
             crate::export_progress::ExportPhase::Rendering,
             crate::export_progress::ExportPhase::AudioEncoding,
@@ -2707,13 +2755,15 @@ mod tests {
                 .sum::<u64>(),
             10_890
         );
+        // Evaluating all children of variadic arithmetic adds seven reached
+        // nodes in this fixture; both sequential and pipelined traversals agree.
         assert_eq!(
             output
                 .diagnostics
                 .iter()
                 .map(|frame| frame.vm_evaluations)
                 .sum::<u64>(),
-            12_870_999
+            12_871_006
         );
 
         let event_session = EventSession::new_configured(
@@ -2761,7 +2811,9 @@ mod tests {
         );
         assert_eq!(events.runtime_frames, 120);
         assert_eq!(events.callbacks, 10_890);
-        assert_eq!(events.evaluations, 12_870_999);
+        // Variadic arithmetic now evaluates all operands, reaching seven
+        // additional child nodes in this Watch interval.
+        assert_eq!(events.evaluations, 12_871_006);
         assert_eq!(events.checkpoints.len(), 1);
         let checkpoint = &events.checkpoints[0];
         assert_eq!((checkpoint.watch_start, checkpoint.watch_end), (0.0, 2.0));

@@ -2636,6 +2636,9 @@ impl<'a> WatchVm<'a> {
             }
             "GetPointed" => {
                 let args = self.all_args(index)?;
+                if args.len() < 3 {
+                    bail!("GetPointed requires at least three arguments");
+                }
                 let value = self
                     .pointed_location_values(args[0], args[1], args[2], false)?
                     .map(|(block, slot)| self.memory_get(block, slot))
@@ -2724,6 +2727,9 @@ impl<'a> WatchVm<'a> {
             "SetPointed" | "SetAddPointed" | "SetSubtractPointed" | "SetMultiplyPointed"
             | "SetDividePointed" | "SetModPointed" | "SetRemPointed" | "SetPowerPointed" => {
                 let args = self.all_args(index)?;
+                if args.len() < 4 {
+                    bail!("{name} requires at least four arguments");
+                }
                 let (block, slot) = self
                     .pointed_location_values(args[0], args[1], args[2], true)?
                     .context("pointed write did not resolve an address")?;
@@ -2757,6 +2763,9 @@ impl<'a> WatchVm<'a> {
                 let pointed = name.ends_with("Pointed");
                 let (block, slot) = if pointed {
                     let args = self.all_args(index)?;
+                    if args.len() < 3 {
+                        bail!("{name} requires at least three arguments");
+                    }
                     self.pointed_location_values(args[0], args[1], args[2], true)?
                         .context("pointed update did not resolve an address")?
                 } else {
@@ -3169,12 +3178,20 @@ impl<'a> WatchVm<'a> {
                     .skip(1)
                     .fold(first, |result, value| result - value))
             }
-            "Divide" | "Power" | "Equal" | "NotEqual" | "Greater" | "GreaterOr" | "Less"
-            | "LessOr" => {
+            "Divide" | "Power" => {
+                let args = self.all_args(index)?;
+                let first = *args
+                    .first()
+                    .context("variadic function requires an argument")?;
+                Ok(args.iter().skip(1).fold(first, |result, value| match name {
+                    "Divide" => result / value,
+                    "Power" => result.powf(*value),
+                    _ => unreachable!(),
+                }))
+            }
+            "Equal" | "NotEqual" | "Greater" | "GreaterOr" | "Less" | "LessOr" => {
                 let (left, right) = binary(self)?;
                 Ok(match name {
-                    "Divide" => left / right,
-                    "Power" => left.powf(right),
                     "Equal" => truth(left == right),
                     "NotEqual" => truth(left != right),
                     "Greater" => truth(left > right),
@@ -3425,10 +3442,23 @@ impl VmContext {
             .unwrap_or(1.0))
     }
     fn time_to_starting_time(&self, time: f64) -> Result<f64> {
-        Ok(time - self.starting_time)
+        Ok(self
+            .timescale_map
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= time)
+            .map(|(at, _)| *at)
+            .unwrap_or(0.0))
     }
     fn time_to_starting_scaled_time(&self, time: f64) -> Result<f64> {
-        Ok(self.scaled_time(time)? - self.scaled_time(self.starting_time)?)
+        let starting_time = self
+            .timescale_map
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= time)
+            .map(|(at, _)| *at)
+            .unwrap_or(0.0);
+        self.scaled_time(starting_time)
     }
     pub(crate) fn beat_to_time(&self, beat: f64) -> Result<f64> {
         if self.bpm_map.is_empty() {
@@ -3448,10 +3478,24 @@ impl VmContext {
         Ok(elapsed + (beat - previous_beat) * 60.0 / bpm)
     }
     fn beat_to_starting_time(&self, beat: f64) -> Result<f64> {
-        Ok(self.beat_to_time(beat)? - self.starting_time)
+        let starting_beat = self
+            .bpm_map
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= beat)
+            .or_else(|| self.bpm_map.first())
+            .map(|(at, _)| *at)
+            .context("beat conversion requires a configured BPM map")?;
+        self.beat_to_time(starting_beat)
     }
     fn beat_to_starting_beat(&self, beat: f64) -> Result<f64> {
-        Ok(beat - self.starting_beat)
+        self.bpm_map
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= beat)
+            .or_else(|| self.bpm_map.first())
+            .map(|(at, _)| *at)
+            .context("BPM query requires a configured BPM map")
     }
     fn bpm_at_beat(&self, beat: f64) -> Result<f64> {
         self.bpm_map

@@ -2584,6 +2584,95 @@ fn watch_draw_trace_preserves_non_finite_values_and_compound_memory_inputs() {
 }
 
 #[test]
+fn watch_vm_divide_and_power_fold_every_operand_left_to_right() {
+    use renderer::watch::EngineNode as N;
+    let nodes: Vec<N> = serde_json::from_value(serde_json::json!([
+        {"value":24}, {"value":3}, {"func":"Divide","args":[0,1]},
+        {"value":2}, {"func":"Divide","args":[0,1,3]},
+        {"value":2}, {"func":"Divide","args":[0,1,3,5]},
+        {"value":2}, {"value":3}, {"func":"Power","args":[7,8,5]},
+        {"value":7}, {"func":"Divide","args":[10]},
+        {"func":"Power","args":[10]}, {"func":"Power","args":[7,8,5,5]},
+        {"func":"Divide","args":[]}, {"func":"Power","args":[]},
+        {"value":0}, {"func":"Divide","args":[0,16]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+
+    assert_eq!(vm.execute(2).unwrap(), 8.0);
+    assert_eq!(vm.execute(4).unwrap(), 4.0);
+    assert_eq!(vm.execute(6).unwrap(), 2.0);
+    assert_eq!(vm.execute(9).unwrap(), 64.0);
+    assert_eq!(vm.execute(11).unwrap(), 7.0);
+    assert_eq!(vm.execute(12).unwrap(), 7.0);
+    assert_eq!(vm.execute(13).unwrap(), 4096.0);
+    assert!(vm.execute(14).is_err());
+    assert!(vm.execute(15).is_err());
+    assert!(vm.execute(17).unwrap().is_infinite());
+}
+
+#[test]
+fn watch_vm_starting_queries_return_active_segment_anchors() {
+    use renderer::watch::EngineNode as N;
+    let nodes: Vec<N> = serde_json::from_value(serde_json::json!([
+        {"value":3}, {"func":"TimeToStartingTime","args":[0]},
+        {"value":3}, {"func":"TimeToStartingScaledTime","args":[2]},
+        {"value":5}, {"func":"BeatToStartingTime","args":[4]},
+        {"value":5}, {"func":"BeatToStartingBeat","args":[6]},
+        {"value":7}, {"func":"TimeToStartingTime","args":[8]},
+        {"value":7}, {"func":"TimeToStartingScaledTime","args":[10]},
+        {"value":9}, {"func":"BeatToStartingTime","args":[12]},
+        {"value":9}, {"func":"BeatToStartingBeat","args":[14]},
+        {"value":-1}, {"func":"TimeToStartingTime","args":[16]},
+        {"value":-1}, {"func":"TimeToStartingScaledTime","args":[18]},
+        {"value":-1}, {"func":"BeatToStartingTime","args":[20]},
+        {"value":-1}, {"func":"BeatToStartingBeat","args":[22]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+    vm.context.time_map = vec![(0.0, 0.0), (2.0, 2.0), (6.0, 10.0)];
+    vm.context.timescale_map = vec![(0.0, 1.0), (2.0, 2.0), (6.0, 4.0)];
+    vm.context.bpm_map = vec![(0.0, 120.0), (4.0, 60.0), (8.0, 120.0)];
+
+    assert_eq!(vm.execute(1).unwrap(), 2.0);
+    assert_eq!(vm.execute(3).unwrap(), 2.0);
+    assert_eq!(vm.execute(5).unwrap(), 2.0);
+    assert_eq!(vm.execute(7).unwrap(), 4.0);
+    assert_eq!(vm.execute(9).unwrap(), 6.0);
+    assert_eq!(vm.execute(11).unwrap(), 10.0);
+    assert_eq!(vm.execute(13).unwrap(), 6.0);
+    assert_eq!(vm.execute(15).unwrap(), 8.0);
+    assert_eq!(vm.execute(17).unwrap(), 0.0);
+    assert_eq!(vm.execute(19).unwrap(), 0.0);
+    assert_eq!(vm.execute(21).unwrap(), 0.0);
+    assert_eq!(vm.execute(23).unwrap(), 0.0);
+
+    vm.context.time_map = vec![(-2.0, -1.0), (1.0, 2.0)];
+    vm.context.timescale_map = vec![(-2.0, 0.5), (1.0, 1.5)];
+    vm.context.bpm_map = vec![(-2.0, 60.0), (3.0, 120.0)];
+    assert_eq!(vm.execute(1).unwrap(), 1.0);
+    assert_eq!(vm.execute(3).unwrap(), 2.0);
+    assert_eq!(vm.execute(5).unwrap(), 5.0);
+    assert_eq!(vm.execute(7).unwrap(), 3.0);
+}
+
+#[test]
+fn malformed_pointed_memory_calls_return_vm_errors_instead_of_panicking() {
+    use renderer::watch::EngineNode as N;
+    let nodes: Vec<N> = serde_json::from_value(serde_json::json!([
+        {"func":"GetPointed","args":[]},
+        {"value":0}, {"func":"SetPointed","args":[1]},
+        {"func":"IncrementPrePointed","args":[]}
+    ]))
+    .unwrap();
+    let mut vm = renderer::runtime::WatchVm::new(&nodes);
+
+    assert!(format!("{:#}", vm.execute(0).unwrap_err()).contains("GetPointed requires"));
+    assert!(format!("{:#}", vm.execute(2).unwrap_err()).contains("SetPointed requires"));
+    assert!(format!("{:#}", vm.execute(3).unwrap_err()).contains("IncrementPrePointed requires"));
+}
+
+#[test]
 fn watch_vm_break_uses_count_then_value_and_unwinds_requested_blocks() {
     let nodes: Vec<renderer::watch::EngineNode> = serde_json::from_value(serde_json::json!([
         {"value":1},{"value":42},{"func":"Break","args":[0,1]},
